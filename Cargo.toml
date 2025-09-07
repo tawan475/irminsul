@@ -1,0 +1,66 @@
+[package]
+name = "irminsul"
+version = "0.1.0"
+authors = ["Konkers <konkers@konkers.net>"]
+edition = "2024"
+include = ["LICENSE-APACHE", "LICENSE-MIT", "**/*.rs", "Cargo.toml"]
+rust-version = "1.85"
+
+[package.metadata.docs.rs]
+all-features = true
+targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
+
+[dependencies]
+anime-game-data = { git = "https://github.com/konkers/anime-game-data", rev = "d5dc51754ac96d65ad1201c85cd03cc9dc35bb72" }
+anyhow = "1.0.99"
+arboard = "3.6.1"
+auto-artifactarium = { git = "https://github.com/konkers/auto-artifactarium", rev = "3683e58c93894237c58ba09cad25e14065b36556" }
+base64 = "0.22.1"
+ctrlc = "3.4.7"
+eframe = { version = "0.32", default-features = false, features = [
+	"accesskit",     # Make egui compatible with screen readers. NOTE: adds a lot of dependencies.
+	"default_fonts", # Embed the default egui fonts.
+	"glow",          # Use the glow rendering backend. Alternative: "wgpu".
+	"persistence",   # Enable restoring app state when restarting the app.
+	"wayland",       # To support Linux (and CI)
+	"x11",           # To support older Linux distributions (restores one of the default features)
+] }
+egui = "0.32"
+egui_extras = "0.32.2"
+egui_material_icons = "0.4.0"
+env_logger = "0.11.8"
+futures = "0.3.31"
+log = "0.4.27"
+pktmon = { version = "0.6.2", features = ["tokio"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = { version = "1.0.143", features = ["alloc"] }
+tokio = { version = "1.47.1", features = [
+	"rt",
+	"tokio-macros",
+	"macros",
+	"rt-multi-thread",
+] }
+tokio-util = "0.7.16"
+tracing = { version = "0.1.41" }
+tracing-appender = "0.2.3"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+windows = { version = "0.61.3", features = [
+	"Win32_System_Console",
+	"Win32_System_Registry",
+	"Win32_UI_Shell",
+] }
+
+[profile.release]
+opt-level = 2 # fast and small wasm
+
+# Optimize all dependencies even in debug builds:
+[profile.dev.package."*"]
+opt-level = 2
+
+# Uncomment for local debugging
+# [patch."https://github.com/konkers/anime-game-data"]
+# anime-game-data = { path = "../anime-game-data" }
+
+# Uncomment for local debugging
+# [patch."https://github.com/konkers/auto-artifactarium"]
+# auto-artifactarium = { path = "../auto-artifactarium" }
