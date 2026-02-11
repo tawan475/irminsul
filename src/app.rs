@@ -1,7 +1,9 @@
 use std::fmt::Display;
+use std::fs;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+use std::process::Command;
 use std::thread;
 use std::time::Instant;
 
@@ -28,6 +30,12 @@ pub struct SavedAppState {
     export_settings: ExportSettings,
     #[serde(default)]
     auto_start_capture: bool,
+    #[serde(default)]
+    start_on_startup: bool,
+    #[serde(default)]
+    save_result_to_file: bool,
+    #[serde(default)]
+    save_result_folder: Option<PathBuf>,
     log_raw_packets: bool,
     #[serde(default)]
     tracing_level: TracingLevel,
@@ -53,6 +61,9 @@ impl Default for SavedAppState {
                 min_weapon_rarity: 3,
             },
             auto_start_capture: false,
+            start_on_startup: false,
+            save_result_to_file: false,
+            save_result_folder: None,
             log_raw_packets: false,
             tracing_level: Default::default(),
         }
@@ -64,6 +75,7 @@ enum OptimizerExportTarget {
     None,
     Clipboard,
     File,
+    Automation,
 }
 
 pub struct IrminsulApp {
@@ -79,6 +91,8 @@ pub struct IrminsulApp {
     bug_report_open: bool,
 
     capture_settings_open: bool,
+    automation_settings_open: bool,
+    automation_folder_dialog: Option<FileDialog>,
 
     optimizer_settings_open: bool,
     optimizer_export_rx: Option<oneshot::Receiver<Result<String>>>,
@@ -87,6 +101,9 @@ pub struct IrminsulApp {
     optimizer_export_target: OptimizerExportTarget,
 
     restarting: bool,
+    last_automation_signature: Option<(Option<Instant>, Option<Instant>, Option<Instant>)>,
+    automation_cycle_started_at: Option<Instant>,
+    automation_capture_requested: bool,
 
     saved_state: SavedAppState,
 }
@@ -106,6 +123,47 @@ impl<T, E: Display> ToastError<T> for std::result::Result<T, E> {
             }
         }
     }
+}
+
+#[cfg(windows)]
+fn set_launch_on_startup(enabled: bool) -> Result<()> {
+    const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+    const RUN_VALUE_NAME: &str = "Irminsul";
+
+    if enabled {
+        let current_exe = std::env::current_exe()?;
+        let command_value = format!("\"{}\"", current_exe.display());
+        let status = Command::new("reg")
+            .args([
+                "add",
+                RUN_KEY,
+                "/v",
+                RUN_VALUE_NAME,
+                "/t",
+                "REG_SZ",
+                "/d",
+                &command_value,
+                "/f",
+            ])
+            .status()?;
+        if !status.success() {
+            return Err(anyhow!("Failed to register Irminsul startup entry"));
+        }
+    } else {
+        let status = Command::new("reg")
+            .args(["delete", RUN_KEY, "/v", RUN_VALUE_NAME, "/f"])
+            .status()?;
+        if !status.success() {
+            return Err(anyhow!("Failed to remove Irminsul startup entry"));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn set_launch_on_startup(_enabled: bool) -> Result<()> {
+    Err(anyhow!("Start on startup is only supported on Windows"))
 }
 
 fn start_async_runtime(
@@ -200,12 +258,17 @@ impl IrminsulApp {
             power_tools_open: false,
             bug_report_open: false,
             capture_settings_open: false,
+            automation_settings_open: false,
+            automation_folder_dialog: None,
             optimizer_settings_open: false,
             optimizer_export_rx: None,
             optimizer_save_dialog: None,
             optimizer_save_path: None,
             optimizer_export_target: OptimizerExportTarget::None,
             restarting: false,
+            last_automation_signature: None,
+            automation_cycle_started_at: None,
+            automation_capture_requested: false,
             state_rx,
             wish_url_rx,
         }
@@ -228,6 +291,14 @@ impl eframe::App for IrminsulApp {
         self.toasts.show(ctx);
         if let Some(optimizer_save_dialog) = &mut self.optimizer_save_dialog {
             optimizer_save_dialog.update(ctx);
+        }
+        if let Some(automation_folder_dialog) = &mut self.automation_folder_dialog {
+            automation_folder_dialog.update(ctx);
+        }
+        if let Some(automation_folder_dialog) = &mut self.automation_folder_dialog
+            && let Some(path) = automation_folder_dialog.take_picked()
+        {
+            self.saved_state.save_result_folder = Some(path);
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -450,6 +521,10 @@ impl IrminsulApp {
     }
 
     fn main_ui(&mut self, ui: &mut egui::Ui, app_state: &AppState) {
+        self.enforce_capture_when_automation_enabled(app_state);
+        self.update_capture_cycle_state(app_state);
+        self.handle_automation_export(app_state);
+
         if self.capture_settings_open {
             let modal = Modal::new(Id::new("Capture Settings")).show(ui.ctx(), |ui| {
                 self.capture_settings_modal(ui);
@@ -473,6 +548,8 @@ impl IrminsulApp {
         ui.separator();
         self.wish_ui(ui);
         ui.separator();
+        self.automation_ui(ui);
+        ui.separator();
         self.achievement_ui(ui, app_state);
     }
 
@@ -492,13 +569,17 @@ impl IrminsulApp {
                     }
 
                     if app_state.capturing {
-                        if ui.button(egui_material_icons::icons::ICON_PAUSE).clicked() {
-                            let _ = self.ui_message_tx.send(Message::StopCapture);
-                        }
+                        ui.add_enabled_ui(!self.saved_state.save_result_to_file, |ui| {
+                            if ui.button(egui_material_icons::icons::ICON_PAUSE).clicked() {
+                                self.automation_cycle_started_at = None;
+                                let _ = self.ui_message_tx.send(Message::StopCapture);
+                            }
+                        });
                     } else if ui
                         .button(egui_material_icons::icons::ICON_PLAY_ARROW)
                         .clicked()
                     {
+                        self.automation_cycle_started_at = Some(Instant::now());
                         let _ = self.ui_message_tx.send(Message::StartCapture);
                     }
                 },
@@ -621,6 +702,95 @@ impl IrminsulApp {
                 },
             );
         });
+    }
+
+    fn automation_ui(&mut self, ui: &mut egui::Ui) {
+        if self.automation_settings_open {
+            let modal = Modal::new(Id::new("Automation Settings")).show(ui.ctx(), |ui| {
+                self.automation_settings_modal(ui);
+            });
+            if modal.should_close() {
+                self.automation_settings_open = false;
+            }
+        }
+
+        ui.vertical(|ui| {
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    Self::section_header(ui, "Automation");
+                },
+                |_ui| {},
+            );
+            let previous_startup = self.saved_state.start_on_startup;
+            if ui
+                .checkbox(&mut self.saved_state.start_on_startup, "Start Irminsul on startup")
+                .changed()
+            {
+                if let Err(e) = set_launch_on_startup(self.saved_state.start_on_startup) {
+                    self.saved_state.start_on_startup = previous_startup;
+                    tracing::error!("Unable to update startup behavior: {e}");
+                    self.toasts.error("Unable to update startup behavior");
+                }
+            }
+            ui.horizontal(|ui| {
+                let previous_save_result_to_file = self.saved_state.save_result_to_file;
+                let changed = ui
+                    .checkbox(
+                    &mut self.saved_state.save_result_to_file,
+                    "Save result to file",
+                    )
+                    .changed();
+                if changed {
+                    if self.saved_state.save_result_to_file {
+                        self.automation_cycle_started_at = Some(Instant::now());
+                        self.request_capture_start();
+                    } else if previous_save_result_to_file {
+                        self.automation_capture_requested = false;
+                    }
+                }
+                ui.add_enabled_ui(self.saved_state.save_result_to_file, |ui| {
+                    if ui.button(egui_material_icons::icons::ICON_SETTINGS).clicked() {
+                        self.automation_settings_open = true;
+                    }
+                });
+            });
+        });
+    }
+
+    fn automation_settings_modal(&mut self, ui: &mut egui::Ui) {
+        ui.set_width(360.0);
+        ui.heading("Save Result To File");
+        ui.separator();
+        let selected_folder = self
+            .saved_state
+            .save_result_folder
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "No folder selected".to_string());
+        ui.label(format!("Selected folder: {selected_folder}"));
+        ui.horizontal(|ui| {
+            if ui.button("Choose folder").clicked() {
+                let mut dialog = FileDialog::new();
+                dialog.pick_directory();
+                self.automation_folder_dialog = Some(dialog);
+                self.automation_settings_open = false;
+                ui.close();
+            }
+            if ui.button("Clear").clicked() {
+                self.saved_state.save_result_folder = None;
+            }
+        });
+        ui.separator();
+        egui::Sides::new().show(
+            ui,
+            |_ui| {},
+            |ui| {
+                if ui.button("Ok").clicked() {
+                    ui.close();
+                }
+            },
+        );
     }
 
     fn power_tools_modal(&mut self, ui: &mut egui::Ui) {
@@ -860,6 +1030,10 @@ impl IrminsulApp {
             OptimizerExportTarget::File => {
                 self.optimizer_save_to_file(json)?;
             }
+            OptimizerExportTarget::Automation => {
+                self.optimizer_save_to_automation_file(json)?;
+                self.reset_capture_for_next_cycle();
+            }
         }
 
         self.optimizer_export_target = OptimizerExportTarget::None;
@@ -885,6 +1059,99 @@ impl IrminsulApp {
 
         self.toasts.info("Genshin Optimizer data saved to file");
         Ok(())
+    }
+
+    fn optimizer_save_to_automation_file(&mut self, json: String) -> Result<()> {
+        let output_dir = if let Some(folder) = &self.saved_state.save_result_folder {
+            folder.clone()
+        } else {
+            let exe_path = std::env::current_exe().context("Unable to locate current executable")?;
+            exe_path
+                .parent()
+                .map(|path| path.to_path_buf())
+                .unwrap_or(std::env::current_dir()?)
+        };
+
+        fs::create_dir_all(&output_dir)
+            .with_context(|| format!("Unable to create output directory {output_dir:?}"))?;
+        let file_name = format!("genshin_export_{}.json", Local::now().format("%Y-%m-%d_%H-%M-%S"));
+        let path = output_dir.join(file_name);
+
+        let file = File::create(&path).with_context(|| format!("Unable to open file {path:?}"))?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(json.as_bytes())?;
+
+        self.toasts
+            .info(format!("Automation saved result to {}", path.display()));
+        Ok(())
+    }
+
+    fn update_capture_cycle_state(&mut self, app_state: &AppState) {
+        if app_state.capturing {
+            self.automation_capture_requested = false;
+            if self.automation_cycle_started_at.is_none() {
+                self.automation_cycle_started_at = Some(Instant::now());
+            }
+        } else {
+            self.automation_cycle_started_at = None;
+        }
+    }
+
+    fn handle_automation_export(&mut self, app_state: &AppState) {
+        if !self.saved_state.save_result_to_file || self.optimizer_export_rx.is_some() {
+            return;
+        }
+        let Some(capture_started_at) = self.automation_cycle_started_at else {
+            return;
+        };
+        let Some(items_updated_at) = app_state.updated.items_updated else {
+            return;
+        };
+        let Some(characters_updated_at) = app_state.updated.characters_updated else {
+            return;
+        };
+        if items_updated_at <= capture_started_at || characters_updated_at <= capture_started_at {
+            return;
+        }
+
+        let signature = (
+            app_state.updated.items_updated,
+            app_state.updated.characters_updated,
+            app_state.updated.achievements_updated,
+        );
+        if self.last_automation_signature == Some(signature) {
+            return;
+        }
+
+        self.last_automation_signature = Some(signature);
+        self.genshin_optimizer_request_export(OptimizerExportTarget::Automation);
+    }
+
+    fn reset_capture_for_next_cycle(&mut self) {
+        self.automation_cycle_started_at = Some(Instant::now());
+        let _ = self.ui_message_tx.send(Message::StopCapture);
+        self.request_capture_start();
+    }
+
+    fn enforce_capture_when_automation_enabled(&mut self, app_state: &AppState) {
+        if !self.saved_state.save_result_to_file {
+            self.automation_capture_requested = false;
+            return;
+        }
+        if app_state.capturing {
+            self.automation_capture_requested = false;
+            return;
+        }
+        self.request_capture_start();
+    }
+
+    fn request_capture_start(&mut self) {
+        if self.automation_capture_requested {
+            return;
+        }
+        if self.ui_message_tx.send(Message::StartCapture).is_ok() {
+            self.automation_capture_requested = true;
+        }
     }
 
     fn achievement_ui(&self, ui: &mut egui::Ui, _app_state: &AppState) {
