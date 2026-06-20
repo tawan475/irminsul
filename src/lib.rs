@@ -454,12 +454,29 @@ pub fn matches_player_property_packet(game_command: &GameCommand) -> Option<std:
                                 if let Ok(prop_msg) = crate::r#gen::protos::Unk::parse_from_bytes(prop_value_bytes) {
                                     let mut max_val: u64 = 0;
                                     for (_, p_data) in prop_msg.unknown_fields().iter() {
-                                        if let Varint(p_val) = p_data {
-                                            if p_val > max_val && p_val != (key as u64) {
-                                                max_val = p_val;
+                                        match p_data {
+                                            Varint(p_val) => {
+                                                if p_val > max_val && p_val != (key as u64) {
+                                                    max_val = p_val;
+                                                }
                                             }
+                                            protobuf::UnknownValueRef::Fixed32(p_val) => {
+                                                let int_val = p_val as u64;
+                                                if int_val > max_val && int_val != (key as u64) {
+                                                    max_val = int_val;
+                                                }
+                                            }
+                                            protobuf::UnknownValueRef::Fixed64(p_val) => {
+                                                let int_val = p_val;
+                                                if int_val > max_val && int_val != (key as u64) {
+                                                    max_val = int_val;
+                                                }
+                                            }
+                                            _ => {}
                                         }
                                     }
+                                    #[cfg(debug_assertions)]
+                                    tracing::info!("Parsed Property ID: {}, Value: {}", key, max_val);
                                     if max_val > 0 {
                                         properties.insert(key, max_val as u32);
                                     }
