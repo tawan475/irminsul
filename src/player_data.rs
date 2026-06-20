@@ -137,6 +137,10 @@ impl PlayerData {
                 continue;
             }
 
+            if item.item_id == 120292 && item.has_material() {
+                continue;
+            }
+
             if item.has_material() {
                 self.items.insert(item.guid, item.clone());
             } else if item.has_equip() {
