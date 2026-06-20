@@ -2254,7 +2254,7 @@ checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 
 [[package]]
 name = "irminsul"
-version = "0.1.17-T-1"
+version = "0.1.17-T-2"
 dependencies = [
  "anime-game-data",
  "anyhow",
