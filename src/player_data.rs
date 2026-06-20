@@ -9,6 +9,61 @@ use serde::{Deserialize, Serialize};
 
 use crate::good::{self, fake_uninitialized_4th_line};
 
+fn map_property_id_to_name(id: u32) -> String {
+    match id {
+        1001 => "Exp".to_string(),
+        1002 => "BreakLevel".to_string(),
+        1003 => "SatiationVal".to_string(),
+        1004 => "SatiationPenaltyTime".to_string(),
+        4001 => "Level".to_string(),
+        10001 => "LastChangeAvatarTime".to_string(),
+        10002 => "MaxSpringVolume".to_string(),
+        10003 => "CurSpringVolume".to_string(),
+        10004 => "IsSpringAutoUse".to_string(),
+        10005 => "SpringAutoUsePercent".to_string(),
+        10006 => "IsFlyable".to_string(),
+        10007 => "IsWeatherLocked".to_string(),
+        10008 => "IsGameTimeLocked".to_string(),
+        10009 => "IsTransferable".to_string(),
+        10010 => "MaxStamina".to_string(),
+        10011 => "CurPersistStamina".to_string(),
+        10012 => "CurTemporaryStamina".to_string(),
+        10013 => "AdventureRank".to_string(),
+        10014 => "AdventureExp".to_string(),
+        10015 => "Primogem".to_string(),
+        10016 => "Mora".to_string(),
+        10017 => "MpSettingType".to_string(),
+        10018 => "IsMpModeAvailable".to_string(),
+        10019 => "WorldLevel".to_string(),
+        10020 => "OriginalResin".to_string(),
+        10022 => "WaitSubHcoin".to_string(),
+        10023 => "WaitSubScoin".to_string(),
+        10024 => "IsOnlyMpWithPsPlayer".to_string(),
+        10025 => "GenesisCrystal".to_string(),
+        10026 => "WaitSubMcoin".to_string(),
+        10027 => "StoryKeys".to_string(),
+        10028 => "IsHasFirstShare".to_string(),
+        10029 => "ForgePoint".to_string(),
+        10035 => "CurClimateMeter".to_string(),
+        10036 => "CurClimateType".to_string(),
+        10037 => "CurClimateAreaId".to_string(),
+        10038 => "CurClimateAreaClimateType".to_string(),
+        10039 => "WorldLevelLimit".to_string(),
+        10040 => "WorldLevelAdjustCd".to_string(),
+        10041 => "LegendaryDailyTaskNum".to_string(),
+        10042 => "RealmCurrency".to_string(),
+        10043 => "WaitSubHomeCoin".to_string(),
+        10044 => "IsAutoUnlockSpecificEquip".to_string(),
+        10045 => "GcgCoin".to_string(),
+        10046 => "WaitSubGcgCoin".to_string(),
+        10047 => "OnlineTime".to_string(),
+        10048 => "CanDive".to_string(),
+        10049 => "DiveMaxStamina".to_string(),
+        10050 => "DiveCurStamina".to_string(),
+        _ => format!("Property_{}", id),
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ExportSettings {
     pub include_characters: bool,
@@ -32,9 +87,10 @@ pub struct ExportSettings {
 
 pub struct PlayerData {
     game_data: AnimeGameData,
-    achievements: Vec<Achievement>,
-    characters: Vec<AvatarInfo>,
-    items: Vec<Item>,
+    achievements: HashMap<u32, Achievement>,
+    characters: HashMap<u32, AvatarInfo>,
+    items: HashMap<u64, Item>,
+    properties: HashMap<u32, u32>,
 
     character_equip_guid_map: HashMap<u64, u32>,
 }
@@ -43,30 +99,52 @@ impl PlayerData {
     pub fn new(game_data: AnimeGameData) -> Self {
         Self {
             game_data,
-            achievements: Vec::new(),
-            characters: Vec::new(),
-            items: Vec::new(),
+            achievements: HashMap::new(),
+            characters: HashMap::new(),
+            items: HashMap::new(),
+            properties: HashMap::new(),
             character_equip_guid_map: HashMap::new(),
         }
     }
 
     pub fn process_achievements(&mut self, achievements: &[Achievement]) {
-        self.achievements = achievements.into();
+        for achievement in achievements {
+            self.achievements.insert(achievement.id, achievement.clone());
+        }
     }
 
+    pub fn process_properties(&mut self, new_props: &HashMap<u32, u32>) {
+        for (k, v) in new_props {
+            self.properties.insert(*k, *v);
+        }
+    }
+
+
     pub fn process_characters(&mut self, avatars: &[AvatarInfo]) {
-        self.character_equip_guid_map.clear();
         for avatar in avatars {
             for guid in &avatar.equip_guid_list {
                 self.character_equip_guid_map
                     .insert(*guid, avatar.avatar_id);
             }
+            self.characters.insert(avatar.avatar_id, avatar.clone());
         }
-        self.characters = avatars.into();
     }
 
     pub fn process_items(&mut self, items: &[Item]) {
-        self.items = items.into();
+        for item in items {
+            // Virtual items like Mora have guid = 0, so they would collide if we inserted them into `self.items`.
+            if item.item_id == 202 && item.has_material() {
+                continue;
+            }
+
+            if item.has_material() {
+                self.items.insert(item.guid, item.clone());
+            } else if item.has_equip() {
+                self.items.insert(item.guid, item.clone());
+            } else if item.has_furniture() {
+                self.items.insert(item.guid, item.clone());
+            }
+        }
     }
 
     pub fn export_genshin_optimizer(&self, settings: &ExportSettings) -> Result<String> {
@@ -111,7 +189,7 @@ impl PlayerData {
         settings: &ExportSettings,
     ) -> Vec<good::Character> {
         self.characters
-            .iter()
+            .values()
             .filter_map(|character| {
                 if character.avatar_type != 1 {
                     return None;
@@ -169,7 +247,7 @@ impl PlayerData {
         settings: &ExportSettings,
     ) -> Vec<good::Artifact> {
         self.items
-            .iter()
+            .values()
             .filter_map(|item| {
                 if !item.has_equip() {
                     return None;
@@ -258,7 +336,7 @@ impl PlayerData {
 
     pub fn export_genshin_optimizer_weapons(&self, settings: &ExportSettings) -> Vec<good::Weapon> {
         self.items
-            .iter()
+            .values()
             .filter_map(|item| {
                 if !item.has_equip() {
                     return None;
@@ -311,17 +389,27 @@ impl PlayerData {
     }
 
     pub fn export_genshin_optimizer_materials(&self) -> HashMap<String, u32> {
-        self.items
-            .iter()
+        let mut materials: HashMap<String, u32> = self.items
+            .values()
             .filter_map(|item| {
                 if !item.has_material() {
                     return None;
                 }
                 let material = item.material();
+
+
+
                 let name = self.game_data.get_material(item.item_id).ok()?;
 
                 Some((good::to_good_key(name), material.count))
             })
-            .collect()
+            .collect();
+
+        // Export explicitly tracked properties as materials
+        for (prop_id, value) in &self.properties {
+            materials.insert(map_property_id_to_name(*prop_id), *value);
+        }
+
+        materials
     }
 }

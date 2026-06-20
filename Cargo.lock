@@ -519,7 +519,7 @@ dependencies = [
 [[package]]
 name = "auto-artifactarium"
 version = "1.4.0"
-source = "git+https://github.com/konkers/auto-artifactarium?rev=07be683fb80e9940d8cc629ab769dbd6307bcaaa#07be683fb80e9940d8cc629ab769dbd6307bcaaa"
+source = "git+https://github.com/tawan475/auto-artifactarium#72b4aeda0f5cdd5d4ec38afe65e54e878868462b"
 dependencies = [
  "anyhow",
  "base64",
@@ -2264,7 +2264,7 @@ checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 
 [[package]]
 name = "irminsul"
-version = "0.1.17"
+version = "0.1.17-T-1"
 dependencies = [
  "anime-game-data",
  "anyhow",
