@@ -52,6 +52,8 @@ pub enum Message {
     StartCapture,
     StopCapture,
     ExportGenshinOptimizer(ExportSettings, oneshot::Sender<Result<String>>),
+    ExportAchievements(oneshot::Sender<Result<Vec<u32>>>),
+    FindWishUrl(oneshot::Sender<Result<String>>),
 }
 
 #[derive(Clone, Debug)]

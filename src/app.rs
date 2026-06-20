@@ -96,6 +96,10 @@ pub struct IrminsulApp {
 
     optimizer_settings_open: bool,
     optimizer_export_rx: Option<oneshot::Receiver<Result<String>>>,
+    achievements_export_rx: Option<oneshot::Receiver<Result<Vec<u32>>>>,
+    wish_url_rx_oneshot: Option<oneshot::Receiver<Result<String>>>,
+    wish_link_failed_for: Option<String>,
+    pending_open_url: Option<String>,
     optimizer_save_dialog: Option<FileDialog>,
     optimizer_save_path: Option<PathBuf>,
     optimizer_export_target: OptimizerExportTarget,
@@ -262,6 +266,10 @@ impl IrminsulApp {
             automation_folder_dialog: None,
             optimizer_settings_open: false,
             optimizer_export_rx: None,
+            achievements_export_rx: None,
+            wish_url_rx_oneshot: None,
+            wish_link_failed_for: None,
+            pending_open_url: None,
             optimizer_save_dialog: None,
             optimizer_save_path: None,
             optimizer_export_target: OptimizerExportTarget::None,
@@ -548,9 +556,9 @@ impl IrminsulApp {
         ui.separator();
         self.wish_ui(ui);
         ui.separator();
-        self.automation_ui(ui);
-        ui.separator();
         self.achievement_ui(ui, app_state);
+        ui.separator();
+        self.automation_ui(ui);
     }
 
     fn capture_ui(&mut self, ui: &mut egui::Ui, app_state: &AppState) {
@@ -627,6 +635,7 @@ impl IrminsulApp {
                     ui.add_enabled_ui(
                         app_state.updated.characters_updated.is_some()
                             && app_state.updated.items_updated.is_some()
+                            && app_state.updated.achievements_updated.is_some()
                             && self.optimizer_export_rx.is_none(),
                         |ui| {
                             if ui
@@ -678,6 +687,7 @@ impl IrminsulApp {
 
     fn wish_ui(&mut self, ui: &mut egui::Ui) {
         self.optimizer_handle_export(ui).toast_error(self);
+        self.wish_handle_find_url(ui).toast_error(self);
 
         let wish_url = self.wish_url_rx.borrow_and_update().clone();
         ui.vertical(|ui| {
@@ -689,19 +699,80 @@ impl IrminsulApp {
                         .on_hover_text("Click the Copy icon to copy the wish URL to the clipboard.  Paste this into paimon.moe using the Manual auto-import method.");
                 },
                 |ui| {
-                    ui.add_enabled_ui(wish_url.is_some(), |ui| {
+                    ui.add_enabled_ui(self.wish_url_rx_oneshot.is_none(), |ui| {
                         if ui
                             .button(egui_material_icons::icons::ICON_CONTENT_PASTE_GO)
                             .clicked()
                         {
-                            if let Some(url) = wish_url {
-                                ui.ctx().copy_text(url);
+                            if let Some(url) = &wish_url {
+                                ui.ctx().copy_text(url.clone());
+                                self.toasts.info("Wish URL copied to clipboard");
+                                self.wish_link_failed_for = None;
+                            } else {
+                                let (tx, rx) = oneshot::channel();
+                                let _ = self.ui_message_tx.send(Message::FindWishUrl(tx));
+                                self.wish_url_rx_oneshot = Some(rx);
+                                self.pending_open_url = None;
+                                self.wish_link_failed_for = None;
                             }
                         }
                     });
                 },
             );
+            ui.horizontal(|ui| {
+                if ui.link("Open Paimon.moe").clicked() {
+                    self.handle_wish_open_button(ui, wish_url.clone(), "https://paimon.moe/wish/import");
+                }
+                if ui.link("Open StarDB").clicked() {
+                    self.handle_wish_open_button(ui, wish_url.clone(), "https://stardb.gg/en/genshin/wish-import");
+                }
+            });
         });
+    }
+
+    fn wish_handle_find_url(&mut self, ui: &mut egui::Ui) -> Result<()> {
+        let Some(rx) = self.wish_url_rx_oneshot.take() else {
+            return Ok(());
+        };
+
+        match rx.blocking_recv() {
+            Ok(Ok(url)) => {
+                ui.ctx().copy_text(url);
+                self.toasts.info("Wish URL copied to clipboard");
+                self.wish_link_failed_for = None;
+                if let Some(target_url) = self.pending_open_url.take() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(target_url));
+                }
+            }
+            Ok(Err(_)) | Err(_) => {
+                if let Some(target_url) = self.pending_open_url.take() {
+                    self.wish_link_failed_for = Some(target_url);
+                    self.toasts.error("Link not found, click again to open anyways");
+                } else {
+                    self.wish_link_failed_for = None;
+                    self.toasts.error("Could not find Wish URL. Please open the Wish History in-game first.");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_wish_open_button(&mut self, ui: &mut egui::Ui, wish_url: Option<String>, target_url: &str) {
+        if self.wish_link_failed_for.as_deref() == Some(target_url) {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(target_url));
+            self.wish_link_failed_for = None;
+        } else if let Some(url) = wish_url {
+            ui.ctx().copy_text(url);
+            self.toasts.info("Wish URL copied to clipboard");
+            ui.ctx().open_url(egui::OpenUrl::new_tab(target_url));
+            self.wish_link_failed_for = None;
+        } else {
+            let (tx, rx) = oneshot::channel();
+            let _ = self.ui_message_tx.send(Message::FindWishUrl(tx));
+            self.wish_url_rx_oneshot = Some(rx);
+            self.pending_open_url = Some(target_url.to_string());
+            self.wish_link_failed_for = None;
+        }
     }
 
     fn automation_ui(&mut self, ui: &mut egui::Ui) {
@@ -1110,7 +1181,13 @@ impl IrminsulApp {
         let Some(characters_updated_at) = app_state.updated.characters_updated else {
             return;
         };
-        if items_updated_at <= capture_started_at || characters_updated_at <= capture_started_at {
+        let Some(achievements_updated_at) = app_state.updated.achievements_updated else {
+            return;
+        };
+        if items_updated_at <= capture_started_at
+            || characters_updated_at <= capture_started_at
+            || achievements_updated_at <= capture_started_at
+        {
             return;
         }
 
@@ -1154,9 +1231,82 @@ impl IrminsulApp {
         }
     }
 
-    fn achievement_ui(&self, ui: &mut egui::Ui, _app_state: &AppState) {
+    fn achievement_ui(&mut self, ui: &mut egui::Ui, app_state: &AppState) {
+        self.achievements_handle_export(ui).toast_error(self);
+
         Self::section_header(ui, "Achievement Export");
-        ui.label("coming soon".to_string());
+
+        ui.add_enabled_ui(
+            self.achievements_export_rx.is_none(),
+            |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Copy Achievements").clicked() {
+                        if app_state.updated.achievements_updated.is_some() {
+                            let (tx, rx) = oneshot::channel();
+                            let _ = self.ui_message_tx.send(Message::ExportAchievements(tx));
+                            self.achievements_export_rx = Some(rx);
+                            self.wish_link_failed_for = None;
+                        } else {
+                            self.wish_link_failed_for = None;
+                            self.toasts.error("Achievements not found. Open the achievements menu in-game first.");
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.link("Open StarDB").clicked() {
+                        self.handle_achievement_open_button(app_state, ui, "https://stardb.gg/import");
+                    }
+                    if ui.link("Open Seelie.me").clicked() {
+                        self.handle_achievement_open_button(app_state, ui, "https://seelie.me/achievements");
+                    }
+                });
+            },
+        );
+    }
+
+    fn achievements_handle_export(&mut self, ui: &mut egui::Ui) -> Result<()> {
+        let Some(rx) = self.achievements_export_rx.take() else {
+            return Ok(());
+        };
+
+        match rx.blocking_recv() {
+            Ok(Ok(achievements)) => {
+                let json = serde_json::json!({ "gi_achievements": achievements }).to_string();
+                ui.ctx().copy_text(json);
+                self.toasts
+                    .info(format!("{} Achievements copied to clipboard", achievements.len()));
+                self.wish_link_failed_for = None;
+                if let Some(target_url) = self.pending_open_url.take() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(target_url));
+                }
+            }
+            Ok(Err(_)) | Err(_) => {
+                if let Some(target_url) = self.pending_open_url.take() {
+                    self.wish_link_failed_for = Some(target_url);
+                    self.toasts.error("Export failed, click again to open anyways");
+                } else {
+                    self.wish_link_failed_for = None;
+                    self.toasts.error("Export failed. Please open the achievements menu in-game first.");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_achievement_open_button(&mut self, app_state: &AppState, ui: &mut egui::Ui, target_url: &str) {
+        if self.wish_link_failed_for.as_deref() == Some(target_url) {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(target_url));
+            self.wish_link_failed_for = None;
+        } else if app_state.updated.achievements_updated.is_some() {
+            let (tx, rx) = oneshot::channel();
+            let _ = self.ui_message_tx.send(Message::ExportAchievements(tx));
+            self.achievements_export_rx = Some(rx);
+            self.pending_open_url = Some(target_url.to_string());
+            self.wish_link_failed_for = None;
+        } else {
+            self.wish_link_failed_for = Some(target_url.to_string());
+            self.toasts.error("Achievements not found, click again to open anyways");
+        }
     }
 
     fn section_header(ui: &mut egui::Ui, name: &str) {

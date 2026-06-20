@@ -98,7 +98,7 @@ impl Wish {
     }
 
     async fn get_web_cache_path(&self) -> Result<PathBuf> {
-        let data_dir = self.get_data_dir().await?;
+        let data_dir = get_data_dir(&self.output_log_path).await?;
         let mut web_cache_path = get_web_cache_dir(data_dir).await?;
 
         web_cache_path.push("Cache/Cache_Data/data_2");
@@ -106,44 +106,13 @@ impl Wish {
         Ok(web_cache_path)
     }
 
-    async fn get_data_dir(&self) -> Result<PathBuf> {
-        let output_log_path = &self.output_log_path;
-        let file = fs::File::open(output_log_path)
-            .await
-            .with_context(|| format!("could not open {output_log_path:?}"))?;
-        let reader = BufReader::new(file);
-        let mut lines = reader.lines();
-
-        let game_data_re = Regex::new(r"(?m).:[/\\].+(GenshinImpact_Data|YuanShen_Data)")?;
-        while let Some(line) = lines.next_line().await? {
-            if let Some(game_data_path) = game_data_re.captures_iter(&line).next()
-                && let Some(game_data_path) = game_data_path.get(0)
-            {
-                return Ok(game_data_path.as_str().into());
-            }
-        }
-
-        Err(anyhow!("Can't find game data path in {output_log_path:?}"))
-    }
-
     async fn handle_web_cache_dir_update(&mut self) -> Result<()> {
         tracing::info!("handling web cache dir update");
-        let Some(data_path) = &mut self.web_cache_path else {
+        let Some(data_path) = &self.web_cache_path else {
             return Ok(());
         };
 
-        let data = fs::read(&data_path)
-            .await
-            .with_context(|| format!("could not open file {data_path:?}"))?;
-        let strings = String::from_utf8_lossy(&data);
-
-        let url_re = Regex::new("(https.+?webview_gacha.+?game_biz=)")?;
-
-        let url = url_re
-            .captures_iter(&strings)
-            .filter_map(|c| c.get(0).map(|s| s.as_str().to_string()))
-            .last()
-            .ok_or_else(|| anyhow!("Can't find URL in {data_path:?}"))?;
+        let url = extract_url_from_cache(data_path).await?;
 
         // Don't attempt to validate the same URL more than once.
         if url == self.prev_url {
@@ -159,6 +128,52 @@ impl Wish {
         Ok(())
     }
 }
+
+pub async fn force_find_url() -> Result<String> {
+    let output_log_path = output_log_path()?;
+    let data_dir = get_data_dir(&output_log_path).await?;
+    let mut web_cache_path = get_web_cache_dir(data_dir).await?;
+    web_cache_path.push("Cache/Cache_Data/data_2");
+    
+    let url = extract_url_from_cache(&web_cache_path).await?;
+    validate_url(&url).await?;
+    Ok(url)
+}
+
+async fn extract_url_from_cache(data_path: &PathBuf) -> Result<String> {
+    let data = fs::read(data_path)
+        .await
+        .with_context(|| format!("could not open file {data_path:?}"))?;
+    let strings = String::from_utf8_lossy(&data);
+
+    let url_re = Regex::new("(https.+?webview_gacha.+?game_biz=)")?;
+
+    url_re
+        .captures_iter(&strings)
+        .filter_map(|c| c.get(0).map(|s| s.as_str().to_string()))
+        .last()
+        .ok_or_else(|| anyhow!("Can't find URL in {data_path:?}"))
+}
+
+async fn get_data_dir(output_log_path: &PathBuf) -> Result<PathBuf> {
+    let file = fs::File::open(output_log_path)
+        .await
+        .with_context(|| format!("could not open {output_log_path:?}"))?;
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+
+    let game_data_re = Regex::new(r"(?m).:[/\\].+(GenshinImpact_Data|YuanShen_Data)")?;
+    while let Some(line) = lines.next_line().await? {
+        if let Some(game_data_path) = game_data_re.captures_iter(&line).next()
+            && let Some(game_data_path) = game_data_path.get(0)
+        {
+            return Ok(game_data_path.as_str().into());
+        }
+    }
+
+    Err(anyhow!("Can't find game data path in {output_log_path:?}"))
+}
+
 
 fn output_log_path() -> Result<PathBuf> {
     let user_profile = env::var("userprofile").context("could not find userprofile var")?;
