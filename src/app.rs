@@ -1234,34 +1234,45 @@ impl IrminsulApp {
     fn achievement_ui(&mut self, ui: &mut egui::Ui, app_state: &AppState) {
         self.achievements_handle_export(ui).toast_error(self);
 
-        Self::section_header(ui, "Achievement Export");
-
-        ui.add_enabled_ui(
-            self.achievements_export_rx.is_none(),
-            |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("Copy Achievements").clicked() {
-                        if app_state.updated.achievements_updated.is_some() {
-                            let (tx, rx) = oneshot::channel();
-                            let _ = self.ui_message_tx.send(Message::ExportAchievements(tx));
-                            self.achievements_export_rx = Some(rx);
-                            self.wish_link_failed_for = None;
-                        } else {
-                            self.wish_link_failed_for = None;
-                            self.toasts.error("Achievements not found. Open the achievements menu in-game first.");
-                        }
-                    }
-                });
-                ui.horizontal(|ui| {
-                    if ui.link("Open StarDB").clicked() {
-                        self.handle_achievement_open_button(app_state, ui, "https://stardb.gg/import");
-                    }
-                    if ui.link("Open Seelie.me").clicked() {
-                        self.handle_achievement_open_button(app_state, ui, "https://seelie.me/achievements");
-                    }
-                });
-            },
-        );
+        ui.vertical(|ui| {
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    Self::section_header(ui, "Achievement Export");
+                    ui.label(egui_material_icons::icons::ICON_HELP)
+                        .on_hover_text("Click the Copy icon to copy your achievements to the clipboard.");
+                },
+                |ui| {
+                    ui.add_enabled_ui(
+                        self.achievements_export_rx.is_none(),
+                        |ui| {
+                            if ui
+                                .button(egui_material_icons::icons::ICON_CONTENT_PASTE_GO)
+                                .clicked()
+                            {
+                                if app_state.updated.achievements_updated.is_some() {
+                                    let (tx, rx) = oneshot::channel();
+                                    let _ = self.ui_message_tx.send(Message::ExportAchievements(tx));
+                                    self.achievements_export_rx = Some(rx);
+                                    self.wish_link_failed_for = None;
+                                } else {
+                                    self.wish_link_failed_for = None;
+                                    self.toasts.error("Achievements not found. Open the achievements menu in-game first.");
+                                }
+                            }
+                        },
+                    );
+                },
+            );
+            ui.horizontal(|ui| {
+                if ui.link("Open StarDB").clicked() {
+                    self.handle_achievement_open_button(app_state, ui, "https://stardb.gg/import");
+                }
+                if ui.link("Open Seelie.me").clicked() {
+                    self.handle_achievement_open_button(app_state, ui, "https://seelie.me/achievements");
+                }
+            });
+        });
     }
 
     fn achievements_handle_export(&mut self, ui: &mut egui::Ui) -> Result<()> {
