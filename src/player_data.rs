@@ -147,6 +147,16 @@ impl PlayerData {
         }
     }
 
+    pub fn export_achievements(&self) -> Result<Vec<u32>> {
+        let mut ids = Vec::new();
+        for ach in self.achievements.values() {
+            if ach.status == 2 || ach.status == 3 {
+                ids.push(ach.id);
+            }
+        }
+        Ok(ids)
+    }
+
     pub fn export_genshin_optimizer(&self, settings: &ExportSettings) -> Result<String> {
         let mut good = good::Good {
             format: "GOOD".to_string(),
@@ -156,6 +166,7 @@ impl PlayerData {
             artifacts: Vec::new(),
             weapons: Vec::new(),
             materials: HashMap::new(),
+            gi_achievements: Some(self.export_achievements().unwrap_or_default()),
         };
 
         if settings.include_characters {

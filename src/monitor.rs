@@ -130,6 +130,14 @@ impl Monitor {
             Message::ExportGenshinOptimizer(settings, reply_tx) => {
                 let _ = reply_tx.send(self.player_data.export_genshin_optimizer(&settings));
             }
+            Message::ExportAchievements(reply_tx) => {
+                let _ = reply_tx.send(self.player_data.export_achievements());
+            }
+            Message::FindWishUrl(reply_tx) => {
+                tokio::spawn(async move {
+                    let _ = reply_tx.send(crate::wish::force_find_url().await);
+                });
+            }
             _ => (),
         }
     }
