@@ -99,6 +99,7 @@ pub enum ConnectionPacket {
 enum CommandId {
     AvatarDataNotify = 21044,
     PlayerStoreNotify = 24051,
+    PlayerPropertyNotify = 7426,
 }
 
 /// Game command header.
@@ -170,6 +171,10 @@ impl GameCommand {
 
     pub fn is_player_store_notify(&self) -> bool {
         self.command_id == CommandId::PlayerStoreNotify as u16
+    }
+
+    pub fn is_player_property_notify(&self) -> bool {
+        self.command_id == CommandId::PlayerPropertyNotify as u16
     }
 }
 
@@ -372,6 +377,7 @@ impl GameSniffer {
         let _enter = span.enter();
 
         info!("received");
+        tracing::info!("Decrypted command: ID {}, len {}", command.command_id, command.proto_data.len());
         trace!(data = BASE64_STANDARD.encode(&command.proto_data), "data");
 
         // if !matches!(
@@ -416,3 +422,61 @@ pub fn matches_avatar_packet(game_command: &GameCommand) -> Option<Vec<r#gen::pr
 
     return matches_avatars_all_data_notify(&game_command.proto_data);
 }
+pub fn matches_player_property_packet(game_command: &GameCommand) -> Option<std::collections::HashMap<u32, u32>> {
+    if game_command.command_id != 7426 {
+        return None;
+    }
+
+    use protobuf::Message;
+    use protobuf::UnknownValueRef::{LengthDelimited, Varint};
+    let Ok(d_msg) = crate::r#gen::protos::Unk::parse_from_bytes(&game_command.proto_data) else {
+        return None;
+    };
+
+    let mut properties = std::collections::HashMap::new();
+
+    for (_, field_data) in d_msg.unknown_fields().iter() {
+        if let LengthDelimited(map_entry_bytes) = field_data {
+            if let Ok(entry_msg) = crate::r#gen::protos::Unk::parse_from_bytes(map_entry_bytes) {
+                let entry_fields = entry_msg.unknown_fields();
+                let mut key: Option<u32> = None;
+                for (fnum, v_data) in entry_fields.iter() {
+                    if fnum == 1 {
+                        if let Varint(k) = v_data {
+                            key = Some(k as u32);
+                        }
+                    }
+                }
+                if let Some(key) = key {
+                    for (fnum, v_data) in entry_fields.iter() {
+                        if fnum == 2 {
+                            if let LengthDelimited(prop_value_bytes) = v_data {
+                                if let Ok(prop_msg) = crate::r#gen::protos::Unk::parse_from_bytes(prop_value_bytes) {
+                                    let mut max_val: u64 = 0;
+                                    for (_, p_data) in prop_msg.unknown_fields().iter() {
+                                        if let Varint(p_val) = p_data {
+                                            if p_val > max_val && p_val != (key as u64) {
+                                                max_val = p_val;
+                                            }
+                                        }
+                                    }
+                                    if max_val > 0 {
+                                        properties.insert(key, max_val as u32);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if properties.is_empty() {
+        None
+    } else {
+        Some(properties)
+    }
+}
+
+

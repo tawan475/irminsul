@@ -108,6 +108,14 @@ message PropValue {
     }
 }
 
+message PlayerPropertyNotify {
+    map<uint32, PropValue> prop_map1 = 1;
+    map<uint32, PropValue> prop_map2 = 2;
+    map<uint32, PropValue> prop_map3 = 3;
+    map<uint32, PropValue> prop_map4 = 4;
+    map<uint32, PropValue> prop_map5 = 5;
+}
+
 message AvatarSkillInfo {
     uint32 pass_cd_time = 1;
     repeated uint32 full_cd_time_list = 2;

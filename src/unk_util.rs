@@ -10,7 +10,10 @@ use crate::r#gen::protos::AvatarDataNotify;
 use crate::r#gen::protos::AvatarInfo;
 use crate::r#gen::protos::Item;
 use crate::r#gen::protos::PacketWithItems;
+
 use crate::r#gen::protos::Unk;
+
+
 
 pub fn matches_get_player_token_rsp(
     data: Vec<u8>,
@@ -179,11 +182,11 @@ pub fn matches_achievement_all_data_notify(data: Vec<u8>) -> Option<Vec<Achievem
 pub fn matches_items_all_data_notify(data: &[u8]) -> Option<Vec<Item>> {
     let packet = PacketWithItems::parse_from_bytes(data).ok()?;
 
-    // Filter out items with 0 (default) item ID.
+    // Filter out items with 0 (default) item ID. Virtual items like Mora may have guid = 0.
     let items: Vec<Item> = packet
         .items
         .into_iter()
-        .filter(|item| item.item_id != 0 && item.guid != 0)
+        .filter(|item| item.item_id != 0)
         .collect();
 
     // Differentiate items packets from other that look alike.
