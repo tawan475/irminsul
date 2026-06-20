@@ -54,7 +54,7 @@ impl Default for SavedAppState {
                 min_character_ascension: 0,
                 min_character_constellation: 0,
                 min_artifact_level: 0,
-                min_artifact_rarity: 5,
+                min_artifact_rarity: 3,
                 min_weapon_level: 1,
                 min_weapon_refinement: 0,
                 min_weapon_ascension: 0,
@@ -387,7 +387,7 @@ impl eframe::App for IrminsulApp {
                         .clicked()
                     {
                         ui.ctx()
-                            .open_url(OpenUrl::new_tab("https://github.com/konkers/irminsul"));
+                            .open_url(OpenUrl::new_tab("https://github.com/tawan475/irminsul"));
                     }
 
                     let button = ui.add(
