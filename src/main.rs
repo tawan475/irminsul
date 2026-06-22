@@ -54,6 +54,8 @@ pub enum Message {
     ExportGenshinOptimizer(ExportSettings, oneshot::Sender<Result<String>>),
     ExportAchievements(oneshot::Sender<Result<Vec<u32>>>),
     FindWishUrl(oneshot::Sender<Result<String>>),
+    VerifyTrackerKey(String, String, oneshot::Sender<Result<(String, String, String)>>),
+    UploadToTracker(String, String, String, oneshot::Sender<Result<(), String>>),
 }
 
 #[derive(Clone, Debug)]

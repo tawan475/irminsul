@@ -171,6 +171,7 @@ impl PlayerData {
             weapons: Vec::new(),
             materials: HashMap::new(),
             gi_achievements: Some(self.export_achievements().unwrap_or_default()),
+            timestamp: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64),
         };
 
         if settings.include_characters {

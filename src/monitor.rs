@@ -138,6 +138,88 @@ impl Monitor {
                     let _ = reply_tx.send(crate::wish::force_find_url().await);
                 });
             }
+            Message::VerifyTrackerKey(url, key, reply_tx) => {
+                tokio::spawn(async move {
+                    let client = reqwest::Client::new();
+                    match client.get(&url).header("x-import-key", &key).send().await {
+                        Ok(res) => {
+                            let status = res.status();
+                            match res.text().await {
+                                Ok(body) => {
+                                    tracing::info!("Verify key response ({}): {}", status, body);
+                                    if !status.is_success() {
+                                        let _ = reply_tx.send(Err(anyhow::anyhow!("Verify failed: HTTP {}", status)));
+                                        return;
+                                    }
+                                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                                        // Backend wraps responses in { data: { ... } }
+                                        let inner = json.get("data").unwrap_or(&json);
+                                        let name = inner.get("accountName")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("Unknown")
+                                            .to_string();
+                                        let uid = inner.get("uid")
+                                            .map(|v| match v {
+                                                serde_json::Value::String(s) => s.clone(),
+                                                serde_json::Value::Number(n) => n.to_string(),
+                                                _ => "N/A".to_string(),
+                                            })
+                                            .unwrap_or_else(|| "N/A".to_string());
+                                        let server = inner.get("server")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("N/A")
+                                            .to_string();
+                                        let _ = reply_tx.send(Ok((name, uid, server)));
+                                    } else {
+                                        let _ = reply_tx.send(Err(anyhow::anyhow!("Invalid JSON response")));
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = reply_tx.send(Err(anyhow::anyhow!("Failed to read response: {}", e)));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = reply_tx.send(Err(anyhow::anyhow!("Request failed: {}", e)));
+                        }
+                    }
+                });
+            }
+            Message::UploadToTracker(json, url, key, reply_tx) => {
+                tokio::spawn(async move {
+                    let client = reqwest::Client::new();
+                    
+                    let part = reqwest::multipart::Part::bytes(json.into_bytes())
+                        .file_name("irminsul_capture.json")
+                        .mime_str("application/json")
+                        .unwrap();
+                        
+                    let form = reqwest::multipart::Form::new().part("file", part);
+                    
+                    match client.post(&url)
+                        .header("x-import-key", &key)
+                        .multipart(form)
+                        .send()
+                        .await 
+                    {
+                        Ok(res) => {
+                            let status = res.status();
+                            let body = res.text().await.unwrap_or_default();
+                            if !status.is_success() {
+                                tracing::error!("Tracker upload failed ({}): {}", status, body);
+                                let _ = reply_tx.send(Err(format!("HTTP {} - {}", status, body)));
+                            } else {
+                                tracing::info!("Successfully uploaded data to tracker");
+                                let _ = reply_tx.send(Ok(()));
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Tracker upload request failed: {}", e);
+                            let _ = reply_tx.send(Err(e.to_string()));
+                        }
+                    }
+                });
+            }
             _ => (),
         }
     }

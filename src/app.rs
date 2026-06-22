@@ -39,6 +39,14 @@ pub struct SavedAppState {
     log_raw_packets: bool,
     #[serde(default)]
     tracing_level: TracingLevel,
+    #[serde(default)]
+    tracker_import_key: String,
+    #[serde(default = "default_tracker_url")]
+    tracker_api_url: String,
+}
+
+fn default_tracker_url() -> String {
+    "http://localhost:3000".to_string()
 }
 
 impl Default for SavedAppState {
@@ -66,6 +74,8 @@ impl Default for SavedAppState {
             save_result_folder: None,
             log_raw_packets: false,
             tracing_level: Default::default(),
+            tracker_import_key: String::new(),
+            tracker_api_url: default_tracker_url(),
         }
     }
 }
@@ -106,10 +116,16 @@ pub struct IrminsulApp {
 
     restarting: bool,
     last_automation_signature: Option<(Option<Instant>, Option<Instant>, Option<Instant>)>,
+    last_automation_export_at: Option<Instant>,
     automation_cycle_started_at: Option<Instant>,
     automation_capture_requested: bool,
 
     saved_state: SavedAppState,
+    
+    tracker_key_modal_open: bool,
+    tracker_account_name: Option<(String, String, String)>,
+    tracker_verify_rx: Option<oneshot::Receiver<Result<(String, String, String)>>>,
+    tracker_upload_rx: Option<oneshot::Receiver<Result<(), String>>>,
 }
 
 trait ToastError<T> {
@@ -253,6 +269,17 @@ impl IrminsulApp {
 
         let toasts = Toasts::default().with_anchor(egui_notify::Anchor::BottomLeft);
 
+        // Auto-verify tracker key on startup
+        let tracker_verify_rx = if !saved_state.tracker_import_key.is_empty() {
+            let key = saved_state.tracker_import_key.clone();
+            let url = format!("{}/genshin-accounts-public/verify-key", saved_state.tracker_api_url.trim_end_matches('/'));
+            let (tx, rx) = oneshot::channel();
+            let _ = ui_message_tx.send(Message::VerifyTrackerKey(url, key, tx));
+            Some(rx)
+        } else {
+            None
+        };
+
         Self {
             saved_state,
             ui_message_tx,
@@ -275,8 +302,13 @@ impl IrminsulApp {
             optimizer_export_target: OptimizerExportTarget::None,
             restarting: false,
             last_automation_signature: None,
+            last_automation_export_at: None,
             automation_cycle_started_at: None,
             automation_capture_requested: false,
+            tracker_key_modal_open: false,
+            tracker_account_name: None,
+            tracker_verify_rx,
+            tracker_upload_rx: None,
             state_rx,
             wish_url_rx,
         }
@@ -307,6 +339,16 @@ impl eframe::App for IrminsulApp {
             && let Some(path) = automation_folder_dialog.take_picked()
         {
             self.saved_state.save_result_folder = Some(path);
+        }
+
+        if let Some(rx) = &mut self.tracker_upload_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.tracker_upload_rx = None;
+                match result {
+                    Ok(_) => self.toasts.success("Successfully synced capture to Tracker!"),
+                    Err(e) => self.toasts.error(format!("Tracker sync failed: {}", e)),
+                };
+            }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -559,6 +601,8 @@ impl IrminsulApp {
         self.achievement_ui(ui, app_state);
         ui.separator();
         self.automation_ui(ui);
+        ui.separator();
+        self.tracker_ui(ui);
     }
 
     fn capture_ui(&mut self, ui: &mut egui::Ui, app_state: &AppState) {
@@ -813,7 +857,10 @@ impl IrminsulApp {
                     )
                     .changed();
                 if changed {
-                    if self.saved_state.save_result_to_file {
+                    let want_file = self.saved_state.save_result_to_file;
+                    let want_tracker = !self.saved_state.tracker_import_key.is_empty();
+
+                    if want_file || want_tracker {
                         self.automation_cycle_started_at = Some(Instant::now());
                         self.request_capture_start();
                     } else if previous_save_result_to_file {
@@ -826,6 +873,78 @@ impl IrminsulApp {
                     }
                 });
             });
+        });
+    }
+
+    fn tracker_ui(&mut self, ui: &mut egui::Ui) {
+        if self.tracker_key_modal_open {
+            let modal = Modal::new(Id::new("Tracker Key Modal")).show(ui.ctx(), |ui| {
+                ui.set_width(360.0);
+                ui.heading("Set Tracker Import Key");
+                ui.separator();
+                ui.label("Enter your Import Key generated from the GDT dashboard:");
+                ui.add(egui::TextEdit::singleline(&mut self.saved_state.tracker_import_key).password(true));
+                ui.separator();
+                if ui.button("Save & Close").clicked() {
+                    self.tracker_key_modal_open = false;
+                    // Trigger a fetch for account details
+                    let key = self.saved_state.tracker_import_key.clone();
+                    let url = format!("{}/genshin-accounts-public/verify-key", self.saved_state.tracker_api_url.trim_end_matches('/'));
+                    if !key.is_empty() {
+                        let (tx, rx) = oneshot::channel();
+                        let _ = self.ui_message_tx.send(Message::VerifyTrackerKey(url, key, tx));
+                        self.tracker_verify_rx = Some(rx);
+                        self.tracker_account_name = None;
+                    }
+                }
+            });
+            if modal.should_close() {
+                self.tracker_key_modal_open = false;
+            }
+        }
+        
+        if let Some(rx) = &mut self.tracker_verify_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.tracker_verify_rx = None;
+                match result {
+                    Ok(info) => {
+                        self.tracker_account_name = Some(info);
+                    }
+                    Err(e) => {
+                        self.tracker_account_name = None;
+                        self.toasts.error(format!("Failed to verify tracker key: {}", e));
+                    }
+                }
+            }
+        }
+
+        ui.vertical(|ui| {
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    Self::section_header(ui, "Tracker");
+                },
+                |ui| {
+                    if ui.button(egui_material_icons::icons::ICON_SETTINGS).clicked() {
+                        self.tracker_key_modal_open = true;
+                    }
+                },
+            );
+
+            if self.saved_state.tracker_import_key.is_empty() {
+                ui.label("No account linked.");
+            } else if let Some((name, uid, server)) = &self.tracker_account_name {
+                ui.label(RichText::new(format!("Account: {}", name)).color(Color32::from_hex("#00ab3f").unwrap()));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("UID: {}", uid)).color(Color32::GRAY));
+                    ui.label(RichText::new("•").color(Color32::DARK_GRAY));
+                    ui.label(RichText::new(format!("Server: {}", server)).color(Color32::GRAY));
+                });
+            } else if self.tracker_verify_rx.is_some() {
+                ui.label(RichText::new("Verifying...").color(Color32::YELLOW));
+            } else {
+                ui.label(RichText::new("Account Linked").color(Color32::YELLOW));
+            }
         });
     }
 
@@ -1102,7 +1221,14 @@ impl IrminsulApp {
                 self.optimizer_save_to_file(json)?;
             }
             OptimizerExportTarget::Automation => {
-                self.optimizer_save_to_automation_file(json)?;
+                if self.saved_state.save_result_to_file {
+                    self.optimizer_save_to_automation_file(json.clone())?;
+                }
+                
+                if !self.saved_state.tracker_import_key.is_empty() {
+                    self.tracker_upload_json(json);
+                }
+
                 self.reset_capture_for_next_cycle();
             }
         }
@@ -1130,6 +1256,18 @@ impl IrminsulApp {
 
         self.toasts.info("Genshin Optimizer data saved to file");
         Ok(())
+    }
+
+    fn tracker_upload_json(&mut self, json: String) {
+        let key = self.saved_state.tracker_import_key.clone();
+        let base_url = self.saved_state.tracker_api_url.clone();
+        let url = format!("{}/genshin-accounts-public/import-by-key", base_url.trim_end_matches('/'));
+        
+        self.toasts.info("Starting upload to Tracker...");
+
+        let (tx, rx) = oneshot::channel();
+        let _ = self.ui_message_tx.send(Message::UploadToTracker(json, url, key, tx));
+        self.tracker_upload_rx = Some(rx);
     }
 
     fn optimizer_save_to_automation_file(&mut self, json: String) -> Result<()> {
@@ -1169,9 +1307,24 @@ impl IrminsulApp {
     }
 
     fn handle_automation_export(&mut self, app_state: &AppState) {
-        if !self.saved_state.save_result_to_file || self.optimizer_export_rx.is_some() {
+        let want_file = self.saved_state.save_result_to_file;
+        let want_tracker = !self.saved_state.tracker_import_key.is_empty();
+
+        if !want_file && !want_tracker {
             return;
         }
+
+        if self.optimizer_export_rx.is_some() {
+            return;
+        }
+
+        // Cooldown: skip if last export was less than 5 seconds ago
+        if let Some(last_export) = self.last_automation_export_at {
+            if last_export.elapsed() < std::time::Duration::from_secs(5) {
+                return;
+            }
+        }
+
         let Some(capture_started_at) = self.automation_cycle_started_at else {
             return;
         };
@@ -1201,6 +1354,7 @@ impl IrminsulApp {
         }
 
         self.last_automation_signature = Some(signature);
+        self.last_automation_export_at = Some(Instant::now());
         self.genshin_optimizer_request_export(OptimizerExportTarget::Automation);
     }
 
@@ -1211,7 +1365,10 @@ impl IrminsulApp {
     }
 
     fn enforce_capture_when_automation_enabled(&mut self, app_state: &AppState) {
-        if !self.saved_state.save_result_to_file {
+        let want_file = self.saved_state.save_result_to_file;
+        let want_tracker = !self.saved_state.tracker_import_key.is_empty();
+
+        if !want_file && !want_tracker {
             self.automation_capture_requested = false;
             return;
         }
