@@ -127,6 +127,10 @@ impl Monitor {
                 cancel_token.cancel();
                 self.app_state.update_capturing_state(false);
             }
+            Message::ClearData => {
+                self.player_data.clear();
+                self.app_state.update_timestamps(DataUpdated::new());
+            }
             Message::ExportGenshinOptimizer(settings, reply_tx) => {
                 let _ = reply_tx.send(self.player_data.export_genshin_optimizer(&settings));
             }

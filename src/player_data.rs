@@ -107,6 +107,14 @@ impl PlayerData {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.achievements.clear();
+        self.characters.clear();
+        self.items.clear();
+        self.properties.clear();
+        self.character_equip_guid_map.clear();
+    }
+
     pub fn process_achievements(&mut self, achievements: &[Achievement]) {
         for achievement in achievements {
             self.achievements.insert(achievement.id, achievement.clone());

@@ -29,8 +29,6 @@ use crate::{
 pub struct SavedAppState {
     export_settings: ExportSettings,
     #[serde(default)]
-    auto_start_capture: bool,
-    #[serde(default)]
     start_on_startup: bool,
     #[serde(default)]
     save_result_to_file: bool,
@@ -68,7 +66,6 @@ impl Default for SavedAppState {
                 min_weapon_ascension: 0,
                 min_weapon_rarity: 3,
             },
-            auto_start_capture: false,
             start_on_startup: false,
             save_result_to_file: false,
             save_result_folder: None,
@@ -100,7 +97,6 @@ pub struct IrminsulApp {
     power_tools_open: bool,
     bug_report_open: bool,
 
-    capture_settings_open: bool,
     automation_settings_open: bool,
     automation_folder_dialog: Option<FileDialog>,
 
@@ -261,10 +257,8 @@ impl IrminsulApp {
         let (ui_message_tx, state_rx, wish_url_rx) =
             start_async_runtime(cc.egui_ctx.clone(), log_packets_rx);
 
-        if saved_state.auto_start_capture {
-            if let Err(e) = ui_message_tx.send(Message::StartCapture) {
-                tracing::error!("Failed to send auto start message: {e}");
-            }
+        if let Err(e) = ui_message_tx.send(Message::StartCapture) {
+            tracing::error!("Failed to send auto start message: {e}");
         }
 
         let toasts = Toasts::default().with_anchor(egui_notify::Anchor::BottomLeft);
@@ -288,7 +282,6 @@ impl IrminsulApp {
             toasts,
             power_tools_open: false,
             bug_report_open: false,
-            capture_settings_open: false,
             automation_settings_open: false,
             automation_folder_dialog: None,
             optimizer_settings_open: false,
@@ -575,14 +568,7 @@ impl IrminsulApp {
         self.update_capture_cycle_state(app_state);
         self.handle_automation_export(app_state);
 
-        if self.capture_settings_open {
-            let modal = Modal::new(Id::new("Capture Settings")).show(ui.ctx(), |ui| {
-                self.capture_settings_modal(ui);
-            });
-            if modal.should_close() {
-                self.capture_settings_open = false;
-            }
-        }
+
 
         if self.optimizer_settings_open {
             let modal = Modal::new(Id::new("Optimizer Settings")).show(ui.ctx(), |ui| {
@@ -593,8 +579,6 @@ impl IrminsulApp {
             }
         }
         self.capture_ui(ui, app_state);
-        ui.separator();
-        self.genshin_optimizer_ui(ui, app_state);
         ui.separator();
         self.wish_ui(ui);
         ui.separator();
@@ -611,62 +595,6 @@ impl IrminsulApp {
                 ui,
                 |ui| {
                     Self::section_header(ui, "Packet Capture");
-                },
-                |ui| {
-                    if ui
-                        .button(egui_material_icons::icons::ICON_SETTINGS)
-                        .clicked()
-                    {
-                        self.capture_settings_open = true;
-                    }
-
-                    if app_state.capturing {
-                        ui.add_enabled_ui(!self.saved_state.save_result_to_file, |ui| {
-                            if ui.button(egui_material_icons::icons::ICON_PAUSE).clicked() {
-                                self.automation_cycle_started_at = None;
-                                let _ = self.ui_message_tx.send(Message::StopCapture);
-                            }
-                        });
-                    } else if ui
-                        .button(egui_material_icons::icons::ICON_PLAY_ARROW)
-                        .clicked()
-                    {
-                        self.automation_cycle_started_at = Some(Instant::now());
-                        let _ = self.ui_message_tx.send(Message::StartCapture);
-                    }
-                },
-            );
-        });
-        egui::Grid::new("capture_stats")
-            .striped(false)
-            .num_columns(2)
-            .min_col_width(0.)
-            .show(ui, |ui| {
-                Self::data_state(ui, "Items", app_state.updated.items_updated);
-                Self::data_state(ui, "Characters", app_state.updated.characters_updated);
-                Self::data_state(ui, "Achievements", app_state.updated.achievements_updated);
-            });
-    }
-
-    fn data_state(ui: &mut egui::Ui, source: &str, last_updated: Option<Instant>) {
-        let updated_icon = match last_updated {
-            Some(_) => RichText::new(egui_material_icons::icons::ICON_CHECK_CIRCLE)
-                .color(Color32::from_hex("#00ab3f").unwrap()),
-            None => RichText::new(egui_material_icons::icons::ICON_CHECK_INDETERMINATE_SMALL),
-        };
-        ui.label(updated_icon);
-        ui.label(source);
-        ui.end_row();
-    }
-
-    fn genshin_optimizer_ui(&mut self, ui: &mut egui::Ui, app_state: &AppState) {
-        self.optimizer_handle_export(ui).toast_error(self);
-
-        ui.vertical(|ui| {
-            egui::Sides::new().show(
-                ui,
-                |ui| {
-                    Self::section_header(ui, "Genshin Optimizer");
                 },
                 |ui| {
                     if ui
@@ -717,7 +645,29 @@ impl IrminsulApp {
                 },
             );
         });
+        egui::Grid::new("capture_stats")
+            .striped(false)
+            .num_columns(2)
+            .min_col_width(0.)
+            .show(ui, |ui| {
+                Self::data_state(ui, "Items", app_state.updated.items_updated);
+                Self::data_state(ui, "Characters", app_state.updated.characters_updated);
+                Self::data_state(ui, "Achievements", app_state.updated.achievements_updated);
+            });
     }
+
+    fn data_state(ui: &mut egui::Ui, source: &str, last_updated: Option<Instant>) {
+        let updated_icon = match last_updated {
+            Some(_) => RichText::new(egui_material_icons::icons::ICON_CHECK_CIRCLE)
+                .color(Color32::from_hex("#00ab3f").unwrap()),
+            None => RichText::new(egui_material_icons::icons::ICON_CHECK_INDETERMINATE_SMALL),
+        };
+        ui.label(updated_icon);
+        ui.label(source);
+        ui.end_row();
+    }
+
+
 
     fn genshin_optimizer_request_export(&mut self, target: OptimizerExportTarget) {
         let (tx, rx) = oneshot::channel();
@@ -837,40 +787,29 @@ impl IrminsulApp {
                 },
                 |_ui| {},
             );
-            let previous_startup = self.saved_state.start_on_startup;
-            if ui
-                .checkbox(&mut self.saved_state.start_on_startup, "Start Irminsul on startup")
-                .changed()
-            {
-                if let Err(e) = set_launch_on_startup(self.saved_state.start_on_startup) {
-                    self.saved_state.start_on_startup = previous_startup;
-                    tracing::error!("Unable to update startup behavior: {e}");
-                    self.toasts.error("Unable to update startup behavior");
-                }
-            }
-            ui.horizontal(|ui| {
-                let previous_save_result_to_file = self.saved_state.save_result_to_file;
-                let changed = ui
-                    .checkbox(
-                    &mut self.saved_state.save_result_to_file,
-                    "Save result to file",
-                    )
-                    .changed();
-                if changed {
-                    let want_file = self.saved_state.save_result_to_file;
-                    let want_tracker = !self.saved_state.tracker_import_key.is_empty();
 
-                    if want_file || want_tracker {
-                        self.automation_cycle_started_at = Some(Instant::now());
-                        self.request_capture_start();
-                    } else if previous_save_result_to_file {
-                        self.automation_capture_requested = false;
+            ui.add_enabled_ui(true, |ui| {
+                let previous_startup = self.saved_state.start_on_startup;
+                if ui
+                    .checkbox(&mut self.saved_state.start_on_startup, "Start Irminsul on startup")
+                    .changed()
+                {
+                    if let Err(e) = set_launch_on_startup(self.saved_state.start_on_startup) {
+                        self.saved_state.start_on_startup = previous_startup;
+                        tracing::error!("Unable to update startup behavior: {e}");
+                        self.toasts.error("Unable to update startup behavior");
                     }
                 }
-                ui.add_enabled_ui(self.saved_state.save_result_to_file, |ui| {
-                    if ui.button(egui_material_icons::icons::ICON_SETTINGS).clicked() {
-                        self.automation_settings_open = true;
-                    }
+                ui.horizontal(|ui| {
+                    ui.checkbox(
+                        &mut self.saved_state.save_result_to_file,
+                        "Save result to file",
+                    );
+                    ui.add_enabled_ui(self.saved_state.save_result_to_file, |ui| {
+                        if ui.button(egui_material_icons::icons::ICON_SETTINGS).clicked() {
+                            self.automation_settings_open = true;
+                        }
+                    });
                 });
             });
         });
@@ -918,16 +857,26 @@ impl IrminsulApp {
             }
         }
 
-        ui.vertical(|ui| {
-            egui::Sides::new().show(
+        ui.add_enabled_ui(true, |ui| {
+            ui.vertical(|ui| {
+                egui::Sides::new().show(
                 ui,
                 |ui| {
                     Self::section_header(ui, "Tracker");
                 },
                 |ui| {
-                    if ui.button(egui_material_icons::icons::ICON_SETTINGS).clicked() {
-                        self.tracker_key_modal_open = true;
-                    }
+                    ui.horizontal(|ui| {
+                        if ui.button(egui_material_icons::icons::ICON_REFRESH).clicked() {
+                            let url = format!("{}/genshin-accounts-public/verify-key", self.saved_state.tracker_api_url.trim_end_matches('/'));
+                            let key = self.saved_state.tracker_import_key.clone();
+                            let (tx, rx) = oneshot::channel();
+                            let _ = self.ui_message_tx.send(Message::VerifyTrackerKey(url, key, tx));
+                            self.tracker_verify_rx = Some(rx);
+                        }
+                        if ui.button(egui_material_icons::icons::ICON_SETTINGS).clicked() {
+                            self.tracker_key_modal_open = true;
+                        }
+                    });
                 },
             );
 
@@ -943,8 +892,9 @@ impl IrminsulApp {
             } else if self.tracker_verify_rx.is_some() {
                 ui.label(RichText::new("Verifying...").color(Color32::YELLOW));
             } else {
-                ui.label(RichText::new("Account Linked").color(Color32::YELLOW));
+                ui.label(RichText::new("Verification Failed").color(Color32::RED));
             }
+        });
         });
     }
 
@@ -1063,25 +1013,7 @@ impl IrminsulApp {
         );
     }
 
-    fn capture_settings_modal(&mut self, ui: &mut egui::Ui) {
-        ui.set_width(300.0);
-        ui.heading("Genshin Optimizer Settings");
-        ui.separator();
-        ui.checkbox(
-            &mut self.saved_state.auto_start_capture,
-            "Start capture on Irminsul launch",
-        );
-        ui.separator();
-        egui::Sides::new().show(
-            ui,
-            |_ui| {},
-            |ui| {
-                if ui.button("Ok").clicked() {
-                    ui.close()
-                }
-            },
-        );
-    }
+
 
     fn optimizer_settings_modal(&mut self, ui: &mut egui::Ui) {
         ui.set_width(300.0);
@@ -1307,6 +1239,7 @@ impl IrminsulApp {
     }
 
     fn handle_automation_export(&mut self, app_state: &AppState) {
+
         let want_file = self.saved_state.save_result_to_file;
         let want_tracker = !self.saved_state.tracker_import_key.is_empty();
 
@@ -1316,6 +1249,25 @@ impl IrminsulApp {
 
         if self.optimizer_export_rx.is_some() {
             return;
+        }
+
+        let now = Instant::now();
+        let max_last_updated = [
+            app_state.updated.items_updated,
+            app_state.updated.characters_updated,
+            app_state.updated.achievements_updated,
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+
+        if let Some(last_updated) = max_last_updated {
+            if now.duration_since(last_updated).as_secs() >= 30 {
+                let _ = self.ui_message_tx.send(Message::ClearData);
+                self.automation_cycle_started_at = Some(Instant::now());
+                self.last_automation_signature = None;
+                return;
+            }
         }
 
         // Cooldown: skip if last export was less than 5 seconds ago
