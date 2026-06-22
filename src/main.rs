@@ -51,6 +51,7 @@ pub enum Message {
     DownloadAcknowledged,
     StartCapture,
     StopCapture,
+    ClearData,
     ExportGenshinOptimizer(ExportSettings, oneshot::Sender<Result<String>>),
     ExportAchievements(oneshot::Sender<Result<Vec<u32>>>),
     FindWishUrl(oneshot::Sender<Result<String>>),
