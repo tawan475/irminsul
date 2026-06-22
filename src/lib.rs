@@ -241,7 +241,6 @@ impl GameSniffer {
                 info!("handshake requested, resetting state");
                 self.recv_kcp = None;
                 self.sent_kcp = None;
-                self.key = None;
                 Some(GamePacket::Connection(packet))
             }
             ConnectionPacket::HandshakeEstablished | ConnectionPacket::Disconnected => {
@@ -354,13 +353,23 @@ impl GameSniffer {
                 decrypt_command(k, &mut test);
 
                 if test[0] == 0x45 && test[1] == 0x67 {
-                    //|| test[test.len() - 2] == 0x89 && test[test.len() - 1] == 0xAB
                     self.key.as_ref().unwrap()
                 } else {
                     warn!("Invalidated session key");
                     self.key = None;
-                    error!("Session key dead, relaunch game");
-                    return None;
+                    
+                    // Fallback to initial key lookup for this packet
+                    let key = lookup_initial_key(&self.initial_keys, &data);
+                    match key {
+                        Some(key) => {
+                            self.key = Some(Dispatch(key));
+                            self.key.as_ref().unwrap()
+                        }
+                        None => {
+                            error!("Session key dead, and no dispatch key found");
+                            return None;
+                        }
+                    }
                 }
             }
         };
