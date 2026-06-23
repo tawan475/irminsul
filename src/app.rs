@@ -605,24 +605,29 @@ impl IrminsulApp {
                     }
 
                     ui.add_enabled_ui(
-                        app_state.updated.characters_updated.is_some()
-                            && app_state.updated.items_updated.is_some()
-                            && app_state.updated.achievements_updated.is_some()
-                            && self.optimizer_export_rx.is_none(),
+                        self.optimizer_export_rx.is_none(),
                         |ui| {
+                            let is_ready = app_state.updated.characters_updated.is_some()
+                                && app_state.updated.items_updated.is_some()
+                                && app_state.updated.achievements_updated.is_some();
+
                             if ui
                                 .button(egui_material_icons::icons::ICON_DOWNLOAD)
                                 .clicked()
                             {
-                                let now = Local::now();
-                                let mut optimizer_save_dialog = FileDialog::new()
-                                    .add_file_filter_extensions("JSON files", vec!["json"])
-                                    .default_file_name(&format!(
-                                        "genshin_export_{}.json",
-                                        now.format("%Y-%m-%d_%H-%M")
-                                    ));
-                                optimizer_save_dialog.save_file();
-                                self.optimizer_save_dialog = Some(optimizer_save_dialog);
+                                if is_ready {
+                                    let now = Local::now();
+                                    let mut optimizer_save_dialog = FileDialog::new()
+                                        .add_file_filter_extensions("JSON files", vec!["json"])
+                                        .default_file_name(&format!(
+                                            "genshin_export_{}.json",
+                                            now.format("%Y-%m-%d_%H-%M")
+                                        ));
+                                    optimizer_save_dialog.save_file();
+                                    self.optimizer_save_dialog = Some(optimizer_save_dialog);
+                                } else {
+                                    self.toasts.error("Data not found. Please open the game first.");
+                                }
                             }
 
                             if let Some(optimizer_save_dialog) = &mut self.optimizer_save_dialog
@@ -636,9 +641,13 @@ impl IrminsulApp {
                                 .button(egui_material_icons::icons::ICON_CONTENT_PASTE_GO)
                                 .clicked()
                             {
-                                self.genshin_optimizer_request_export(
-                                    OptimizerExportTarget::Clipboard,
-                                );
+                                if is_ready {
+                                    self.genshin_optimizer_request_export(
+                                        OptimizerExportTarget::Clipboard,
+                                    );
+                                } else {
+                                    self.toasts.error("Data not found. Please open the game first.");
+                                }
                             }
                         },
                     );
@@ -1366,7 +1375,7 @@ impl IrminsulApp {
                                     self.wish_link_failed_for = None;
                                 } else {
                                     self.wish_link_failed_for = None;
-                                    self.toasts.error("Achievements not found. Open the achievements menu in-game first.");
+                                    self.toasts.error("Data not found. Please open the game first.");
                                 }
                             }
                         },
