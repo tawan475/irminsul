@@ -241,6 +241,10 @@ impl GameSniffer {
                 info!("handshake requested, resetting state");
                 self.recv_kcp = None;
                 self.sent_kcp = None;
+                self.key = None;
+                self.client_seed = None;
+                self.possible_seeds.clear();
+                self.sent_time = None;
                 Some(GamePacket::Connection(packet))
             }
             ConnectionPacket::HandshakeEstablished | ConnectionPacket::Disconnected => {
