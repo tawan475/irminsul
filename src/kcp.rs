@@ -6,7 +6,7 @@ use tracing::{error, info, instrument, span, trace, warn, Level};
 use crate::bytes_as_hex;
 
 pub(crate) struct KcpSniffer {
-    conv_id: u32,
+    pub(crate) conv_id: u32,
     kcp: Kcp<Vec<u8>>,
     time_start: SystemTime,
 }

@@ -19,7 +19,14 @@ pub fn matches_get_player_token_rsp(
     data: Vec<u8>,
     rsa_keys: Vec<RsaPrivateKey>,
 ) -> Option<Vec<u64>> {
-    let d_msg = Unk::parse_from_bytes(&data);
+    // Cut at last "==": token 256 bytes -> 1 modulo 3, so always == at end in base64.
+    // This prevents the trailing binary signature data from crashing the protobuf parser.
+    let end = data
+        .windows(2)
+        .rposition(|w| w == b"==")
+        .map_or(data.len(), |pos| pos + 2);
+
+    let d_msg = Unk::parse_from_bytes(&data[..end]);
     match d_msg {
         Ok(d_msg) => {
             let mut to_ret: Vec<u64> = vec![];
