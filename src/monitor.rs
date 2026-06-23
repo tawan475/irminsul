@@ -229,8 +229,18 @@ impl Monitor {
     }
 
     fn handle_packet(&mut self, packet: Vec<u8>) {
-        let Some(GamePacket::Commands(commands)) = self.sniffer.receive_packet(packet) else {
-            return;
+        let commands = match self.sniffer.receive_packet(packet) {
+            Some(GamePacket::Commands(commands)) => commands,
+            Some(GamePacket::Connection(conn)) => {
+                match conn {
+                    auto_artifactarium::ConnectionPacket::HandshakeRequested => tracing::info!("Connection: Handshake Requested"),
+                    auto_artifactarium::ConnectionPacket::HandshakeEstablished => tracing::info!("Connection: Handshake Established"),
+                    auto_artifactarium::ConnectionPacket::Disconnected => tracing::info!("Connection: Disconnected"),
+                    _ => {}
+                }
+                return;
+            }
+            None => return,
         };
 
         let log_packets = *self.log_packet_rx.borrow_and_update();
@@ -313,6 +323,16 @@ async fn capture_task(
         }
     };
     tracing::info!("starting capture");
+
+    #[cfg(debug_assertions)]
+    let mut pcapng = eframe::storage_dir(crate::APP_ID)
+        .map(|mut p| {
+            p.push("log");
+            std::fs::create_dir_all(&p).ok()?;
+            p.push("latest.pcapng");
+            crate::pcapng::PcapngWriter::new(p).ok()
+        })
+        .flatten();
     loop {
         let packet = tokio::select!(
             packet = capture.next_packet() => packet,
@@ -326,6 +346,15 @@ async fn capture_task(
                 break;
             }
         };
+
+        #[cfg(debug_assertions)]
+        if let Some(ref mut writer) = pcapng {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64;
+            let _ = writer.write_packet(ts, &packet);
+        }
 
         if let Err(e) = packet_tx.send(Ok(packet)) {
             tracing::error!("Error sending captured packet to monitor: {e}");
