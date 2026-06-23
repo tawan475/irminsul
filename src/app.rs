@@ -219,6 +219,7 @@ fn start_async_runtime(
                 }
             });
 
+            let monitor_ctx = updater_ctx.clone();
             // Notify egui of state changes.
             tokio::spawn(async move {
                 loop {
@@ -227,7 +228,7 @@ fn start_async_runtime(
                 }
             });
             tracing::info!("Starting monitor");
-            let monitor = match Monitor::new(state_tx, ui_message_rx, log_packets_rx).await {
+            let monitor = match Monitor::new(state_tx, ui_message_rx, log_packets_rx, monitor_ctx).await {
                 Ok(monitor) => monitor,
                 Err(e) => {
                     tracing::error!("error loading monitor task: {e}");
