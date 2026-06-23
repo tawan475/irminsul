@@ -50,6 +50,7 @@ use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use rsa::{RsaPrivateKey, pkcs1::DecodeRsaPrivateKey};
 use tracing::{error, info, info_span, instrument, trace, warn};
+use protobuf::Message;
 
 use crate::connection::parse_connection_packet;
 use crate::crypto::{bruteforce, decrypt_command, lookup_initial_key};
@@ -242,7 +243,6 @@ impl GameSniffer {
                 self.recv_kcp = None;
                 self.sent_kcp = None;
                 self.key = None;
-                self.client_seed = None;
                 self.possible_seeds.clear();
                 self.sent_time = None;
                 Some(GamePacket::Connection(packet))
@@ -318,14 +318,16 @@ impl GameSniffer {
                 {
                     self.key.as_ref().unwrap()
                 } else {
+                    info!("Dispatch key failed, attempting session key bruteforce. possible_seeds={}, client_seed={:?}, sent_time={:?}",
+                        self.possible_seeds.len(), self.client_seed, self.sent_time);
                     let mut discovered_key: Option<&Key> = None;
                     for &seed in &self.possible_seeds {
-                        // First try with a retained client seed.
-                        if let Some(client_seed) = self.client_seed
-                            && let Some((client_seed, key)) =
-                                bruteforce(client_seed, seed, data.clone())
+                        // First try with a retained client_seed (which acts as time_seed).
+                        if let Some(time_seed) = self.client_seed
+                            && let Some((time_seed, key)) =
+                                bruteforce(time_seed, seed, data.clone())
                         {
-                            self.client_seed = Some(client_seed);
+                            self.client_seed = Some(time_seed);
                             self.key = Some(Key::Session(key));
                             discovered_key = self.key.as_ref();
                             break;
@@ -333,10 +335,10 @@ impl GameSniffer {
 
                         // If that fails, try with a client seed generated from the packet's
                         // `sent_time`
-                        if let Some((client_seed, key)) =
+                        if let Some((time_seed, key)) =
                             bruteforce(self.sent_time.unwrap(), seed, data.clone())
                         {
-                            self.client_seed = Some(client_seed);
+                            self.client_seed = Some(time_seed);
                             self.key = Some(Key::Session(key));
                             discovered_key = self.key.as_ref();
                             break;
@@ -346,7 +348,8 @@ impl GameSniffer {
                     match discovered_key {
                         Some(key) => key,
                         None => {
-                            error!("Couldn't bruteforce from deduced keys");
+                            error!("Couldn't bruteforce from deduced keys. possible_seeds={:?}, client_seed={:?}, sent_time={:?}",
+                                self.possible_seeds, self.client_seed, self.sent_time);
                             return None;
                         }
                     }
@@ -401,14 +404,21 @@ impl GameSniffer {
         // }
 
         if let Some(Dispatch(_)) = self.key {
+            let header_len = command.header_len as usize;
+            let header_data = &command.proto_data[..header_len];
+            let payload_data = &command.proto_data[header_len..];
+
             if let Some(possible_seeds) =
-                matches_get_player_token_rsp(command.proto_data.clone(), self.rsa_keys.clone())
+                matches_get_player_token_rsp(payload_data.to_vec(), self.rsa_keys.clone())
             {
                 self.possible_seeds = possible_seeds;
                 info!(?self.possible_seeds, "setting new possible session seeds");
-                let header_command = command.parse_proto::<PacketHead>().unwrap();
-                self.sent_time = Some(header_command.sent_ms);
-                info!(?self.sent_time, "setting new send time");
+                if let Ok(header_command) = PacketHead::parse_from_bytes(header_data) {
+                    self.sent_time = Some(header_command.sent_ms);
+                    info!(?self.sent_time, "setting new send time");
+                } else {
+                    warn!("Failed to parse PacketHead from header_data (len={})", header_len);
+                }
             }
         }
 

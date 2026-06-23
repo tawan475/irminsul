@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use rand_mt::Mt64;
-use tracing::{debug, info, instrument, trace, warn};
+use tracing::{info, instrument, trace, warn};
+
 
 use crate::bytes_as_hex;
 use crate::cs_rand::Random;
@@ -50,24 +51,31 @@ pub fn new_key_from_seed(seed: u64) -> Vec<u8> {
     key
 }
 
-pub fn guess(seed: i64, server_seed: u64, depth: i32, data: Vec<u8>) -> Option<Vec<u8>> {
-    // Attempt to generate the key.
+pub fn guess(seed: i64, server_seed: u64, depth: i32, data: &[u8]) -> Option<Vec<u8>> {
+    // Pre-compute expected XOR bytes for magic header/trailer check.
+    // The encrypted data XORed with the key at positions 0,1 should yield 0x45,0x67
+    // and at positions len-2,len-1 should yield 0x89,0xAB.
+    let key_prefix = [data[0] ^ 0x45, data[1] ^ 0x67];
+    let key_suffix = [
+        data[data.len() - 2] ^ 0x89,
+        data[data.len() - 1] ^ 0xAB,
+    ];
+
     let mut generator = Random::seeded(seed as i32);
-    for _ in 0..depth {
+    for i in 0..depth {
         let client_seed = generator.next_safe_uint64();
 
-        let seed = client_seed ^ server_seed;
-        let key = new_key_from_seed(seed);
+        let combined_seed = client_seed ^ server_seed;
+        let key = new_key_from_seed(combined_seed);
 
-        let mut clone = data.clone();
-        decrypt_command(&key, &mut clone);
-
-        if clone[0] == 0x45
-            && clone[1] == 0x67
-            && clone[clone.len() - 2] == 0x89
-            && clone[clone.len() - 1] == 0xAB
+        // Fast prefix/suffix check before full decryption
+        let key_len = key.len();
+        if key[0] == key_prefix[0]
+            && key[1] == key_prefix[1]
+            && key[(data.len() - 2) % key_len] == key_suffix[0]
+            && key[(data.len() - 1) % key_len] == key_suffix[1]
         {
-            debug!("Found encryption key seed: {seed}");
+            info!("Found encryption key seed: {combined_seed} at depth {i} (time_seed={seed}, client_seed={client_seed})");
             return Some(key);
         }
     }
@@ -76,16 +84,19 @@ pub fn guess(seed: i64, server_seed: u64, depth: i32, data: Vec<u8>) -> Option<V
 }
 
 pub fn bruteforce(sent_time: u64, server_seed: u64, data: Vec<u8>) -> Option<(u64, Vec<u8>)> {
-    debug!("Running bruteforce loop.");
+    info!("Running bruteforce: sent_time={sent_time}, server_seed={server_seed}, data_len={}", data.len());
     // Generate new seeds.
     for i in 0..3000i64 {
         let offset = if i % 2 == 0 { i / 2 } else { -(i - 1) / 2 };
         let time = sent_time as i64 + offset; // This will act as the seed.
 
-        if let Some(key) = guess(time, server_seed, 5, data.clone()) {
+        if let Some(key) = guess(time, server_seed, 1000, &data) {
+            info!("Bruteforce succeeded: offset={offset}, time={time}");
             return Some((time as u64, key));
         }
     }
-    warn!("Unable to find the encryption key seed.");
+    warn!("Unable to find the encryption key seed. sent_time={sent_time}, server_seed={server_seed}, data_len={}", data.len());
     None
 }
+
+
