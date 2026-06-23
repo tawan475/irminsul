@@ -57,6 +57,7 @@ pub struct Monitor {
     capture_cancel_token: Option<CancellationToken>,
     packet_tx: mpsc::UnboundedSender<Result<Vec<u8>>>,
     packet_rx: mpsc::UnboundedReceiver<Result<Vec<u8>>>,
+    ctx: egui::Context,
 }
 
 impl Monitor {
@@ -64,6 +65,7 @@ impl Monitor {
         state_tx: watch::Sender<AppState>,
         mut ui_message_rx: mpsc::UnboundedReceiver<Message>,
         log_packet_rx: watch::Receiver<bool>,
+        ctx: egui::Context,
     ) -> Result<Self> {
         let mut app_state = AppStateManager::new(state_tx.borrow().clone(), state_tx.clone());
         let game_data = get_database(&mut app_state, &mut ui_message_rx).await?;
@@ -81,6 +83,7 @@ impl Monitor {
             capture_cancel_token: None,
             packet_tx,
             packet_rx,
+            ctx,
         })
     }
 
@@ -133,16 +136,21 @@ impl Monitor {
             }
             Message::ExportGenshinOptimizer(settings, reply_tx) => {
                 let _ = reply_tx.send(self.player_data.export_genshin_optimizer(&settings));
+                self.ctx.request_repaint();
             }
             Message::ExportAchievements(reply_tx) => {
                 let _ = reply_tx.send(self.player_data.export_achievements());
+                self.ctx.request_repaint();
             }
             Message::FindWishUrl(reply_tx) => {
+                let ctx = self.ctx.clone();
                 tokio::spawn(async move {
                     let _ = reply_tx.send(crate::wish::force_find_url().await);
+                    ctx.request_repaint();
                 });
             }
             Message::VerifyTrackerKey(url, key, reply_tx) => {
+                let ctx = self.ctx.clone();
                 tokio::spawn(async move {
                     let client = reqwest::Client::new();
                     match client.get(&url).header("x-import-key", &key).send().await {
@@ -153,6 +161,7 @@ impl Monitor {
                                     tracing::info!("Verify key response ({}): {}", status, body);
                                     if !status.is_success() {
                                         let _ = reply_tx.send(Err(anyhow::anyhow!("Verify failed: HTTP {}", status)));
+                                        ctx.request_repaint();
                                         return;
                                     }
                                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
@@ -174,22 +183,27 @@ impl Monitor {
                                             .unwrap_or("N/A")
                                             .to_string();
                                         let _ = reply_tx.send(Ok((name, uid, server)));
+                                        ctx.request_repaint();
                                     } else {
                                         let _ = reply_tx.send(Err(anyhow::anyhow!("Invalid JSON response")));
+                                        ctx.request_repaint();
                                     }
                                 }
                                 Err(e) => {
                                     let _ = reply_tx.send(Err(anyhow::anyhow!("Failed to read response: {}", e)));
+                                    ctx.request_repaint();
                                 }
                             }
                         }
                         Err(e) => {
                             let _ = reply_tx.send(Err(anyhow::anyhow!("Request failed: {}", e)));
+                            ctx.request_repaint();
                         }
                     }
                 });
             }
             Message::UploadToTracker(json, url, key, reply_tx) => {
+                let ctx = self.ctx.clone();
                 tokio::spawn(async move {
                     let client = reqwest::Client::new();
                     
@@ -212,14 +226,17 @@ impl Monitor {
                             if !status.is_success() {
                                 tracing::error!("Tracker upload failed ({}): {}", status, body);
                                 let _ = reply_tx.send(Err(format!("HTTP {} - {}", status, body)));
+                                ctx.request_repaint();
                             } else {
                                 tracing::info!("Successfully uploaded data to tracker");
                                 let _ = reply_tx.send(Ok(()));
+                                ctx.request_repaint();
                             }
                         }
                         Err(e) => {
                             tracing::error!("Tracker upload request failed: {}", e);
                             let _ = reply_tx.send(Err(e.to_string()));
+                            ctx.request_repaint();
                         }
                     }
                 });
