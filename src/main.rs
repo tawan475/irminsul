@@ -8,7 +8,6 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
-use tracing_appender::rolling::Rotation;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, reload};
 
@@ -19,6 +18,7 @@ mod app;
 mod capture;
 mod good;
 mod monitor;
+mod pcapng;
 mod player_data;
 mod update;
 mod wish;
@@ -133,7 +133,7 @@ impl TracingLevel {
                 if cfg!(debug_assertions) {
                     "info"
                 } else {
-                    "warn,irminsul=info"
+                    "warn,irminsul=info,auto_artifactarium=info"
                 }
             }
             TracingLevel::VerboseInfo => "info",
@@ -198,13 +198,63 @@ fn open_log_dir() -> Result<()> {
     Ok(())
 }
 
+fn rotate_logs(log_dir: &std::path::Path) -> Result<()> {
+    let latest_path = log_dir.join("latest.log");
+    if latest_path.exists() {
+        if let Ok(metadata) = std::fs::metadata(&latest_path) {
+            if let Ok(modified) = metadata.modified() {
+                let dt: chrono::DateTime<chrono::Local> = modified.into();
+                let new_name = format!("{}.log", dt.format("%Y-%m-%d_%H-%M-%S"));
+                let new_path = log_dir.join(&new_name);
+                let _ = std::fs::rename(&latest_path, &new_path);
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        let latest_pcapng_path = log_dir.join("latest.pcapng");
+        if latest_pcapng_path.exists() {
+            if let Ok(metadata) = std::fs::metadata(&latest_pcapng_path) {
+                if let Ok(modified) = metadata.modified() {
+                    let dt: chrono::DateTime<chrono::Local> = modified.into();
+                    let new_name = format!("{}.pcapng", dt.format("%Y-%m-%d_%H-%M-%S"));
+                    let new_path = log_dir.join(&new_name);
+                    let _ = std::fs::rename(&latest_pcapng_path, &new_path);
+                }
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    if let Ok(dir) = std::fs::read_dir(log_dir) {
+        for entry in dir.flatten() {
+            let path = entry.path();
+            if (path.extension().and_then(|e| e.to_str()) == Some("log") && path.file_name().and_then(|n| n.to_str()) != Some("latest.log")) || (path.extension().and_then(|e| e.to_str()) == Some("pcapng") && path.file_name().and_then(|n| n.to_str()) != Some("latest.pcapng")) {
+                if let Ok(metadata) = entry.metadata() {
+                    if let Ok(modified) = metadata.modified() {
+                        entries.push((path, modified));
+                    }
+                }
+            }
+        }
+    }
+    entries.sort_by_key(|k| std::cmp::Reverse(k.1));
+
+    for (path, _) in entries.into_iter().skip(6) {
+        let _ = std::fs::remove_file(path);
+    }
+    Ok(())
+}
+
 fn tracing_init() -> Result<(tracing_appender::non_blocking::WorkerGuard, ReloadHandle)> {
-    let appender = tracing_appender::rolling::Builder::new()
-        .filename_prefix("log")
-        .rotation(Rotation::DAILY)
-        .max_log_files(7)
-        .build(log_dir()?)?;
-    let (non_blocking_appender, guard) = tracing_appender::non_blocking(appender);
+    let dir = log_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let _ = rotate_logs(&dir);
+
+    let latest_path = dir.join("latest.log");
+    let file = std::fs::File::create(&latest_path)?;
+    let (non_blocking_appender, guard) = tracing_appender::non_blocking(file);
 
     let filter = EnvFilter::new(TracingLevel::default().get_filter());
     let (filter, reload_handle) = reload::Layer::new(filter);
