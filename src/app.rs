@@ -345,7 +345,9 @@ impl eframe::App for IrminsulApp {
             if let Ok(result) = rx.try_recv() {
                 self.tracker_upload_rx = None;
                 match result {
-                    Ok(_) => self.toasts.success("Successfully synced capture to Tracker!"),
+                    Ok(_) => {
+                        self.toasts.success("Successfully synced capture to Tracker!");
+                    }
                     Err(e) => {
                         if e.contains("401")
                             || e.contains("403")
@@ -357,7 +359,7 @@ impl eframe::App for IrminsulApp {
                         }
                         self.toasts.error(format!("Tracker sync failed: {}", e));
                     }
-                };
+                }
             }
         }
 
