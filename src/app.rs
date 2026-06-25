@@ -41,6 +41,8 @@ pub struct SavedAppState {
     tracker_import_key: String,
     #[serde(default = "default_tracker_url")]
     tracker_api_url: String,
+    #[serde(default)]
+    auto_export_to_tracker: bool,
 }
 
 fn default_tracker_url() -> String {
@@ -73,6 +75,7 @@ impl Default for SavedAppState {
             tracing_level: Default::default(),
             tracker_import_key: String::new(),
             tracker_api_url: default_tracker_url(),
+            auto_export_to_tracker: false,
         }
     }
 }
@@ -83,6 +86,7 @@ enum OptimizerExportTarget {
     Clipboard,
     File,
     Automation,
+    TrackerManual,
 }
 
 pub struct IrminsulApp {
@@ -120,6 +124,7 @@ pub struct IrminsulApp {
     
     tracker_key_modal_open: bool,
     tracker_account_name: Option<(String, String, String)>,
+    tracker_verified: bool,
     tracker_verify_rx: Option<oneshot::Receiver<Result<(String, String, String)>>>,
     tracker_upload_rx: Option<oneshot::Receiver<Result<(), String>>>,
 }
@@ -301,6 +306,7 @@ impl IrminsulApp {
             automation_capture_requested: false,
             tracker_key_modal_open: false,
             tracker_account_name: None,
+            tracker_verified: false,
             tracker_verify_rx,
             tracker_upload_rx: None,
             state_rx,
@@ -340,8 +346,25 @@ impl eframe::App for IrminsulApp {
                 self.tracker_upload_rx = None;
                 match result {
                     Ok(_) => self.toasts.success("Successfully synced capture to Tracker!"),
-                    Err(e) => self.toasts.error(format!("Tracker sync failed: {}", e)),
+                    Err(e) => {
+                        if e.contains("401")
+                            || e.contains("403")
+                            || e.to_lowercase().contains("unauthorized")
+                        {
+                            self.tracker_verified = false;
+                            self.tracker_account_name = None;
+                            self.request_tracker_verify();
+                        }
+                        self.toasts.error(format!("Tracker sync failed: {}", e));
+                    }
                 };
+            }
+        }
+
+        if let Some(rx) = &mut self.tracker_verify_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.tracker_verify_rx = None;
+                self.apply_tracker_verify_result(result);
             }
         }
 
@@ -589,7 +612,7 @@ impl IrminsulApp {
         ui.separator();
         self.automation_ui(ui);
         ui.separator();
-        self.tracker_ui(ui);
+        self.tracker_ui(ui, app_state);
     }
 
     fn capture_ui(&mut self, ui: &mut egui::Ui, app_state: &AppState) {
@@ -827,7 +850,48 @@ impl IrminsulApp {
         });
     }
 
-    fn tracker_ui(&mut self, ui: &mut egui::Ui) {
+    fn want_tracker_upload(&self) -> bool {
+        self.saved_state.auto_export_to_tracker
+            && !self.saved_state.tracker_import_key.is_empty()
+            && self.tracker_verified
+    }
+
+    fn apply_tracker_verify_result(
+        &mut self,
+        result: Result<(String, String, String)>,
+    ) {
+        match result {
+            Ok(info) => {
+                self.tracker_account_name = Some(info);
+                self.tracker_verified = true;
+            }
+            Err(e) => {
+                self.tracker_account_name = None;
+                self.tracker_verified = false;
+                self.toasts.error(format!("Failed to verify tracker key: {}", e));
+            }
+        }
+    }
+
+    fn request_tracker_verify(&mut self) {
+        let key = self.saved_state.tracker_import_key.clone();
+        if key.is_empty() {
+            self.tracker_account_name = None;
+            self.tracker_verified = false;
+            return;
+        }
+        let url = format!(
+            "{}/genshin-accounts-public/verify-key",
+            self.saved_state.tracker_api_url.trim_end_matches('/')
+        );
+        let (tx, rx) = oneshot::channel();
+        let _ = self.ui_message_tx.send(Message::VerifyTrackerKey(url, key, tx));
+        self.tracker_verify_rx = Some(rx);
+        self.tracker_account_name = None;
+        self.tracker_verified = false;
+    }
+
+    fn tracker_ui(&mut self, ui: &mut egui::Ui, app_state: &AppState) {
         if self.tracker_key_modal_open {
             let modal = Modal::new(Id::new("Tracker Key Modal")).show(ui.ctx(), |ui| {
                 ui.set_width(360.0);
@@ -835,37 +899,27 @@ impl IrminsulApp {
                 ui.separator();
                 ui.label("Enter your Import Key generated from the GDT dashboard:");
                 ui.add(egui::TextEdit::singleline(&mut self.saved_state.tracker_import_key).password(true));
+                if self.tracker_verify_rx.is_some() {
+                    ui.label(RichText::new("Verifying key…").color(Color32::YELLOW));
+                } else if self.tracker_verified {
+                    if let Some((name, uid, server)) = &self.tracker_account_name {
+                        ui.label(
+                            RichText::new(format!("Valid: {} (UID {})", name, uid))
+                                .color(Color32::from_hex("#00ab3f").unwrap()),
+                        );
+                        ui.label(RichText::new(format!("Server: {}", server)).color(Color32::GRAY));
+                    }
+                } else if !self.saved_state.tracker_import_key.is_empty() {
+                    ui.label(RichText::new("Key invalid or unreachable").color(Color32::RED));
+                }
                 ui.separator();
                 if ui.button("Save & Close").clicked() {
                     self.tracker_key_modal_open = false;
-                    // Trigger a fetch for account details
-                    let key = self.saved_state.tracker_import_key.clone();
-                    let url = format!("{}/genshin-accounts-public/verify-key", self.saved_state.tracker_api_url.trim_end_matches('/'));
-                    if !key.is_empty() {
-                        let (tx, rx) = oneshot::channel();
-                        let _ = self.ui_message_tx.send(Message::VerifyTrackerKey(url, key, tx));
-                        self.tracker_verify_rx = Some(rx);
-                        self.tracker_account_name = None;
-                    }
+                    self.request_tracker_verify();
                 }
             });
             if modal.should_close() {
                 self.tracker_key_modal_open = false;
-            }
-        }
-        
-        if let Some(rx) = &mut self.tracker_verify_rx {
-            if let Ok(result) = rx.try_recv() {
-                self.tracker_verify_rx = None;
-                match result {
-                    Ok(info) => {
-                        self.tracker_account_name = Some(info);
-                    }
-                    Err(e) => {
-                        self.tracker_account_name = None;
-                        self.toasts.error(format!("Failed to verify tracker key: {}", e));
-                    }
-                }
             }
         }
 
@@ -879,14 +933,28 @@ impl IrminsulApp {
                 |ui| {
                     ui.horizontal(|ui| {
                         if ui.button(egui_material_icons::icons::ICON_REFRESH).clicked() {
-                            let url = format!("{}/genshin-accounts-public/verify-key", self.saved_state.tracker_api_url.trim_end_matches('/'));
-                            let key = self.saved_state.tracker_import_key.clone();
-                            let (tx, rx) = oneshot::channel();
-                            let _ = self.ui_message_tx.send(Message::VerifyTrackerKey(url, key, tx));
-                            self.tracker_verify_rx = Some(rx);
+                            self.request_tracker_verify();
                         }
+                        let is_ready = app_state.updated.characters_updated.is_some()
+                            && app_state.updated.items_updated.is_some()
+                            && app_state.updated.achievements_updated.is_some();
+                        ui.add_enabled_ui(
+                            is_ready && self.tracker_verified && self.optimizer_export_rx.is_none(),
+                            |ui| {
+                                if ui
+                                    .button(egui_material_icons::icons::ICON_CLOUD_UPLOAD)
+                                    .on_hover_text("Export current capture to Tracker")
+                                    .clicked()
+                                {
+                                    self.genshin_optimizer_request_export(
+                                        OptimizerExportTarget::TrackerManual,
+                                    );
+                                }
+                            },
+                        );
                         if ui.button(egui_material_icons::icons::ICON_SETTINGS).clicked() {
                             self.tracker_key_modal_open = true;
+                            self.request_tracker_verify();
                         }
                     });
                 },
@@ -906,6 +974,11 @@ impl IrminsulApp {
             } else {
                 ui.label(RichText::new("Verification Failed").color(Color32::RED));
             }
+
+            ui.checkbox(
+                &mut self.saved_state.auto_export_to_tracker,
+                "Auto export to tracker",
+            );
         });
         });
     }
@@ -1168,12 +1241,21 @@ impl IrminsulApp {
                 if self.saved_state.save_result_to_file {
                     self.optimizer_save_to_automation_file(json.clone())?;
                 }
-                
-                if !self.saved_state.tracker_import_key.is_empty() {
+
+                if self.want_tracker_upload() {
                     self.tracker_upload_json(json);
                 }
 
                 self.reset_capture_for_next_cycle();
+            }
+            OptimizerExportTarget::TrackerManual => {
+                if self.want_tracker_upload() {
+                    self.tracker_upload_json(json);
+                } else if !self.saved_state.tracker_import_key.is_empty() {
+                    self.toasts.error("Tracker key not verified. Open settings to re-link.");
+                } else {
+                    self.toasts.error("No tracker import key configured.");
+                }
             }
         }
 
@@ -1253,7 +1335,7 @@ impl IrminsulApp {
     fn handle_automation_export(&mut self, app_state: &AppState) {
 
         let want_file = self.saved_state.save_result_to_file;
-        let want_tracker = !self.saved_state.tracker_import_key.is_empty();
+        let want_tracker = self.want_tracker_upload();
 
         if !want_file && !want_tracker {
             return;
@@ -1330,7 +1412,7 @@ impl IrminsulApp {
 
     fn enforce_capture_when_automation_enabled(&mut self, app_state: &AppState) {
         let want_file = self.saved_state.save_result_to_file;
-        let want_tracker = !self.saved_state.tracker_import_key.is_empty();
+        let want_tracker = self.want_tracker_upload();
 
         if !want_file && !want_tracker {
             self.automation_capture_requested = false;
