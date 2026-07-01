@@ -1,5 +1,4 @@
 use std::fmt::Display;
-use std::fs;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -17,6 +16,8 @@ use egui_file_dialog::FileDialog;
 use egui_notify::Toasts;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem};
+use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::monitor::Monitor;
 use crate::player_data::ExportSettings;
@@ -25,28 +26,32 @@ use crate::{
     AppState, ConfirmationType, Message, ReloadHandle, State, TracingLevel, open_log_dir, wish,
 };
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct SavedAppState {
-    export_settings: ExportSettings,
+    pub export_settings: ExportSettings,
     #[serde(default)]
-    start_on_startup: bool,
+    pub start_on_startup: bool,
     #[serde(default)]
-    save_result_to_file: bool,
+    pub save_result_to_file: bool,
     #[serde(default)]
-    save_result_folder: Option<PathBuf>,
-    log_raw_packets: bool,
+    pub save_result_folder: Option<PathBuf>,
+    pub log_raw_packets: bool,
     #[serde(default)]
-    tracing_level: TracingLevel,
+    pub tracing_level: TracingLevel,
     #[serde(default)]
-    tracker_import_key: String,
+    pub tracker_import_key: String,
     #[serde(skip, default = "default_tracker_url")]
-    tracker_api_url: String,
+    pub tracker_api_url: String,
     #[serde(default)]
-    auto_export_to_tracker: bool,
+    pub auto_export_to_tracker: bool,
+    #[serde(default)]
+    pub minimize_to_tray: Option<bool>,
 }
 
 fn default_tracker_url() -> String {
-    std::env::var("TRACKER_API_URL").unwrap_or_else(|_| "http://localhost:49000".to_string())
+    option_env!("TRACKER_API_URL")
+        .unwrap_or("http://localhost:49000")
+        .to_string()
 }
 
 impl Default for SavedAppState {
@@ -76,6 +81,7 @@ impl Default for SavedAppState {
             tracker_import_key: String::new(),
             tracker_api_url: default_tracker_url(),
             auto_export_to_tracker: false,
+            minimize_to_tray: None,
         }
     }
 }
@@ -85,7 +91,6 @@ enum OptimizerExportTarget {
     None,
     Clipboard,
     File,
-    Automation,
     TrackerManual,
 }
 
@@ -94,7 +99,9 @@ pub struct IrminsulApp {
     state_rx: watch::Receiver<AppState>,
     wish_url_rx: watch::Receiver<Option<String>>,
     log_packets_tx: watch::Sender<bool>,
+    saved_state_tx: watch::Sender<SavedAppState>,
     tracing_reload_handle: ReloadHandle,
+    toast_rx: mpsc::UnboundedReceiver<(String, bool)>,
 
     toasts: Toasts,
 
@@ -115,18 +122,22 @@ pub struct IrminsulApp {
     optimizer_export_target: OptimizerExportTarget,
 
     restarting: bool,
-    last_automation_signature: Option<(Option<Instant>, Option<Instant>, Option<Instant>)>,
-    last_automation_export_at: Option<Instant>,
-    automation_cycle_started_at: Option<Instant>,
-    automation_capture_requested: bool,
 
     saved_state: SavedAppState,
-    
+
     tracker_key_modal_open: bool,
     tracker_account_name: Option<(String, String, String)>,
     tracker_verified: bool,
     tracker_verify_rx: Option<oneshot::Receiver<Result<(String, String, String)>>>,
     tracker_upload_rx: Option<oneshot::Receiver<Result<(), String>>>,
+
+    #[allow(dead_code)]
+    tray_icon: Option<TrayIcon>,
+
+    minimize_modal_open: bool,
+    minimize_modal_remember: bool,
+
+    app_settings_open: bool,
 }
 
 trait ToastError<T> {
@@ -190,13 +201,16 @@ fn set_launch_on_startup(_enabled: bool) -> Result<()> {
 fn start_async_runtime(
     egui_ctx: Context,
     log_packets_rx: watch::Receiver<bool>,
+    saved_state_rx: watch::Receiver<SavedAppState>,
 ) -> (
     mpsc::UnboundedSender<Message>,
     watch::Receiver<AppState>,
     watch::Receiver<Option<String>>,
+    mpsc::UnboundedReceiver<(String, bool)>,
 ) {
     tracing::info!("starting tokio async");
     let (ui_message_tx, mut ui_message_rx) = mpsc::unbounded_channel::<Message>();
+    let (toast_tx, toast_rx) = mpsc::unbounded_channel::<(String, bool)>();
 
     let (state_tx, state_rx) = watch::channel(AppState::new());
     let (wish_url_tx, wish_url_rx) = watch::channel(None);
@@ -233,7 +247,16 @@ fn start_async_runtime(
                 }
             });
             tracing::info!("Starting monitor");
-            let monitor = match Monitor::new(state_tx, ui_message_rx, log_packets_rx, monitor_ctx).await {
+            let monitor = match Monitor::new(
+                state_tx,
+                ui_message_rx,
+                log_packets_rx,
+                saved_state_rx,
+                toast_tx,
+                monitor_ctx,
+            )
+            .await
+            {
                 Ok(monitor) => monitor,
                 Err(e) => {
                     tracing::error!("error loading monitor task: {e}");
@@ -244,7 +267,7 @@ fn start_async_runtime(
         });
     });
     tracing::info!("started tokio");
-    (ui_message_tx, state_rx, wish_url_rx)
+    (ui_message_tx, state_rx, wish_url_rx, toast_rx)
 }
 
 impl IrminsulApp {
@@ -262,8 +285,10 @@ impl IrminsulApp {
 
         tracing_reload_handle.set_filter(saved_state.tracing_level.get_filter());
         let (log_packets_tx, log_packets_rx) = watch::channel(saved_state.log_raw_packets);
-        let (ui_message_tx, state_rx, wish_url_rx) =
-            start_async_runtime(cc.egui_ctx.clone(), log_packets_rx);
+        let (saved_state_tx, saved_state_rx) = watch::channel(saved_state.clone());
+
+        let (ui_message_tx, state_rx, wish_url_rx, toast_rx) =
+            start_async_runtime(cc.egui_ctx.clone(), log_packets_rx, saved_state_rx);
 
         if let Err(e) = ui_message_tx.send(Message::StartCapture) {
             tracing::error!("Failed to send auto start message: {e}");
@@ -274,7 +299,10 @@ impl IrminsulApp {
         // Auto-verify tracker key on startup
         let tracker_verify_rx = if !saved_state.tracker_import_key.is_empty() {
             let key = saved_state.tracker_import_key.clone();
-            let url = format!("{}/genshin-accounts-public/verify-key", saved_state.tracker_api_url.trim_end_matches('/'));
+            let url = format!(
+                "{}/genshin-accounts-public/verify-key",
+                saved_state.tracker_api_url.trim_end_matches('/')
+            );
             let (tx, rx) = oneshot::channel();
             let _ = ui_message_tx.send(Message::VerifyTrackerKey(url, key, tx));
             Some(rx)
@@ -282,11 +310,68 @@ impl IrminsulApp {
             None
         };
 
+        let mut tray_icon = None;
+
+        if let Ok(icon_data) = image::load_from_memory(include_bytes!("../assets/icon-256.png")) {
+            let rgba = icon_data.into_rgba8();
+            let (w, h) = rgba.dimensions();
+            if let Ok(icon) = tray_icon::Icon::from_rgba(rgba.into_raw(), w, h) {
+                let tray_menu = Menu::new();
+                let restore_i = MenuItem::new("Restore", true, None);
+                let quit_i = MenuItem::new("Quit", true, None);
+                let restore_id = restore_i.id().clone();
+                let quit_id = quit_i.id().clone();
+                let _ = tray_menu.append_items(&[&restore_i, &quit_i]);
+
+                tray_icon = TrayIconBuilder::new()
+                    .with_tooltip("Irminsul")
+                    .with_icon(icon)
+                    .with_menu(Box::new(tray_menu))
+                    .build()
+                    .ok();
+
+                let ctx_clone1 = cc.egui_ctx.clone();
+                TrayIconEvent::set_event_handler(Some(move |event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        ctx_clone1.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx_clone1.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        ctx_clone1.request_repaint();
+                        #[cfg(windows)]
+                        show_window();
+                    }
+                }));
+
+                let ctx_clone2 = cc.egui_ctx.clone();
+                MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+                    if event.id == restore_id {
+                        ctx_clone2.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx_clone2.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        ctx_clone2.request_repaint();
+                        #[cfg(windows)]
+                        show_window();
+                    } else if event.id == quit_id {
+                        #[cfg(windows)]
+                        close_window();
+                        #[cfg(not(windows))]
+                        ctx_clone2.send_viewport_cmd(egui::ViewportCommand::Close);
+                        ctx_clone2.request_repaint();
+                    }
+                }));
+            }
+        }
+
         Self {
             saved_state,
             ui_message_tx,
             log_packets_tx,
+            saved_state_tx,
             tracing_reload_handle,
+            toast_rx,
             toasts,
             power_tools_open: false,
             bug_report_open: false,
@@ -302,17 +387,17 @@ impl IrminsulApp {
             optimizer_save_path: None,
             optimizer_export_target: OptimizerExportTarget::None,
             restarting: false,
-            last_automation_signature: None,
-            last_automation_export_at: None,
-            automation_cycle_started_at: None,
-            automation_capture_requested: false,
             tracker_key_modal_open: false,
             tracker_account_name: None,
             tracker_verified: false,
             tracker_verify_rx,
             tracker_upload_rx: None,
+            tray_icon,
             state_rx,
             wish_url_rx,
+            minimize_modal_open: false,
+            minimize_modal_remember: true,
+            app_settings_open: false,
         }
     }
 }
@@ -325,11 +410,77 @@ impl eframe::App for IrminsulApp {
 
     /// Called each time the UI needs repainting, which may be many times per second.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let minimize_modal_open = self.minimize_modal_open;
+        if minimize_modal_open {
+            Modal::new(Id::new("minimize_modal")).show(ctx, |ui| {
+                ui.heading("Minimize Behavior");
+                ui.label("Would you like to minimize to the system tray or the taskbar?");
+                ui.checkbox(&mut self.minimize_modal_remember, "Remember my choice");
+
+                ui.horizontal(|ui| {
+                    if ui.button("System Tray").clicked() {
+                        if self.minimize_modal_remember {
+                            self.saved_state.minimize_to_tray = Some(true);
+                        }
+                        self.minimize_modal_open = false;
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    }
+                    if ui.button("Taskbar").clicked() {
+                        if self.minimize_modal_remember {
+                            self.saved_state.minimize_to_tray = Some(false);
+                        }
+                        self.minimize_modal_open = false;
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.minimize_modal_open = false;
+                    }
+                });
+            });
+        }
+
+        let app_settings_open = self.app_settings_open;
+        if app_settings_open {
+            let modal = Modal::new(Id::new("app_settings_modal")).show(ctx, |ui| {
+                ui.heading("App Settings");
+                ui.horizontal(|ui| {
+                    ui.label("Minimize Behavior:");
+                    egui::ComboBox::from_id_salt("minimize_behavior_global")
+                        .selected_text(match self.saved_state.minimize_to_tray {
+                            Some(true) => "Minimize to System Tray",
+                            Some(false) => "Minimize to Taskbar",
+                            None => "Ask Me",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.saved_state.minimize_to_tray,
+                                Some(true),
+                                "Minimize to System Tray",
+                            );
+                            ui.selectable_value(
+                                &mut self.saved_state.minimize_to_tray,
+                                Some(false),
+                                "Minimize to Taskbar",
+                            );
+                            ui.selectable_value(
+                                &mut self.saved_state.minimize_to_tray,
+                                None,
+                                "Ask Me",
+                            );
+                        });
+                });
+            });
+            if modal.should_close() {
+                self.app_settings_open = false;
+            }
+        }
+
         ctx.style_mut(|style| {
             style.interaction.selectable_labels = false;
             style.interaction.tooltip_delay = 0.25;
         });
-
 
         if let Some(optimizer_save_dialog) = &mut self.optimizer_save_dialog {
             optimizer_save_dialog.update(ctx);
@@ -348,7 +499,8 @@ impl eframe::App for IrminsulApp {
                 self.tracker_upload_rx = None;
                 match result {
                     Ok(_) => {
-                        self.toasts.success("Successfully synced capture to Tracker!");
+                        self.toasts
+                            .success("Successfully synced capture to Tracker!");
                     }
                     Err(e) => {
                         if e.contains("401")
@@ -470,30 +622,76 @@ impl eframe::App for IrminsulApp {
                     if button.clicked() {
                         self.bug_report_open = true;
                     }
+                    let settings_button = ui.add(
+                        Button::new(
+                            RichText::new(egui_material_icons::icons::ICON_SETTINGS).size(16.),
+                        )
+                        .frame(false),
+                    );
+                    if settings_button.clicked() {
+                        self.app_settings_open = true;
+                    }
                     ui.label(env!("CARGO_PKG_VERSION").to_string());
                     egui::warn_if_debug_build(ui);
                 });
             });
         });
 
+        // Drain toast_rx
+        while let Ok((msg, is_error)) = self.toast_rx.try_recv() {
+            if is_error {
+                self.toasts.error(msg);
+            } else {
+                self.toasts.success(msg);
+            }
+        }
+
         self.toasts.show(ctx);
+
+        // Push the latest saved state to the background thread
+        let _ = self.saved_state_tx.send(self.saved_state.clone());
     }
 }
 
 impl IrminsulApp {
-    fn title_bar(&self, ui: &mut egui::Ui) {
+    fn title_bar(&mut self, ui: &mut egui::Ui) {
         let (_, button_width) = egui::Sides::new().show(
             ui,
             |_ui| {},
             |ui| {
-                let button = ui.add(
+                let mut width = 0.0;
+
+                let close_button = ui.add(
                     Button::new(RichText::new(egui_material_icons::icons::ICON_CLOSE).size(24.))
                         .frame(false),
                 );
-                if button.clicked() {
+                if close_button.clicked() {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                button.rect.width()
+                width += close_button.rect.width();
+
+                let min_button = ui.add(
+                    Button::new(RichText::new(egui_material_icons::icons::ICON_MINIMIZE).size(24.))
+                        .frame(false),
+                );
+                if min_button.clicked() {
+                    match self.saved_state.minimize_to_tray {
+                        Some(true) => {
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                        }
+                        Some(false) => {
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        }
+                        None => {
+                            self.minimize_modal_open = true;
+                        }
+                    }
+                }
+                width += min_button.rect.width();
+
+                width
             },
         );
 
@@ -594,12 +792,6 @@ impl IrminsulApp {
     }
 
     fn main_ui(&mut self, ui: &mut egui::Ui, app_state: &AppState) {
-        self.enforce_capture_when_automation_enabled(app_state);
-        self.update_capture_cycle_state(app_state);
-        self.handle_automation_export(app_state);
-
-
-
         if self.optimizer_settings_open {
             let modal = Modal::new(Id::new("Optimizer Settings")).show(ui.ctx(), |ui| {
                 self.optimizer_settings_modal(ui);
@@ -634,53 +826,52 @@ impl IrminsulApp {
                         self.optimizer_settings_open = true;
                     }
 
-                    ui.add_enabled_ui(
-                        self.optimizer_export_rx.is_none(),
-                        |ui| {
-                            let is_ready = app_state.updated.characters_updated.is_some()
-                                && app_state.updated.items_updated.is_some()
-                                && app_state.updated.achievements_updated.is_some();
+                    ui.add_enabled_ui(self.optimizer_export_rx.is_none(), |ui| {
+                        let is_ready = app_state.updated.characters_updated.is_some()
+                            && app_state.updated.items_updated.is_some()
+                            && app_state.updated.achievements_updated.is_some();
 
-                            if ui
-                                .button(egui_material_icons::icons::ICON_DOWNLOAD)
-                                .clicked()
-                            {
-                                if is_ready {
-                                    let now = Local::now();
-                                    let mut optimizer_save_dialog = FileDialog::new()
-                                        .add_file_filter_extensions("JSON files", vec!["json"])
-                                        .default_file_name(&format!(
-                                            "genshin_export_{}.json",
-                                            now.format("%Y-%m-%d_%H-%M")
-                                        ));
-                                    optimizer_save_dialog.save_file();
-                                    self.optimizer_save_dialog = Some(optimizer_save_dialog);
-                                } else {
-                                    self.toasts.error("Data not found. Please open the game first.");
-                                }
+                        if ui
+                            .button(egui_material_icons::icons::ICON_DOWNLOAD)
+                            .clicked()
+                        {
+                            if is_ready {
+                                let now = Local::now();
+                                let mut optimizer_save_dialog = FileDialog::new()
+                                    .add_file_filter_extensions("JSON files", vec!["json"])
+                                    .default_file_name(&format!(
+                                        "genshin_export_{}.json",
+                                        now.format("%Y-%m-%d_%H-%M")
+                                    ));
+                                optimizer_save_dialog.save_file();
+                                self.optimizer_save_dialog = Some(optimizer_save_dialog);
+                            } else {
+                                self.toasts
+                                    .error("Data not found. Please open the game first.");
                             }
+                        }
 
-                            if let Some(optimizer_save_dialog) = &mut self.optimizer_save_dialog
-                                && let Some(path) = optimizer_save_dialog.take_picked()
-                            {
-                                self.optimizer_save_path = Some(path);
-                                self.genshin_optimizer_request_export(OptimizerExportTarget::File);
-                            }
+                        if let Some(optimizer_save_dialog) = &mut self.optimizer_save_dialog
+                            && let Some(path) = optimizer_save_dialog.take_picked()
+                        {
+                            self.optimizer_save_path = Some(path);
+                            self.genshin_optimizer_request_export(OptimizerExportTarget::File);
+                        }
 
-                            if ui
-                                .button(egui_material_icons::icons::ICON_CONTENT_PASTE_GO)
-                                .clicked()
-                            {
-                                if is_ready {
-                                    self.genshin_optimizer_request_export(
-                                        OptimizerExportTarget::Clipboard,
-                                    );
-                                } else {
-                                    self.toasts.error("Data not found. Please open the game first.");
-                                }
+                        if ui
+                            .button(egui_material_icons::icons::ICON_CONTENT_PASTE_GO)
+                            .clicked()
+                        {
+                            if is_ready {
+                                self.genshin_optimizer_request_export(
+                                    OptimizerExportTarget::Clipboard,
+                                );
+                            } else {
+                                self.toasts
+                                    .error("Data not found. Please open the game first.");
                             }
-                        },
-                    );
+                        }
+                    });
                 },
             );
         });
@@ -693,6 +884,27 @@ impl IrminsulApp {
                 Self::data_state(ui, "Characters", app_state.updated.characters_updated);
                 Self::data_state(ui, "Achievements", app_state.updated.achievements_updated);
             });
+
+        ui.add_space(4.0);
+        let status_text = if let Some(updated_time) = app_state.updated.achievements_updated_time {
+            if let Some(updated_instant) = app_state.updated.achievements_updated {
+                ui.ctx().request_repaint(); // update timer
+                let elapsed = updated_instant.elapsed().as_secs();
+                let remaining = 5u64.saturating_sub(elapsed);
+                RichText::new(format!("Status: Capture success [{}s]", remaining))
+                    .color(Color32::from_hex("#00ab3f").unwrap())
+                    .strong()
+            } else {
+                RichText::new(format!(
+                    "Status: Ready to capture, Last capture at {}",
+                    updated_time.format("%H:%M:%S")
+                ))
+                .strong()
+            }
+        } else {
+            RichText::new("Status: Ready to capture").strong()
+        };
+        ui.label(status_text);
     }
 
     fn data_state(ui: &mut egui::Ui, source: &str, last_updated: Option<Instant>) {
@@ -705,8 +917,6 @@ impl IrminsulApp {
         ui.label(source);
         ui.end_row();
     }
-
-
 
     fn genshin_optimizer_request_export(&mut self, target: OptimizerExportTarget) {
         let (tx, rx) = oneshot::channel();
@@ -780,17 +990,25 @@ impl IrminsulApp {
             Ok(Err(_)) | Err(_) => {
                 if let Some(target_url) = self.pending_open_url.take() {
                     self.wish_link_failed_for = Some(target_url);
-                    self.toasts.error("Link not found, click again to open anyways");
+                    self.toasts
+                        .error("Link not found, click again to open anyways");
                 } else {
                     self.wish_link_failed_for = None;
-                    self.toasts.error("Could not find Wish URL. Please open the Wish History in-game first.");
+                    self.toasts.error(
+                        "Could not find Wish URL. Please open the Wish History in-game first.",
+                    );
                 }
             }
         }
         Ok(())
     }
 
-    fn handle_wish_open_button(&mut self, ui: &mut egui::Ui, wish_url: Option<String>, target_url: &str) {
+    fn handle_wish_open_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        wish_url: Option<String>,
+        target_url: &str,
+    ) {
         if self.wish_link_failed_for.as_deref() == Some(target_url) {
             ui.ctx().open_url(egui::OpenUrl::new_tab(target_url));
             self.wish_link_failed_for = None;
@@ -830,7 +1048,10 @@ impl IrminsulApp {
             ui.add_enabled_ui(true, |ui| {
                 let previous_startup = self.saved_state.start_on_startup;
                 if ui
-                    .checkbox(&mut self.saved_state.start_on_startup, "Start Irminsul on startup")
+                    .checkbox(
+                        &mut self.saved_state.start_on_startup,
+                        "Start Irminsul on startup",
+                    )
                     .changed()
                 {
                     if let Err(e) = set_launch_on_startup(self.saved_state.start_on_startup) {
@@ -845,7 +1066,10 @@ impl IrminsulApp {
                         "Save result to file",
                     );
                     ui.add_enabled_ui(self.saved_state.save_result_to_file, |ui| {
-                        if ui.button(egui_material_icons::icons::ICON_SETTINGS).clicked() {
+                        if ui
+                            .button(egui_material_icons::icons::ICON_SETTINGS)
+                            .clicked()
+                        {
                             self.automation_settings_open = true;
                         }
                     });
@@ -860,10 +1084,7 @@ impl IrminsulApp {
             && self.tracker_verified
     }
 
-    fn apply_tracker_verify_result(
-        &mut self,
-        result: Result<(String, String, String)>,
-    ) {
+    fn apply_tracker_verify_result(&mut self, result: Result<(String, String, String)>) {
         match result {
             Ok(info) => {
                 self.tracker_account_name = Some(info);
@@ -872,7 +1093,8 @@ impl IrminsulApp {
             Err(e) => {
                 self.tracker_account_name = None;
                 self.tracker_verified = false;
-                self.toasts.error(format!("Failed to verify tracker key: {}", e));
+                self.toasts
+                    .error(format!("Failed to verify tracker key: {}", e));
             }
         }
     }
@@ -889,7 +1111,9 @@ impl IrminsulApp {
             self.saved_state.tracker_api_url.trim_end_matches('/')
         );
         let (tx, rx) = oneshot::channel();
-        let _ = self.ui_message_tx.send(Message::VerifyTrackerKey(url, key, tx));
+        let _ = self
+            .ui_message_tx
+            .send(Message::VerifyTrackerKey(url, key, tx));
         self.tracker_verify_rx = Some(rx);
         self.tracker_account_name = None;
         self.tracker_verified = false;
@@ -902,7 +1126,10 @@ impl IrminsulApp {
                 ui.heading("Set Tracker Import Key");
                 ui.separator();
                 ui.label("Enter your Import Key generated from the GDT dashboard:");
-                ui.add(egui::TextEdit::singleline(&mut self.saved_state.tracker_import_key).password(true));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.saved_state.tracker_import_key)
+                        .password(true),
+                );
                 if self.tracker_verify_rx.is_some() {
                     ui.label(RichText::new("Verifying key…").color(Color32::YELLOW));
                 } else if self.tracker_verified {
@@ -930,60 +1157,71 @@ impl IrminsulApp {
         ui.add_enabled_ui(true, |ui| {
             ui.vertical(|ui| {
                 egui::Sides::new().show(
-                ui,
-                |ui| {
-                    Self::section_header(ui, "Tracker");
-                },
-                |ui| {
+                    ui,
+                    |ui| {
+                        Self::section_header(ui, "Tracker");
+                    },
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(egui_material_icons::icons::ICON_REFRESH)
+                                .clicked()
+                            {
+                                self.request_tracker_verify();
+                            }
+                            let is_ready = app_state.updated.characters_updated.is_some()
+                                && app_state.updated.items_updated.is_some()
+                                && app_state.updated.achievements_updated.is_some();
+                            ui.add_enabled_ui(
+                                is_ready
+                                    && self.tracker_verified
+                                    && self.optimizer_export_rx.is_none(),
+                                |ui| {
+                                    if ui
+                                        .button(egui_material_icons::icons::ICON_CLOUD_UPLOAD)
+                                        .on_hover_text("Export current capture to Tracker")
+                                        .clicked()
+                                    {
+                                        self.genshin_optimizer_request_export(
+                                            OptimizerExportTarget::TrackerManual,
+                                        );
+                                    }
+                                },
+                            );
+                            if ui
+                                .button(egui_material_icons::icons::ICON_SETTINGS)
+                                .clicked()
+                            {
+                                self.tracker_key_modal_open = true;
+                                self.request_tracker_verify();
+                            }
+                        });
+                    },
+                );
+
+                if self.saved_state.tracker_import_key.is_empty() {
+                    ui.label("No account linked.");
+                } else if let Some((name, uid, server)) = &self.tracker_account_name {
+                    ui.label(
+                        RichText::new(format!("Account: {}", name))
+                            .color(Color32::from_hex("#00ab3f").unwrap()),
+                    );
                     ui.horizontal(|ui| {
-                        if ui.button(egui_material_icons::icons::ICON_REFRESH).clicked() {
-                            self.request_tracker_verify();
-                        }
-                        let is_ready = app_state.updated.characters_updated.is_some()
-                            && app_state.updated.items_updated.is_some()
-                            && app_state.updated.achievements_updated.is_some();
-                        ui.add_enabled_ui(
-                            is_ready && self.tracker_verified && self.optimizer_export_rx.is_none(),
-                            |ui| {
-                                if ui
-                                    .button(egui_material_icons::icons::ICON_CLOUD_UPLOAD)
-                                    .on_hover_text("Export current capture to Tracker")
-                                    .clicked()
-                                {
-                                    self.genshin_optimizer_request_export(
-                                        OptimizerExportTarget::TrackerManual,
-                                    );
-                                }
-                            },
-                        );
-                        if ui.button(egui_material_icons::icons::ICON_SETTINGS).clicked() {
-                            self.tracker_key_modal_open = true;
-                            self.request_tracker_verify();
-                        }
+                        ui.label(RichText::new(format!("UID: {}", uid)).color(Color32::GRAY));
+                        ui.label(RichText::new("•").color(Color32::DARK_GRAY));
+                        ui.label(RichText::new(format!("Server: {}", server)).color(Color32::GRAY));
                     });
-                },
-            );
+                } else if self.tracker_verify_rx.is_some() {
+                    ui.label(RichText::new("Verifying...").color(Color32::YELLOW));
+                } else {
+                    ui.label(RichText::new("Verification Failed").color(Color32::RED));
+                }
 
-            if self.saved_state.tracker_import_key.is_empty() {
-                ui.label("No account linked.");
-            } else if let Some((name, uid, server)) = &self.tracker_account_name {
-                ui.label(RichText::new(format!("Account: {}", name)).color(Color32::from_hex("#00ab3f").unwrap()));
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("UID: {}", uid)).color(Color32::GRAY));
-                    ui.label(RichText::new("•").color(Color32::DARK_GRAY));
-                    ui.label(RichText::new(format!("Server: {}", server)).color(Color32::GRAY));
-                });
-            } else if self.tracker_verify_rx.is_some() {
-                ui.label(RichText::new("Verifying...").color(Color32::YELLOW));
-            } else {
-                ui.label(RichText::new("Verification Failed").color(Color32::RED));
-            }
-
-            ui.checkbox(
-                &mut self.saved_state.auto_export_to_tracker,
-                "Auto export to tracker",
-            );
-        });
+                ui.checkbox(
+                    &mut self.saved_state.auto_export_to_tracker,
+                    "Auto export to tracker",
+                );
+            });
         });
     }
 
@@ -1101,8 +1339,6 @@ impl IrminsulApp {
             },
         );
     }
-
-
 
     fn optimizer_settings_modal(&mut self, ui: &mut egui::Ui) {
         ui.set_width(300.0);
@@ -1241,22 +1477,13 @@ impl IrminsulApp {
             OptimizerExportTarget::File => {
                 self.optimizer_save_to_file(json)?;
             }
-            OptimizerExportTarget::Automation => {
-                if self.saved_state.save_result_to_file {
-                    self.optimizer_save_to_automation_file(json.clone())?;
-                }
 
-                if self.want_tracker_upload() {
-                    self.tracker_upload_json(json);
-                }
-
-                self.reset_capture_for_next_cycle();
-            }
             OptimizerExportTarget::TrackerManual => {
                 if self.want_tracker_upload() {
                     self.tracker_upload_json(json);
                 } else if !self.saved_state.tracker_import_key.is_empty() {
-                    self.toasts.error("Tracker key not verified. Open settings to re-link.");
+                    self.toasts
+                        .error("Tracker key not verified. Open settings to re-link.");
                 } else {
                     self.toasts.error("No tracker import key configured.");
                 }
@@ -1291,151 +1518,18 @@ impl IrminsulApp {
     fn tracker_upload_json(&mut self, json: String) {
         let key = self.saved_state.tracker_import_key.clone();
         let base_url = self.saved_state.tracker_api_url.clone();
-        let url = format!("{}/genshin-accounts-public/import-by-key", base_url.trim_end_matches('/'));
-        
+        let url = format!(
+            "{}/genshin-accounts-public/import-by-key",
+            base_url.trim_end_matches('/')
+        );
+
         self.toasts.info("Starting upload to Tracker...");
 
         let (tx, rx) = oneshot::channel();
-        let _ = self.ui_message_tx.send(Message::UploadToTracker(json, url, key, tx));
+        let _ = self
+            .ui_message_tx
+            .send(Message::UploadToTracker(json, url, key, tx));
         self.tracker_upload_rx = Some(rx);
-    }
-
-    fn optimizer_save_to_automation_file(&mut self, json: String) -> Result<()> {
-        let output_dir = if let Some(folder) = &self.saved_state.save_result_folder {
-            folder.clone()
-        } else {
-            let exe_path = std::env::current_exe().context("Unable to locate current executable")?;
-            exe_path
-                .parent()
-                .map(|path| path.to_path_buf())
-                .unwrap_or(std::env::current_dir()?)
-        };
-
-        fs::create_dir_all(&output_dir)
-            .with_context(|| format!("Unable to create output directory {output_dir:?}"))?;
-        let file_name = format!("genshin_export_{}.json", Local::now().format("%Y-%m-%d_%H-%M-%S"));
-        let path = output_dir.join(file_name);
-
-        let file = File::create(&path).with_context(|| format!("Unable to open file {path:?}"))?;
-        let mut writer = BufWriter::new(file);
-        writer.write_all(json.as_bytes())?;
-
-        self.toasts
-            .info(format!("Automation saved result to {}", path.display()));
-        Ok(())
-    }
-
-    fn update_capture_cycle_state(&mut self, app_state: &AppState) {
-        if app_state.capturing {
-            self.automation_capture_requested = false;
-            if self.automation_cycle_started_at.is_none() {
-                self.automation_cycle_started_at = Some(Instant::now());
-            }
-        } else {
-            self.automation_cycle_started_at = None;
-        }
-    }
-
-    fn handle_automation_export(&mut self, app_state: &AppState) {
-
-        let want_file = self.saved_state.save_result_to_file;
-        let want_tracker = self.want_tracker_upload();
-
-        if !want_file && !want_tracker {
-            return;
-        }
-
-        if self.optimizer_export_rx.is_some() {
-            return;
-        }
-
-        let now = Instant::now();
-        let max_last_updated = [
-            app_state.updated.items_updated,
-            app_state.updated.characters_updated,
-            app_state.updated.achievements_updated,
-        ]
-        .into_iter()
-        .flatten()
-        .max();
-
-        if let Some(last_updated) = max_last_updated {
-            if now.duration_since(last_updated).as_secs() >= 30 {
-                let _ = self.ui_message_tx.send(Message::ClearData);
-                self.automation_cycle_started_at = Some(Instant::now());
-                self.last_automation_signature = None;
-                return;
-            }
-        }
-
-        // Cooldown: skip if last export was less than 5 seconds ago
-        if let Some(last_export) = self.last_automation_export_at {
-            if last_export.elapsed() < std::time::Duration::from_secs(5) {
-                return;
-            }
-        }
-
-        let Some(capture_started_at) = self.automation_cycle_started_at else {
-            return;
-        };
-        let Some(items_updated_at) = app_state.updated.items_updated else {
-            return;
-        };
-        let Some(characters_updated_at) = app_state.updated.characters_updated else {
-            return;
-        };
-        let Some(achievements_updated_at) = app_state.updated.achievements_updated else {
-            return;
-        };
-        if items_updated_at <= capture_started_at
-            || characters_updated_at <= capture_started_at
-            || achievements_updated_at <= capture_started_at
-        {
-            return;
-        }
-
-        let signature = (
-            app_state.updated.items_updated,
-            app_state.updated.characters_updated,
-            app_state.updated.achievements_updated,
-        );
-        if self.last_automation_signature == Some(signature) {
-            return;
-        }
-
-        self.last_automation_signature = Some(signature);
-        self.last_automation_export_at = Some(Instant::now());
-        self.genshin_optimizer_request_export(OptimizerExportTarget::Automation);
-    }
-
-    fn reset_capture_for_next_cycle(&mut self) {
-        self.automation_cycle_started_at = Some(Instant::now());
-        let _ = self.ui_message_tx.send(Message::StopCapture);
-        self.request_capture_start();
-    }
-
-    fn enforce_capture_when_automation_enabled(&mut self, app_state: &AppState) {
-        let want_file = self.saved_state.save_result_to_file;
-        let want_tracker = self.want_tracker_upload();
-
-        if !want_file && !want_tracker {
-            self.automation_capture_requested = false;
-            return;
-        }
-        if app_state.capturing {
-            self.automation_capture_requested = false;
-            return;
-        }
-        self.request_capture_start();
-    }
-
-    fn request_capture_start(&mut self) {
-        if self.automation_capture_requested {
-            return;
-        }
-        if self.ui_message_tx.send(Message::StartCapture).is_ok() {
-            self.automation_capture_requested = true;
-        }
     }
 
     fn achievement_ui(&mut self, ui: &mut egui::Ui, app_state: &AppState) {
@@ -1447,36 +1541,41 @@ impl IrminsulApp {
                 |ui| {
                     Self::section_header(ui, "Achievement Export");
                     ui.label(egui_material_icons::icons::ICON_HELP)
-                        .on_hover_text("Click the Copy icon to copy your achievements to the clipboard.");
+                        .on_hover_text(
+                            "Click the Copy icon to copy your achievements to the clipboard.",
+                        );
                 },
                 |ui| {
-                    ui.add_enabled_ui(
-                        self.achievements_export_rx.is_none(),
-                        |ui| {
-                            if ui
-                                .button(egui_material_icons::icons::ICON_CONTENT_PASTE_GO)
-                                .clicked()
-                            {
-                                if app_state.updated.achievements_updated.is_some() {
-                                    let (tx, rx) = oneshot::channel();
-                                    let _ = self.ui_message_tx.send(Message::ExportAchievements(tx));
-                                    self.achievements_export_rx = Some(rx);
-                                    self.wish_link_failed_for = None;
-                                } else {
-                                    self.wish_link_failed_for = None;
-                                    self.toasts.error("Data not found. Please open the game first.");
-                                }
+                    ui.add_enabled_ui(self.achievements_export_rx.is_none(), |ui| {
+                        if ui
+                            .button(egui_material_icons::icons::ICON_CONTENT_PASTE_GO)
+                            .clicked()
+                        {
+                            if app_state.updated.achievements_updated_time.is_some() {
+                                let (tx, rx) = oneshot::channel();
+                                let _ = self.ui_message_tx.send(Message::ExportAchievements(tx));
+                                self.achievements_export_rx = Some(rx);
+                                self.wish_link_failed_for = None;
+                            } else {
+                                self.wish_link_failed_for = None;
+                                self.toasts
+                                    .error("Data not found. Please open the game first.");
                             }
-                        },
-                    );
+                        }
+                    });
                 },
             );
+
             ui.horizontal(|ui| {
                 if ui.link("Open StarDB").clicked() {
                     self.handle_achievement_open_button(app_state, ui, "https://stardb.gg/import");
                 }
                 if ui.link("Open Seelie.me").clicked() {
-                    self.handle_achievement_open_button(app_state, ui, "https://seelie.me/achievements");
+                    self.handle_achievement_open_button(
+                        app_state,
+                        ui,
+                        "https://seelie.me/achievements",
+                    );
                 }
             });
         });
@@ -1491,8 +1590,10 @@ impl IrminsulApp {
             Ok(Ok(achievements)) => {
                 let json = serde_json::json!({ "gi_achievements": achievements }).to_string();
                 ui.ctx().copy_text(json);
-                self.toasts
-                    .info(format!("{} Achievements copied to clipboard", achievements.len()));
+                self.toasts.info(format!(
+                    "{} Achievements copied to clipboard",
+                    achievements.len()
+                ));
                 self.wish_link_failed_for = None;
                 if let Some(target_url) = self.pending_open_url.take() {
                     ui.ctx().open_url(egui::OpenUrl::new_tab(target_url));
@@ -1501,21 +1602,28 @@ impl IrminsulApp {
             Ok(Err(_)) | Err(_) => {
                 if let Some(target_url) = self.pending_open_url.take() {
                     self.wish_link_failed_for = Some(target_url);
-                    self.toasts.error("Export failed, click again to open anyways");
+                    self.toasts
+                        .error("Export failed, click again to open anyways");
                 } else {
                     self.wish_link_failed_for = None;
-                    self.toasts.error("Export failed. Please open the achievements menu in-game first.");
+                    self.toasts
+                        .error("Export failed. Please open the achievements menu in-game first.");
                 }
             }
         }
         Ok(())
     }
 
-    fn handle_achievement_open_button(&mut self, app_state: &AppState, ui: &mut egui::Ui, target_url: &str) {
+    fn handle_achievement_open_button(
+        &mut self,
+        app_state: &AppState,
+        ui: &mut egui::Ui,
+        target_url: &str,
+    ) {
         if self.wish_link_failed_for.as_deref() == Some(target_url) {
             ui.ctx().open_url(egui::OpenUrl::new_tab(target_url));
             self.wish_link_failed_for = None;
-        } else if app_state.updated.achievements_updated.is_some() {
+        } else if app_state.updated.achievements_updated_time.is_some() {
             let (tx, rx) = oneshot::channel();
             let _ = self.ui_message_tx.send(Message::ExportAchievements(tx));
             self.achievements_export_rx = Some(rx);
@@ -1523,11 +1631,61 @@ impl IrminsulApp {
             self.wish_link_failed_for = None;
         } else {
             self.wish_link_failed_for = Some(target_url.to_string());
-            self.toasts.error("Achievements not found, click again to open anyways");
+            self.toasts
+                .error("Achievements not found, click again to open anyways");
         }
     }
 
     fn section_header(ui: &mut egui::Ui, name: &str) {
         ui.label(RichText::new(name).size(18.));
+    }
+}
+
+#[cfg(windows)]
+fn show_window() {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, SW_RESTORE, SetForegroundWindow, ShowWindow,
+    };
+    use windows::core::PCWSTR;
+
+    let title: Vec<u16> = std::ffi::OsStr::new("Irminsul")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let hwnd = FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr()));
+        if hwnd.is_ok() && !hwnd.clone().unwrap().0.is_null() {
+            let hwnd = hwnd.unwrap();
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn close_window() {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_CLOSE};
+    use windows::core::PCWSTR;
+
+    let title: Vec<u16> = std::ffi::OsStr::new("Irminsul")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let hwnd = FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr()));
+        if hwnd.is_ok() && !hwnd.clone().unwrap().0.is_null() {
+            let _ = PostMessageW(
+                Some(hwnd.unwrap()),
+                WM_CLOSE,
+                windows::Win32::Foundation::WPARAM(0),
+                windows::Win32::Foundation::LPARAM(0),
+            );
+        }
     }
 }

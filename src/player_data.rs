@@ -107,17 +107,10 @@ impl PlayerData {
         }
     }
 
-    pub fn clear(&mut self) {
-        self.achievements.clear();
-        self.characters.clear();
-        self.items.clear();
-        self.properties.clear();
-        self.character_equip_guid_map.clear();
-    }
-
     pub fn process_achievements(&mut self, achievements: &[Achievement]) {
         for achievement in achievements {
-            self.achievements.insert(achievement.id, achievement.clone());
+            self.achievements
+                .insert(achievement.id, achievement.clone());
         }
     }
 
@@ -126,7 +119,6 @@ impl PlayerData {
             self.properties.insert(*k, *v);
         }
     }
-
 
     pub fn process_characters(&mut self, avatars: &[AvatarInfo]) {
         for avatar in avatars {
@@ -179,7 +171,12 @@ impl PlayerData {
             weapons: Vec::new(),
             materials: HashMap::new(),
             gi_achievements: Some(self.export_achievements().unwrap_or_default()),
-            timestamp: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64),
+            timestamp: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+            ),
         };
 
         if settings.include_characters {
@@ -413,15 +410,14 @@ impl PlayerData {
     }
 
     pub fn export_genshin_optimizer_materials(&self) -> HashMap<String, u32> {
-        let mut materials: HashMap<String, u32> = self.items
+        let mut materials: HashMap<String, u32> = self
+            .items
             .values()
             .filter_map(|item| {
                 if !item.has_material() {
                     return None;
                 }
                 let material = item.material();
-
-
 
                 let name = self.game_data.get_material(item.item_id).ok()?;
 

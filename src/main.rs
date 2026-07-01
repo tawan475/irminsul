@@ -55,13 +55,18 @@ pub enum Message {
     ExportGenshinOptimizer(ExportSettings, oneshot::Sender<Result<String>>),
     ExportAchievements(oneshot::Sender<Result<Vec<u32>>>),
     FindWishUrl(oneshot::Sender<Result<String>>),
-    VerifyTrackerKey(String, String, oneshot::Sender<Result<(String, String, String)>>),
+    VerifyTrackerKey(
+        String,
+        String,
+        oneshot::Sender<Result<(String, String, String)>>,
+    ),
     UploadToTracker(String, String, String, oneshot::Sender<Result<(), String>>),
 }
 
 #[derive(Clone, Debug)]
 pub struct DataUpdated {
     achievements_updated: Option<Instant>,
+    achievements_updated_time: Option<chrono::DateTime<chrono::Local>>,
     characters_updated: Option<Instant>,
     items_updated: Option<Instant>,
 }
@@ -70,6 +75,7 @@ impl DataUpdated {
     pub fn new() -> Self {
         Self {
             achievements_updated: None,
+            achievements_updated_time: None,
             characters_updated: None,
             items_updated: None,
         }
@@ -155,6 +161,12 @@ impl ReloadHandle {
 }
 
 fn main() -> eframe::Result {
+    let instance = single_instance::SingleInstance::new("irminsul_app_instance").unwrap();
+    if !instance.is_single() {
+        eprintln!("Another instance of Irminsul is already running.");
+        std::process::exit(1);
+    }
+
     let (_guard, reload_handle) = tracing_init().unwrap();
 
     let args = Args::parse();
@@ -230,7 +242,11 @@ fn rotate_logs(log_dir: &std::path::Path) -> Result<()> {
     if let Ok(dir) = std::fs::read_dir(log_dir) {
         for entry in dir.flatten() {
             let path = entry.path();
-            if (path.extension().and_then(|e| e.to_str()) == Some("log") && path.file_name().and_then(|n| n.to_str()) != Some("latest.log")) || (path.extension().and_then(|e| e.to_str()) == Some("pcapng") && path.file_name().and_then(|n| n.to_str()) != Some("latest.pcapng")) {
+            if (path.extension().and_then(|e| e.to_str()) == Some("log")
+                && path.file_name().and_then(|n| n.to_str()) != Some("latest.log"))
+                || (path.extension().and_then(|e| e.to_str()) == Some("pcapng")
+                    && path.file_name().and_then(|n| n.to_str()) != Some("latest.pcapng"))
+            {
                 if let Ok(metadata) = entry.metadata() {
                     if let Ok(modified) = metadata.modified() {
                         entries.push((path, modified));
