@@ -98,9 +98,9 @@ pub enum ConnectionPacket {
 
 #[repr(u16)]
 enum CommandId {
-    AvatarDataNotify = 21044,
-    PlayerStoreNotify = 24051,
-    PlayerPropertyNotify = 7426,
+    AvatarDataNotify = 22826,
+    PlayerStoreNotify = 25494,
+    PlayerPropertyNotify = 2643,
 }
 
 /// Game command header.
@@ -446,9 +446,11 @@ pub fn matches_avatar_packet(game_command: &GameCommand) -> Option<Vec<r#gen::pr
     return matches_avatars_all_data_notify(&game_command.proto_data);
 }
 pub fn matches_player_property_packet(game_command: &GameCommand) -> Option<std::collections::HashMap<u32, u32>> {
-    if game_command.command_id != 7426 {
-        return None;
-    }
+    // Instead of a hardcoded command ID check, we dynamically discover it.
+    // If we uncommented this, it would break when the command ID changes.
+    // if game_command.command_id != 7426 {
+    //     return None;
+    // }
 
     use protobuf::Message;
     use protobuf::UnknownValueRef::{LengthDelimited, Varint};
@@ -512,9 +514,12 @@ pub fn matches_player_property_packet(game_command: &GameCommand) -> Option<std:
         }
     }
 
-    if properties.is_empty() {
+    // PlayerPropertyNotify typically has quite a few properties (e.g. Level, XP, MaxStamina, etc.)
+    // If it only has 1 or 2, it might be a coincidence or a different packet.
+    if properties.len() < 5 {
         None
     } else {
+        tracing::info!("Discovered PlayerPropertyNotify! Command ID is: {}", game_command.command_id);
         Some(properties)
     }
 }

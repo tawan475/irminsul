@@ -177,6 +177,6 @@ message AvatarTeam {
 }
 
 message AvatarDataNotify {
-    repeated AvatarInfo avatar_list = 3;
+    repeated AvatarInfo avatar_list = 14;
     //map<uint32, AvatarTeam> avatar_team_map = 14;
 }
