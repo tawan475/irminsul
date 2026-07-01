@@ -23,7 +23,7 @@ tokio = { version = "1.47.1", features = [
 
 anyhow = "1.0.99"
 async-watcher = "0.3.0"
-auto-artifactarium = { git = "https://github.com/tawan475/auto-artifactarium" }
+auto-artifactarium = { git = "https://github.com/tawan475/auto-artifactarium", rev = "344db64249096a2aab49c3ba8a8a33c6d7aefe5f" }
 base64 = "0.22.1"
 chrono = "0.4.42"
 clap = { version = "4.5.47", features = ["derive"] }
@@ -92,5 +92,5 @@ opt-level = 2
 # anime-game-data = { path = "../anime-game-data" }
 
 # Uncomment for local debugging
-# [patch."https://github.com/tawan475/auto-artifactarium"]
-# auto-artifactarium = { path = "../auto-artifactarium" }
+[patch."https://github.com/tawan475/auto-artifactarium"]
+auto-artifactarium = { path = "../auto-artifactarium" }
