@@ -519,6 +519,7 @@ dependencies = [
 [[package]]
 name = "auto-artifactarium"
 version = "1.4.0"
+source = "git+https://github.com/tawan475/auto-artifactarium?rev=38eb3bc68b94d6b8ba26598144e926ea9dc39a18#38eb3bc68b94d6b8ba26598144e926ea9dc39a18"
 dependencies = [
  "anyhow",
  "base64",
