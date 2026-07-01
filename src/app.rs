@@ -39,14 +39,14 @@ pub struct SavedAppState {
     tracing_level: TracingLevel,
     #[serde(default)]
     tracker_import_key: String,
-    #[serde(default = "default_tracker_url")]
+    #[serde(skip, default = "default_tracker_url")]
     tracker_api_url: String,
     #[serde(default)]
     auto_export_to_tracker: bool,
 }
 
 fn default_tracker_url() -> String {
-    "http://localhost:3000".to_string()
+    std::env::var("TRACKER_API_URL").unwrap_or_else(|_| "http://localhost:49000".to_string())
 }
 
 impl Default for SavedAppState {
@@ -257,6 +257,8 @@ impl IrminsulApp {
         } else {
             Default::default()
         };
+
+        tracing::info!("Tracker API URL: {}", saved_state.tracker_api_url);
 
         tracing_reload_handle.set_filter(saved_state.tracing_level.get_filter());
         let (log_packets_tx, log_packets_rx) = watch::channel(saved_state.log_raw_packets);
