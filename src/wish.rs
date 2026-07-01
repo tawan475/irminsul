@@ -134,7 +134,7 @@ pub async fn force_find_url() -> Result<String> {
     let data_dir = get_data_dir(&output_log_path).await?;
     let mut web_cache_path = get_web_cache_dir(data_dir).await?;
     web_cache_path.push("Cache/Cache_Data/data_2");
-    
+
     let url = extract_url_from_cache(&web_cache_path).await?;
     validate_url(&url).await?;
     Ok(url)
@@ -173,7 +173,6 @@ async fn get_data_dir(output_log_path: &PathBuf) -> Result<PathBuf> {
 
     Err(anyhow!("Can't find game data path in {output_log_path:?}"))
 }
-
 
 fn output_log_path() -> Result<PathBuf> {
     let user_profile = env::var("userprofile").context("could not find userprofile var")?;

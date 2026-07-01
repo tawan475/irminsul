@@ -58,6 +58,9 @@ tokio-util = "0.7.16"
 tracing = { version = "0.1.41" }
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+tray-icon = "0.24.1"
+image = "0.25.9"
+single-instance = "0.3.3"
 
 [target.'cfg(windows)'.dependencies]
 pktmon = { version = "0.6.2", features = ["tokio"] }
@@ -65,6 +68,7 @@ windows = { version = "0.61.3", features = [
 	"Win32_System_Console",
 	"Win32_System_Registry",
 	"Win32_UI_Shell",
+	"Win32_UI_WindowsAndMessaging",
 ] }
 
 [build-dependencies]
