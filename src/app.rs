@@ -637,13 +637,21 @@ impl eframe::App for IrminsulApp {
             });
         });
 
-        // Drain toast_rx
+        // Drain toast_rx but only keep the most recent success/error to avoid spam when waking up from tray
+        let mut latest_error = None;
+        let mut latest_success = None;
         while let Ok((msg, is_error)) = self.toast_rx.try_recv() {
             if is_error {
-                self.toasts.error(msg);
+                latest_error = Some(msg);
             } else {
-                self.toasts.success(msg);
+                latest_success = Some(msg);
             }
+        }
+        if let Some(msg) = latest_error {
+            self.toasts.error(msg);
+        }
+        if let Some(msg) = latest_success {
+            self.toasts.success(msg);
         }
 
         self.toasts.show(ctx);
