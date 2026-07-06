@@ -16,7 +16,11 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            artifact_name: ${{ github.event.repository.name }}.exe
+            artifact_name: ${{ github.event.repository.name }}-windows
+            suffix: ".exe"
+            features: ""
+          - os: windows-latest
+            artifact_name: ${{ github.event.repository.name }}-windows-pcap
             suffix: ".exe"
             features: "pcap"
           - os: ubuntu-22.04
@@ -45,8 +49,8 @@ jobs:
           tar xzf libpcap-1.10.5.tar.gz && cd libpcap-1.10.5
           ./configure --prefix=/usr --libdir=/usr/lib/x86_64-linux-gnu --disable-dbus
           make && sudo make install && sudo ldconfig
-      - name: Setup Windows
-        if: runner.os == 'Windows'
+      - name: Setup Windows (for pcap builds)
+        if: runner.os == 'Windows' && matrix.features == 'pcap'
         run: |
           curl https://npcap.com/dist/npcap-sdk-1.15.zip -o sdk.zip
           unzip sdk.zip
