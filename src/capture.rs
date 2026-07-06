@@ -1,10 +1,14 @@
+#[cfg(feature = "pcap")]
+mod pcap_backend;
+#[cfg(windows)]
+mod pktmon_backend;
+
 use std::fmt::{Debug, Display};
+use std::path::PathBuf;
 
 use anyhow::Error;
-use futures::StreamExt;
-use futures::stream::FusedStream;
-use pktmon::filter::{PktMonFilter, TransportProtocol};
-use pktmon::{Capture, Packet};
+use async_trait::async_trait;
+use clap::ValueEnum;
 
 pub const PORT_RANGE: (u16, u16) = (22101, 22102);
 
@@ -15,6 +19,7 @@ pub enum CaptureError {
     Capture { has_captured: bool, error: Error },
     CaptureClosed,
     ChannelClosed,
+    SavefileError(Error),
 }
 
 impl Display for CaptureError {
@@ -31,56 +36,68 @@ impl Display for CaptureError {
             ),
             CaptureError::CaptureClosed => write!(f, "Capture closed"),
             CaptureError::ChannelClosed => write!(f, "Channel closed"),
+            CaptureError::SavefileError(e) => write!(f, "Savefile open error: {}", e),
         }
     }
 }
 
 pub type Result<T> = std::result::Result<T, CaptureError>;
 
-pub struct PacketCapture {
-    stream: Box<dyn FusedStream<Item = Packet> + Unpin + Send>,
+#[async_trait]
+pub trait CaptureBackend: Send {
+    async fn next_packet(&mut self) -> Result<Vec<u8>>;
 }
 
-impl PacketCapture {
-    pub fn new() -> Result<Self> {
-        let mut capture = Capture::new().map_err(|e| CaptureError::Capture {
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+#[allow(unused)]
+pub enum BackendType {
+    #[cfg(windows)]
+    Pktmon,
+    Pcap,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CaptureSource {
+    Device(Option<PathBuf>),
+    File(PathBuf),
+}
+
+#[cfg(windows)]
+pub const DEFAULT_CAPTURE_BACKEND_TYPE: BackendType = BackendType::Pktmon;
+#[cfg(not(windows))]
+pub const DEFAULT_CAPTURE_BACKEND_TYPE: BackendType = BackendType::Pcap;
+
+pub fn create_capture(
+    backend: BackendType,
+    capture_source: CaptureSource,
+) -> Result<Box<dyn CaptureBackend>> {
+    match backend {
+        #[cfg(windows)]
+        BackendType::Pktmon => match capture_source {
+            CaptureSource::Device(None) => Ok(Box::new(pktmon_backend::PktmonBackend::new()?)),
+            _ => Err(CaptureError::Capture {
+                has_captured: false,
+                error: anyhow::anyhow!("Savefiles are only supported for the pcap backend"),
+            }),
+        },
+
+        #[cfg(feature = "pcap")]
+        BackendType::Pcap => Ok(Box::new(pcap_backend::PcapBackend::new(capture_source)?)),
+        #[cfg(not(feature = "pcap"))]
+        BackendType::Pcap => Err(CaptureError::Capture {
             has_captured: false,
-            error: e.into(),
-        })?;
+            error: anyhow::anyhow!(
+                "Please enable the pcap feature during build to use the pcap backend",
+            ),
+        }),
 
-        let filter = PktMonFilter {
-            name: "UDP Filter".to_string(),
-            transport_protocol: Some(TransportProtocol::UDP),
-            port: PORT_RANGE.0.into(),
-            ..PktMonFilter::default()
-        };
-
-        capture
-            .add_filter(filter)
-            .map_err(|e| CaptureError::Filter(e.into()))?;
-
-        let filter = PktMonFilter {
-            name: "UDP Filter".to_string(),
-            transport_protocol: Some(TransportProtocol::UDP),
-            port: PORT_RANGE.1.into(),
-            ..PktMonFilter::default()
-        };
-
-        capture
-            .add_filter(filter)
-            .map_err(|e| CaptureError::Filter(e.into()))?;
-
-        Ok(Self {
-            stream: Box::new(capture.stream().unwrap().boxed().fuse()),
-        })
-    }
-
-    pub async fn next_packet(&mut self) -> Result<Vec<u8>> {
-        futures::select! {
-            packet = self.stream.select_next_some() => {
-                Ok(packet.payload.to_vec().clone())
-            },
-            complete => Err(CaptureError::CaptureClosed),
-        }
+        #[allow(unreachable_patterns)]
+        _ => Err(CaptureError::Capture {
+            has_captured: false,
+            error: anyhow::anyhow!(
+                "Capture backend type {:?} not supported on this operating system",
+                backend
+            ),
+        }),
     }
 }

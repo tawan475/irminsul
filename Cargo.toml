@@ -22,6 +22,7 @@ tokio = { version = "1.47.1", features = [
 ] }
 
 anyhow = "1.0.99"
+async-trait = "0.1.89"
 async-watcher = "0.3.0"
 auto-artifactarium = { git = "https://github.com/tawan475/auto-artifactarium", rev = "38eb3bc68b94d6b8ba26598144e926ea9dc39a18" }
 base64 = "0.22.1"
@@ -58,9 +59,10 @@ tokio-util = "0.7.16"
 tracing = { version = "0.1.41" }
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
-tray-icon = "0.24.1"
+tray-icon = { version = "0.24.1", default-features = false, features = [ "gtk" ] }
 image = "0.25.9"
 single-instance = "0.3.3"
+pcap = { version = "2.3.0", features = ["capture-stream"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 pktmon = { version = "0.6.2", features = ["tokio"] }
@@ -70,6 +72,13 @@ windows = { version = "0.61.3", features = [
 	"Win32_UI_Shell",
 	"Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+caps = "0.5.6"
+gtk = "0.18.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.177"
 
 [build-dependencies]
 # Keep these in sync with dependencies above
@@ -83,6 +92,11 @@ tokio = { version = "1.47.1", features = [
 ] }
 
 winresource = "0.1.23"
+
+[features]
+default = ["pcap"]
+pcap = ["dep:pcap"]
+static-libpcap = ["pcap"]
 
 [profile.release]
 opt-level = 2 # fast and small wasm

@@ -18,26 +18,52 @@ jobs:
           - os: windows-latest
             artifact_name: ${{ github.event.repository.name }}.exe
             suffix: ".exe"
+            features: "pcap"
+          - os: ubuntu-22.04
+            artifact_name: ${{ github.event.repository.name }}
+            suffix: ""
+            features: "pcap,static-libpcap"
+          - os: macos-latest
+            artifact_name: ${{ github.event.repository.name }}
+            suffix: ""
+            features: "pcap"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Setup Linux
+        if: runner.os == 'Linux'
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          echo "set man-db/auto-update false" | sudo debconf-communicate
+          sudo dpkg-reconfigure -f noninteractive man-db
+          sudo sed -Ei 's/^# deb-src /deb-src /' /etc/apt/sources.list
+          sudo apt-get update && sudo apt-get build-dep -y libpcap0.8 && sudo apt-get install -y libgtk-3-dev libappindicator3-dev libatk1.0-dev
+          cd /tmp
+          [ ! -f libpcap-1.10.5.tar.gz ] && wget https://www.tcpdump.org/release/libpcap-1.10.5.tar.gz
+          echo "37ced90a19a302a7f32e458224a00c365c117905c2cd35ac544b6880a81488f0  libpcap-1.10.5.tar.gz" | sha256sum -c
+          tar xzf libpcap-1.10.5.tar.gz && cd libpcap-1.10.5
+          ./configure --prefix=/usr --libdir=/usr/lib/x86_64-linux-gnu --disable-dbus
+          make && sudo make install && sudo ldconfig
+      - name: Setup Windows
+        if: runner.os == 'Windows'
+        run: |
+          curl https://npcap.com/dist/npcap-sdk-1.15.zip -o sdk.zip
+          unzip sdk.zip
       - run: rustup component add clippy
-      - run: cargo check --release
       - run: cargo fmt --check
-      - run: cargo test --release
-      - run: cargo clippy --release -- -Dwarnings
-      - run: cargo build --release
+      - run: cargo clippy --release --no-default-features --features "${{ matrix.features }}" -- -Dwarnings
+        env:
+          LIB: ${{ github.workspace }}/Lib/x64/
+      - run: cargo test --release --no-default-features --features "${{ matrix.features }}"
+        env:
+          LIB: ${{ github.workspace }}/Lib/x64/
+      - run: cargo build --release --no-default-features --features "${{ matrix.features }}"
+        env:
+          LIB: ${{ github.workspace }}/Lib/x64/
       - if: ${{matrix.artifact_name}}
         name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
+          name: ${{ matrix.artifact_name }}-${{ runner.os }}
           path: target/release/irminsul${{ matrix.suffix }}

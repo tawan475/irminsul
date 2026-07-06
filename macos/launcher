@@ -1,0 +1,8 @@
+#!/bin/bash
+DIR="$(cd "$(dirname "$0")" && pwd)"
+if ! [ -r /dev/bpf0 ]; then
+  osascript -e 'display dialog "Irminsul uses packet capture to read Genshin network traffic\n\nThis requires a one-time admin prompt to grant access to /dev/bpf" buttons {"Cancel", "Grant Access"} default button "Grant Access" with title "Irminsul" with icon caution' \
+    -e 'do shell script "chmod 644 /dev/bpf*" with administrator privileges' \
+    || exit 0
+fi
+"$DIR/irminsul" --no-admin

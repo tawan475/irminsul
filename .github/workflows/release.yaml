@@ -11,63 +11,119 @@ env:
   TRACKER_API_URL: ${{ vars.TRACKER_API_URL }}
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
+  prepare:
+    runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      version: ${{ inputs.nextVersion }}
     steps:
       - uses: actions/checkout@v4
-      - name: Cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - run: cargo install toml-cli
-
       - name: Update Cargo.toml with new version
-        # piping the output of toml-cli directly into the file will cause the file to be deleted before being read
-        # by toml-cli. excuse this workaround.
         run: |
           toml set Cargo.toml package.version ${{inputs.nextVersion}} > Cargo.toml.new
           rm Cargo.toml
           mv Cargo.toml.new Cargo.toml
           cargo generate-lockfile
-      - run: cargo build --release
-      - name: Push updated version
+      - name: Push updated version and tag
         run: |
           git config user.name "irminsul bot"
           git config user.email "irminsul.bot@users.noreply.github.com"
           git add Cargo.toml
           git add Cargo.lock
           git commit -m "[skip ci] bump version to ${{inputs.nextVersion}}"
+          git tag v${{inputs.nextVersion}}
           git push origin main
+          git push origin --tags
+
+  build:
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows
+            binary: irminsul.exe
+            features: "pcap"
+          - os: ubuntu-22.04
+            name: linux-x86_64
+            binary: irminsul
+            features: "pcap,static-libpcap"
+          - os: macos-latest
+            name: macos-arm64
+            binary: irminsul
+            features: "pcap"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.prepare.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Setup Linux
+        if: runner.os == 'Linux'
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          echo "set man-db/auto-update false" | sudo debconf-communicate
+          sudo dpkg-reconfigure -f noninteractive man-db
+          sudo sed -Ei 's/^# deb-src /deb-src /' /etc/apt/sources.list
+          sudo apt-get update && sudo apt-get build-dep -y libpcap0.8 && sudo apt-get install -y libgtk-3-dev libappindicator3-dev libatk1.0-dev
+          cd /tmp
+          [ ! -f libpcap-1.10.5.tar.gz ] && wget https://www.tcpdump.org/release/libpcap-1.10.5.tar.gz
+          echo "37ced90a19a302a7f32e458224a00c365c117905c2cd35ac544b6880a81488f0  libpcap-1.10.5.tar.gz" | sha256sum -c
+          tar xzf libpcap-1.10.5.tar.gz && cd libpcap-1.10.5
+          ./configure --prefix=/usr --libdir=/usr/lib/x86_64-linux-gnu --disable-dbus
+          make && sudo make install && sudo ldconfig
+      - name: Setup Windows
+        if: runner.os == 'Windows'
+        run: |
+          curl https://npcap.com/dist/npcap-sdk-1.15.zip -o sdk.zip
+          unzip sdk.zip
+      - run: cargo build --release --no-default-features --features "${{ matrix.features }}"
+        env:
+          LIB: ${{ github.workspace }}/Lib/x64/
+      - name: Package
+        shell: bash
+        run: |
+          cd target/release
+          strip ${{ matrix.binary }} 2>/dev/null || true
+          chmod +x ${{ matrix.binary }} 2>/dev/null || true
+          tar -czf irminsul-${{ matrix.name }}.tar.gz ${{ matrix.binary }}
+      - name: Package macOS app
+        if: runner.os == 'macOS'
+        run: |
+          version=${{ needs.prepare.outputs.version }}
+          mkdir -p Irminsul.app/Contents/{MacOS,Resources}
+          sed "s/APPVERSION/$version/g" macos/Info.plist > Irminsul.app/Contents/Info.plist
+          cp macos/AppIcon.icns Irminsul.app/Contents/Resources/
+          cp macos/launcher Irminsul.app/Contents/MacOS/
+          cp target/release/irminsul Irminsul.app/Contents/MacOS/
+          chmod +x Irminsul.app/Contents/MacOS/{launcher,irminsul}
+          tar -czf target/release/Irminsul-${{ matrix.name }}.app.tar.gz Irminsul.app
       - uses: actions/upload-artifact@v4
         with:
-          name: irminsul
-          path: target/release/irminsul.exe
+          name: irminsul-${{ matrix.name }}
+          path: target/release/irminsul-${{ matrix.name }}.tar.gz
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'macOS'
+        with:
+          name: Irminsul-${{ matrix.name }}-app
+          path: target/release/Irminsul-${{ matrix.name }}.app.tar.gz
 
   create-release:
     runs-on: ubuntu-latest
-    needs: [build-windows]
+    needs: [prepare, build]
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Download release artifact
+      - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
-          name: irminsul
-          path: ./
-      - name: Create and push version tag
-        run: |
-          git tag v${{inputs.nextVersion}}
-          git push origin --tags
+          path: artifacts
       - name: Create release
         uses: ncipollo/release-action@v1
         with:
-          tag: v${{inputs.nextVersion}}
-          name: "v${{inputs.nextVersion}}"
-          artifacts: "irminsul.exe"
+          tag: v${{ needs.prepare.outputs.version }}
+          name: "v${{ needs.prepare.outputs.version }}"
+          artifacts: "artifacts/*/*"

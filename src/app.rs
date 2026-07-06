@@ -2,8 +2,9 @@ use std::fmt::Display;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+#[cfg(target_os = "windows")]
 use std::process::Command;
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use anyhow::{Context as _, Result, anyhow};
@@ -16,12 +17,16 @@ use egui_file_dialog::FileDialog;
 use egui_notify::Toasts;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio_util::sync::CancellationToken;
+
+use crate::capture;
 
 type AsyncRuntimeHandles = (
     mpsc::UnboundedSender<Message>,
     watch::Receiver<AppState>,
     watch::Receiver<Option<String>>,
     mpsc::UnboundedReceiver<(String, bool)>,
+    JoinHandle<()>,
 );
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -109,6 +114,9 @@ pub struct IrminsulApp {
     saved_state_tx: watch::Sender<SavedAppState>,
     tracing_reload_handle: ReloadHandle,
     toast_rx: mpsc::UnboundedReceiver<(String, bool)>,
+
+    monitor_handle: Option<JoinHandle<()>>,
+    monitor_cancel_token: CancellationToken,
 
     toasts: Toasts,
 
@@ -206,9 +214,12 @@ fn set_launch_on_startup(_enabled: bool) -> Result<()> {
 }
 
 fn start_async_runtime(
+    cancel_token: CancellationToken,
     egui_ctx: Context,
     log_packets_rx: watch::Receiver<bool>,
     saved_state_rx: watch::Receiver<SavedAppState>,
+    capture_backend: capture::BackendType,
+    capture_source: capture::CaptureSource,
 ) -> AsyncRuntimeHandles {
     tracing::info!("starting tokio async");
     let (ui_message_tx, mut ui_message_rx) = mpsc::unbounded_channel::<Message>();
@@ -218,7 +229,7 @@ fn start_async_runtime(
     let (wish_url_tx, wish_url_rx) = watch::channel(None);
     let mut updater_state_rx = state_rx.clone();
     let updater_ctx = egui_ctx.clone();
-    thread::spawn(|| {
+    let monitor_handle = thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
 
         rt.block_on(async {
@@ -250,9 +261,12 @@ fn start_async_runtime(
             });
             tracing::info!("Starting monitor");
             let monitor = match Monitor::new(
+                cancel_token,
                 state_tx,
                 ui_message_rx,
                 log_packets_rx,
+                capture_backend,
+                capture_source,
                 saved_state_rx,
                 toast_tx,
                 monitor_ctx,
@@ -269,11 +283,22 @@ fn start_async_runtime(
         });
     });
     tracing::info!("started tokio");
-    (ui_message_tx, state_rx, wish_url_rx, toast_rx)
+    (
+        ui_message_tx,
+        state_rx,
+        wish_url_rx,
+        toast_rx,
+        monitor_handle,
+    )
 }
 
 impl IrminsulApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, mut tracing_reload_handle: ReloadHandle) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        mut tracing_reload_handle: ReloadHandle,
+        capture_backend: capture::BackendType,
+        capture_source: capture::CaptureSource,
+    ) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         egui_material_icons::initialize(&cc.egui_ctx);
 
@@ -285,12 +310,19 @@ impl IrminsulApp {
 
         tracing::info!("Tracker API URL: {}", saved_state.tracker_api_url);
 
+        let cancel_token = CancellationToken::new();
         tracing_reload_handle.set_filter(saved_state.tracing_level.get_filter());
         let (log_packets_tx, log_packets_rx) = watch::channel(saved_state.log_raw_packets);
         let (saved_state_tx, saved_state_rx) = watch::channel(saved_state.clone());
 
-        let (ui_message_tx, state_rx, wish_url_rx, toast_rx) =
-            start_async_runtime(cc.egui_ctx.clone(), log_packets_rx, saved_state_rx);
+        let (ui_message_tx, state_rx, wish_url_rx, toast_rx, monitor_handle) = start_async_runtime(
+            cancel_token.clone(),
+            cc.egui_ctx.clone(),
+            log_packets_rx,
+            saved_state_rx,
+            capture_backend,
+            capture_source,
+        );
 
         if let Err(e) = ui_message_tx.send(Message::StartCapture) {
             tracing::error!("Failed to send auto start message: {e}");
@@ -312,6 +344,7 @@ impl IrminsulApp {
             None
         };
 
+        #[allow(unused_mut)]
         let mut tray_icon = None;
 
         if let Ok(icon_data) = image::load_from_memory(include_bytes!("../assets/icon-256.png")) {
@@ -325,12 +358,28 @@ impl IrminsulApp {
                 let quit_id = quit_i.id().clone();
                 let _ = tray_menu.append_items(&[&restore_i, &quit_i]);
 
-                tray_icon = TrayIconBuilder::new()
-                    .with_tooltip("Irminsul")
-                    .with_icon(icon)
-                    .with_menu(Box::new(tray_menu))
-                    .build()
-                    .ok();
+                #[cfg(target_os = "linux")]
+                std::thread::spawn(|| {
+                    gtk::init().unwrap();
+                    let _tray_icon = TrayIconBuilder::new()
+                        .with_tooltip("Irminsul")
+                        .with_icon(icon)
+                        .with_menu(Box::new(Menu::new()))
+                        .build()
+                        .ok();
+
+                    gtk::main();
+                });
+
+                #[cfg(not(target_os = "linux"))]
+                {
+                    tray_icon = TrayIconBuilder::new()
+                        .with_tooltip("Irminsul")
+                        .with_icon(icon)
+                        .with_menu(Box::new(tray_menu))
+                        .build()
+                        .ok();
+                }
 
                 let ctx_clone1 = cc.egui_ctx.clone();
                 TrayIconEvent::set_event_handler(Some(move |event| {
@@ -400,6 +449,17 @@ impl IrminsulApp {
             minimize_modal_open: false,
             minimize_modal_remember: true,
             app_settings_open: false,
+            monitor_cancel_token: cancel_token,
+            monitor_handle: Some(monitor_handle),
+        }
+    }
+}
+
+impl Drop for IrminsulApp {
+    fn drop(&mut self) {
+        self.monitor_cancel_token.cancel();
+        if let Some(handle) = self.monitor_handle.take() {
+            let _ = handle.join();
         }
     }
 }

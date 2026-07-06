@@ -13,9 +13,10 @@ use base64::prelude::*;
 use chrono::prelude::*;
 use flate2::read::GzDecoder;
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::capture::PacketCapture;
+use crate::capture::{self, BackendType, CaptureSource, create_capture};
 use crate::player_data::PlayerData;
 use crate::{APP_ID, AppState, DataUpdated, Message, State};
 
@@ -54,9 +55,13 @@ pub struct Monitor {
     log_packet_rx: watch::Receiver<bool>,
     player_data: PlayerData,
     sniffer: GameSniffer,
+    cancel_token: CancellationToken,
     capture_cancel_token: Option<CancellationToken>,
+    capture_handle: Option<JoinHandle<Result<()>>>,
     packet_tx: mpsc::UnboundedSender<Result<Vec<u8>>>,
     packet_rx: mpsc::UnboundedReceiver<Result<Vec<u8>>>,
+    capture_backend: BackendType,
+    capture_source: CaptureSource,
     saved_state_rx: watch::Receiver<crate::app::SavedAppState>,
     toast_tx: mpsc::UnboundedSender<(String, bool)>,
 
@@ -68,10 +73,14 @@ pub struct Monitor {
 }
 
 impl Monitor {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
+        cancel_token: CancellationToken,
         state_tx: watch::Sender<AppState>,
         mut ui_message_rx: mpsc::UnboundedReceiver<Message>,
         log_packet_rx: watch::Receiver<bool>,
+        capture_backend: BackendType,
+        capture_source: CaptureSource,
         saved_state_rx: watch::Receiver<crate::app::SavedAppState>,
         toast_tx: mpsc::UnboundedSender<(String, bool)>,
         ctx: egui::Context,
@@ -89,9 +98,13 @@ impl Monitor {
             ui_message_rx,
             log_packet_rx,
             sniffer,
+            cancel_token,
             capture_cancel_token: None,
+            capture_handle: None,
             packet_tx,
             packet_rx,
+            capture_backend,
+            capture_source,
             saved_state_rx,
             toast_tx,
             automation_pending_since: None,
@@ -119,6 +132,9 @@ impl Monitor {
 
             #[rustfmt::skip]
                 tokio::select! {
+                    _ = self.cancel_token.cancelled() => {
+                        break;
+                    }
                     _ = sleep_fut => {
                         self.execute_automation_export().await;
                     }
@@ -149,17 +165,21 @@ impl Monitor {
 
                 // Spawn capture task.
                 let cancel_token = CancellationToken::new();
-                tokio::spawn(capture_task(cancel_token.clone(), self.packet_tx.clone()));
+                let capture_handle = tokio::spawn(capture_task(
+                    cancel_token.clone(),
+                    self.packet_tx.clone(),
+                    self.capture_backend,
+                    self.capture_source.clone(),
+                ));
                 self.capture_cancel_token = Some(cancel_token);
+                self.capture_handle = Some(capture_handle);
                 self.automation_cycle_started_at = Some(Instant::now());
                 self.app_state.update_capturing_state(true);
             }
             Message::StopCapture => {
-                let Some(cancel_token) = self.capture_cancel_token.take() else {
-                    tracing::warn!("Capture stop request with no current cancel token");
-                    return;
-                };
-                cancel_token.cancel();
+                if let Some(cancel_token) = self.capture_cancel_token.take() {
+                    cancel_token.cancel();
+                }
                 self.app_state.update_capturing_state(false);
             }
             Message::ClearData => {
@@ -461,8 +481,14 @@ impl Monitor {
             cancel_token.cancel();
         }
         let cancel_token = CancellationToken::new();
-        tokio::spawn(capture_task(cancel_token.clone(), self.packet_tx.clone()));
+        let capture_handle = tokio::spawn(capture_task(
+            cancel_token.clone(),
+            self.packet_tx.clone(),
+            self.capture_backend,
+            self.capture_source.clone(),
+        ));
         self.capture_cancel_token = Some(cancel_token);
+        self.capture_handle = Some(capture_handle);
         self.app_state.update_capturing_state(true);
         self.ctx.request_repaint();
     }
@@ -566,35 +592,20 @@ async fn get_database(
 async fn capture_task(
     cancel_token: CancellationToken,
     packet_tx: mpsc::UnboundedSender<Result<Vec<u8>>>,
+    backend: BackendType,
+    capture_source: capture::CaptureSource,
 ) -> Result<()> {
-    let mut capture = match PacketCapture::new() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("Error creating packet capture, retrying... ({})", e);
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            if cancel_token.is_cancelled() {
-                return Ok(());
-            }
-            match PacketCapture::new() {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = packet_tx.send(Err(anyhow!("Error creating packet capture: {e}")));
-                    return Err(anyhow!("Error creating packet capture: {e}"));
-                }
-            }
-        }
-    };
+    let mut capture = create_capture(backend, capture_source)
+        .map_err(|e| anyhow!("Error creating packet capture using {:?}: {e}", backend))?;
     tracing::info!("starting capture");
 
     #[cfg(debug_assertions)]
-    let mut pcapng = eframe::storage_dir(crate::APP_ID)
-        .map(|mut p| {
-            p.push("log");
-            std::fs::create_dir_all(&p).ok()?;
-            p.push("latest.pcapng");
-            crate::pcapng::PcapngWriter::new(p).ok()
-        })
-        .flatten();
+    let mut pcapng = eframe::storage_dir(crate::APP_ID).and_then(|mut p| {
+        p.push("log");
+        std::fs::create_dir_all(&p).ok()?;
+        p.push("latest.pcapng");
+        crate::pcapng::PcapngWriter::new(p).ok()
+    });
     loop {
         let packet = tokio::select!(
             packet = capture.next_packet() => packet,

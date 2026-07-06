@@ -75,3 +75,91 @@ pub fn ensure_admin() {
     // Exit the current process since we launched a new elevated one
     std::process::exit(0);
 }
+
+#[cfg(unix)]
+pub fn ensure_admin() {
+    // Running as root is always sufficient
+    let is_root = unsafe { libc::geteuid() } == 0;
+    if is_root {
+        return;
+    }
+
+    // On Linux, CAP_NET_RAW is sufficient
+    #[cfg(target_os = "linux")]
+    if caps::has_cap(None, caps::CapSet::Effective, caps::Capability::CAP_NET_RAW)
+        .is_ok_and(|has_net_raw| has_net_raw)
+    {
+        return;
+    }
+
+    // On macOS, /dev/bpf access is sufficient
+    #[cfg(target_os = "macos")]
+    if std::fs::File::open("/dev/bpf0").is_ok() {
+        return;
+    }
+
+    show_packet_capture_permissions_missing_dialog();
+}
+
+#[cfg(unix)]
+fn show_packet_capture_permissions_missing_dialog() {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([500.0, 200.0])
+            .with_resizable(true),
+        ..Default::default()
+    };
+
+    // Try to get the current executable path
+    let exe_path = std::env::current_exe()
+        .ok()
+        .map(|mut path| path.as_mut_os_string().to_string_lossy().to_string())
+        .unwrap_or("./irminsul".to_owned());
+
+    let _ = eframe::run_simple_native(
+        "Irminsul requires packet capture permissions",
+        options,
+        move |ctx, _frame| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.label("How to grant packet capture permissions:");
+                    ui.add_space(5.0);
+
+                    #[cfg(target_os = "linux")]
+                    {
+                        ui.label("1. Grant CAP_NET_RAW to Irminsul (after every update):");
+                        ui.label(format!(
+                            "sudo setcap cap_net_raw=ep '{}' && '{}'",
+                            exe_path, exe_path
+                        ));
+                    }
+
+                    #[cfg(target_os = "macos")]
+                    {
+                        ui.label("1. Grant read permissions on /dev/bpf* (after every reboot):");
+                        ui.label("sudo chmod 644 /dev/bpf*");
+                    }
+
+                    ui.add_space(5.0);
+                    ui.label("2. Run Irminsul as root (every time):");
+                    ui.label(format!("sudo '{}'", exe_path));
+                    ui.add_space(10.0);
+                    ui.label("Rerun Irminsul with --no-admin if you wish to proceed without packet capture")
+                });
+
+                // Push button to the bottom
+                ui.with_layout(
+                    egui::Layout::bottom_up(egui::Align::Center).with_cross_justify(true),
+                    |ui| {
+                        ui.add_space(10.0); // Small margin from bottom edge
+                        if ui.button("OK").clicked() {
+                            std::process::exit(1);
+                        }
+                    },
+                );
+            });
+        },
+    );
+
+    std::process::exit(1);
+}
