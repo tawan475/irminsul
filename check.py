@@ -39,11 +39,6 @@ def main():
 
     if args.all:
         print("\n🌍 Running cross-platform checks (Windows, macOS, Linux)...")
-        targets = [
-            ("x86_64-pc-windows-gnu", ["--features", "pcap"], "x86_64-w64-mingw32-gcc", "sudo apt-get install mingw-w64"),
-            ("x86_64-apple-darwin", ["--features", "pcap"], "x86_64-apple-darwin-cc", "osxcross toolchain"),
-            ("x86_64-unknown-linux-gnu", ["--features", "pcap,static-libpcap"], "gcc", "build-essential")
-        ]
         
         # Don't check the native target using cross-compilation logic
         native_target = ""
@@ -51,6 +46,12 @@ def main():
         elif platform.system() == "Linux": native_target = "x86_64-unknown-linux-gnu"
         elif platform.system() == "Darwin": native_target = "x86_64-apple-darwin"
 
+        targets = [
+            ("x86_64-pc-windows-gnu", ["--features", "pcap"], "x86_64-w64-mingw32-gcc", "sudo apt-get install mingw-w64"),
+            ("x86_64-apple-darwin", ["--features", "pcap"], "x86_64-apple-darwin-cc", "osxcross toolchain"),
+            ("x86_64-unknown-linux-gnu", ["--features", "pcap,static-libpcap"], "gcc" if native_target == "x86_64-unknown-linux-gnu" else "x86_64-linux-gnu-gcc", "gcc-x86-64-linux-gnu (or run within WSL)")
+        ]
+        
 
         for target, target_features, compiler, install_hint in targets:
             if target == native_target:
