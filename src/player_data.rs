@@ -141,11 +141,7 @@ impl PlayerData {
                 continue;
             }
 
-            if item.has_material() {
-                self.items.insert(item.guid, item.clone());
-            } else if item.has_equip() {
-                self.items.insert(item.guid, item.clone());
-            } else if item.has_furniture() {
+            if item.has_material() || item.has_equip() || item.has_furniture() {
                 self.items.insert(item.guid, item.clone());
             }
         }

@@ -2,11 +2,13 @@ use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 
+#[cfg(debug_assertions)]
 pub struct PcapngWriter {
     file: File,
     packet_count: u32,
 }
 
+#[cfg(debug_assertions)]
 impl PcapngWriter {
     pub fn new(path: PathBuf) -> std::io::Result<Self> {
         let file = File::create(path)?;

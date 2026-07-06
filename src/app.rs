@@ -16,6 +16,13 @@ use egui_file_dialog::FileDialog;
 use egui_notify::Toasts;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
+
+type AsyncRuntimeHandles = (
+    mpsc::UnboundedSender<Message>,
+    watch::Receiver<AppState>,
+    watch::Receiver<Option<String>>,
+    mpsc::UnboundedReceiver<(String, bool)>,
+);
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
@@ -202,12 +209,7 @@ fn start_async_runtime(
     egui_ctx: Context,
     log_packets_rx: watch::Receiver<bool>,
     saved_state_rx: watch::Receiver<SavedAppState>,
-) -> (
-    mpsc::UnboundedSender<Message>,
-    watch::Receiver<AppState>,
-    watch::Receiver<Option<String>>,
-    mpsc::UnboundedReceiver<(String, bool)>,
-) {
+) -> AsyncRuntimeHandles {
     tracing::info!("starting tokio async");
     let (ui_message_tx, mut ui_message_rx) = mpsc::unbounded_channel::<Message>();
     let (toast_tx, toast_rx) = mpsc::unbounded_channel::<(String, bool)>();
@@ -1665,10 +1667,11 @@ fn show_window() {
 
     unsafe {
         let hwnd = FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr()));
-        if hwnd.is_ok() && !hwnd.clone().unwrap().0.is_null() {
-            let hwnd = hwnd.unwrap();
-            let _ = ShowWindow(hwnd, SW_RESTORE);
-            let _ = SetForegroundWindow(hwnd);
+        if let Ok(hwnd) = hwnd {
+            if !hwnd.0.is_null() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+                let _ = SetForegroundWindow(hwnd);
+            }
         }
     }
 }
@@ -1687,13 +1690,15 @@ fn close_window() {
 
     unsafe {
         let hwnd = FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr()));
-        if hwnd.is_ok() && !hwnd.clone().unwrap().0.is_null() {
-            let _ = PostMessageW(
-                Some(hwnd.unwrap()),
-                WM_CLOSE,
-                windows::Win32::Foundation::WPARAM(0),
-                windows::Win32::Foundation::LPARAM(0),
-            );
+        if let Ok(hwnd) = hwnd {
+            if !hwnd.0.is_null() {
+                let _ = PostMessageW(
+                    Some(hwnd),
+                    WM_CLOSE,
+                    windows::Win32::Foundation::WPARAM(0),
+                    windows::Win32::Foundation::LPARAM(0),
+                );
+            }
         }
     }
 }
