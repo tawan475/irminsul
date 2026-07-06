@@ -11,55 +11,41 @@ env:
   TRACKER_API_URL: ${{ vars.TRACKER_API_URL }}
 
 jobs:
-  prepare:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    outputs:
-      version: ${{ inputs.nextVersion }}
-    steps:
-      - uses: actions/checkout@v4
-      - run: cargo install toml-cli
-      - name: Update Cargo.toml with new version
-        run: |
-          toml set Cargo.toml package.version ${{inputs.nextVersion}} > Cargo.toml.new
-          rm Cargo.toml
-          mv Cargo.toml.new Cargo.toml
-          cargo generate-lockfile
-      - name: Push updated version and tag
-        run: |
-          git config user.name "irminsul bot"
-          git config user.email "irminsul.bot@users.noreply.github.com"
-          git add Cargo.toml
-          git add Cargo.lock
-          git commit -m "[skip ci] bump version to ${{inputs.nextVersion}}"
-          git tag v${{inputs.nextVersion}}
-          git push origin main
-          git push origin --tags
-
   build:
-    needs: prepare
     strategy:
       matrix:
         include:
           - os: windows-latest
             name: windows
             binary: irminsul.exe
+            features: ""
+            out_file: irminsul-windows.exe
+          - os: windows-latest
+            name: windows-pcap
+            binary: irminsul.exe
             features: "pcap"
+            out_file: irminsul-windows-pcap.exe
           - os: ubuntu-22.04
             name: linux-x86_64
             binary: irminsul
             features: "pcap,static-libpcap"
+            out_file: irminsul-linux-x86_64.tar.gz
           - os: macos-latest
             name: macos-arm64
             binary: irminsul
             features: "pcap"
+            out_file: Irminsul-macos-arm64.app.tar.gz
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: v${{ needs.prepare.outputs.version }}
       - uses: Swatinem/rust-cache@v2
+      - run: cargo install toml-cli
+      - name: Update Cargo.toml version locally
+        run: |
+          toml set Cargo.toml package.version ${{inputs.nextVersion}} > Cargo.toml.new
+          rm Cargo.toml
+          mv Cargo.toml.new Cargo.toml
+          cargo generate-lockfile
       - name: Setup Linux
         if: runner.os == 'Linux'
         run: |
@@ -74,49 +60,65 @@ jobs:
           tar xzf libpcap-1.10.5.tar.gz && cd libpcap-1.10.5
           ./configure --prefix=/usr --libdir=/usr/lib/x86_64-linux-gnu --disable-dbus
           make && sudo make install && sudo ldconfig
-      - name: Setup Windows
-        if: runner.os == 'Windows'
+      - name: Setup Windows (for pcap builds)
+        if: runner.os == 'Windows' && matrix.features == 'pcap'
         run: |
           curl https://npcap.com/dist/npcap-sdk-1.15.zip -o sdk.zip
           unzip sdk.zip
       - run: cargo build --release --no-default-features --features "${{ matrix.features }}"
         env:
           LIB: ${{ github.workspace }}/Lib/x64/
-      - name: Package
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cd target/release
+          mv ${{ matrix.binary }} ${{ matrix.out_file }}
+      - name: Package Linux
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           cd target/release
           strip ${{ matrix.binary }} 2>/dev/null || true
           chmod +x ${{ matrix.binary }} 2>/dev/null || true
-          tar -czf irminsul-${{ matrix.name }}.tar.gz ${{ matrix.binary }}
+          tar -czf ${{ matrix.out_file }} ${{ matrix.binary }}
       - name: Package macOS app
         if: runner.os == 'macOS'
         run: |
-          version=${{ needs.prepare.outputs.version }}
+          version=${{ inputs.nextVersion }}
           mkdir -p Irminsul.app/Contents/{MacOS,Resources}
           sed "s/APPVERSION/$version/g" macos/Info.plist > Irminsul.app/Contents/Info.plist
           cp macos/AppIcon.icns Irminsul.app/Contents/Resources/
           cp macos/launcher Irminsul.app/Contents/MacOS/
           cp target/release/irminsul Irminsul.app/Contents/MacOS/
           chmod +x Irminsul.app/Contents/MacOS/{launcher,irminsul}
-          tar -czf target/release/Irminsul-${{ matrix.name }}.app.tar.gz Irminsul.app
+          tar -czf target/release/${{ matrix.out_file }} Irminsul.app
       - uses: actions/upload-artifact@v4
         with:
           name: irminsul-${{ matrix.name }}
-          path: target/release/irminsul-${{ matrix.name }}.tar.gz
-      - uses: actions/upload-artifact@v4
-        if: runner.os == 'macOS'
-        with:
-          name: Irminsul-${{ matrix.name }}-app
-          path: target/release/Irminsul-${{ matrix.name }}.app.tar.gz
+          path: target/release/${{ matrix.out_file }}
 
   create-release:
     runs-on: ubuntu-latest
-    needs: [prepare, build]
+    needs: [build]
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      - run: cargo install toml-cli
+      - name: Update version, commit, and tag
+        run: |
+          toml set Cargo.toml package.version ${{inputs.nextVersion}} > Cargo.toml.new
+          rm Cargo.toml
+          mv Cargo.toml.new Cargo.toml
+          cargo generate-lockfile
+          git config user.name "irminsul bot"
+          git config user.email "irminsul.bot@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "[skip ci] bump version to ${{inputs.nextVersion}}"
+          git tag v${{inputs.nextVersion}}
+          git push origin main
+          git push origin --tags
       - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
@@ -124,6 +126,6 @@ jobs:
       - name: Create release
         uses: ncipollo/release-action@v1
         with:
-          tag: v${{ needs.prepare.outputs.version }}
-          name: "v${{ needs.prepare.outputs.version }}"
+          tag: v${{ inputs.nextVersion }}
+          name: "v${{ inputs.nextVersion }}"
           artifacts: "artifacts/*/*"
