@@ -1,5 +1,8 @@
+#[cfg(debug_assertions)]
 use std::fs::File;
+#[cfg(debug_assertions)]
 use std::io::Write;
+#[cfg(debug_assertions)]
 use std::path::PathBuf;
 
 #[cfg(debug_assertions)]

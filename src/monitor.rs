@@ -164,11 +164,8 @@ impl Monitor {
             }
             Message::ClearData => {
                 let mut new_updated = DataUpdated::new();
-                new_updated.achievements_updated_time = self
-                    .app_state
-                    .app_state
-                    .updated
-                    .achievements_updated_time;
+                new_updated.achievements_updated_time =
+                    self.app_state.app_state.updated.achievements_updated_time;
                 self.app_state.update_timestamps(new_updated);
                 self.ctx.request_repaint();
             }
