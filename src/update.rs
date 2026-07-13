@@ -86,7 +86,12 @@ fn asset_for_current_platform(release: &Release) -> Result<ReleaseAsset> {
         .iter()
         .find(|asset| asset.name == name)
         .cloned()
-        .ok_or_else(|| anyhow!("release {} does not contain asset '{name}'", release.version))
+        .ok_or_else(|| {
+            anyhow!(
+                "release {} does not contain asset '{name}'",
+                release.version
+            )
+        })
 }
 
 async fn download_new_version_and_replace_current(release: Release) -> Result<()> {
