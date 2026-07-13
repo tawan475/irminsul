@@ -4,7 +4,7 @@ use std::thread;
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
 use reqwest::header;
-use self_update::update::Release;
+use self_update::update::{Release, ReleaseAsset};
 use serde::Deserialize;
 use tokio::sync::{mpsc, watch};
 
@@ -44,8 +44,53 @@ pub fn check_for_new_version() -> Result<Option<Release>> {
     Ok(Some(release))
 }
 
+/// The release asset name that matches the binary currently running.
+///
+/// These must stay in sync with the `out_file` names produced by
+/// `.github/workflows/release.yaml`.
+const CURRENT_ASSET_NAME: Option<&str> = {
+    #[cfg(all(target_os = "windows", feature = "pcap"))]
+    {
+        Some("irminsul-windows-pcap.exe")
+    }
+    #[cfg(all(target_os = "windows", not(feature = "pcap")))]
+    {
+        Some("irminsul-windows.exe")
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        Some("irminsul-linux-x86_64.tar.gz")
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        Some("Irminsul-macos-arm64.app.tar.gz")
+    }
+    #[cfg(not(any(
+        target_os = "windows",
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64"),
+    )))]
+    {
+        None
+    }
+};
+
+/// Pick the release asset that matches the platform of the running binary so we
+/// don't, for example, download a Linux tarball onto a Windows machine.
+fn asset_for_current_platform(release: &Release) -> Result<ReleaseAsset> {
+    let name = CURRENT_ASSET_NAME
+        .ok_or_else(|| anyhow!("no prebuilt binary is available for this platform"))?;
+
+    release
+        .assets
+        .iter()
+        .find(|asset| asset.name == name)
+        .cloned()
+        .ok_or_else(|| anyhow!("release {} does not contain asset '{name}'", release.version))
+}
+
 async fn download_new_version_and_replace_current(release: Release) -> Result<()> {
-    let asset = release.asset_for("", None).unwrap();
+    let asset = asset_for_current_platform(&release)?;
     tracing::info!("asset: {asset:#?}");
 
     let tmp_dir = tempfile::Builder::new()

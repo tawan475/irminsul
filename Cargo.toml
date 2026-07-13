@@ -62,16 +62,22 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 tray-icon = { version = "0.24.1", default-features = false, features = [ "gtk" ] }
 image = "0.25.9"
 single-instance = "0.3.3"
-pcap = { version = "2.3.0", features = ["capture-stream"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 pktmon = { version = "0.6.2", features = ["tokio"] }
+# On Windows pcap is optional (needs the Npcap SDK); pktmon is the default backend.
+pcap = { version = "2.3.0", features = ["capture-stream"], optional = true }
 windows = { version = "0.61.3", features = [
 	"Win32_System_Console",
 	"Win32_System_Registry",
 	"Win32_UI_Shell",
 	"Win32_UI_WindowsAndMessaging",
 ] }
+
+# On every non-Windows platform pcap is the only capture backend, so it is a
+# mandatory dependency and always compiled in.
+[target.'cfg(not(windows))'.dependencies]
+pcap = { version = "2.3.0", features = ["capture-stream"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 caps = "0.5.6"
@@ -94,7 +100,11 @@ tokio = { version = "1.47.1", features = [
 winresource = "0.1.23"
 
 [features]
-default = ["pcap"]
+# `pcap` is intentionally NOT enabled by default: it requires the Npcap SDK
+# (wpcap.lib) to build and wpcap.dll at runtime on Windows. Windows uses the
+# pktmon backend by default, so enable `pcap` explicitly if you need it
+# (e.g. `cargo build --features pcap`).
+default = []
 pcap = ["dep:pcap"]
 static-libpcap = ["pcap"]
 

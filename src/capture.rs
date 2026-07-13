@@ -1,4 +1,4 @@
-#[cfg(feature = "pcap")]
+#[cfg(any(feature = "pcap", not(windows)))]
 mod pcap_backend;
 #[cfg(windows)]
 mod pktmon_backend;
@@ -81,9 +81,9 @@ pub fn create_capture(
             }),
         },
 
-        #[cfg(feature = "pcap")]
+        #[cfg(any(feature = "pcap", not(windows)))]
         BackendType::Pcap => Ok(Box::new(pcap_backend::PcapBackend::new(capture_source)?)),
-        #[cfg(not(feature = "pcap"))]
+        #[cfg(not(any(feature = "pcap", not(windows))))]
         BackendType::Pcap => Err(CaptureError::Capture {
             has_captured: false,
             error: anyhow::anyhow!(
