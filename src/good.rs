@@ -70,6 +70,9 @@ pub struct Good {
     pub timestamp: Option<u64>,
 }
 
+/// GOOD key for the Traveler before their element is appended.
+pub const TRAVELER_KEY: &str = "Traveler";
+
 pub fn to_good_key(value: &str) -> String {
     let mut result = String::new();
     let mut capitalize_next = true;

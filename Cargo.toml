@@ -12,7 +12,7 @@ targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
 
 [dependencies]
 # Keep these in sync with dev-dependencies below
-anime-game-data = { git = "https://github.com/konkers/anime-game-data", rev = "ddef20de96e6364fbb1bddb0c3265d2e4e67e426" }
+anime-game-data = { git = "https://github.com/konkers/anime-game-data", rev = "dfc03cdb5e27807a876b8d4dff17b3f67a320f5c" }
 flate2 = "1.1.9"
 tokio = { version = "1.47.1", features = [
 	"rt",
@@ -24,7 +24,7 @@ tokio = { version = "1.47.1", features = [
 anyhow = "1.0.99"
 async-trait = "0.1.89"
 async-watcher = "0.3.0"
-auto-artifactarium = { git = "https://github.com/tawan475/auto-artifactarium", rev = "38eb3bc68b94d6b8ba26598144e926ea9dc39a18" }
+auto-artifactarium = { git = "https://github.com/tawan475/auto-artifactarium", rev = "0c7a8f8f53722b9a8abf8f7371f3d0a883162ece" }
 base64 = "0.22.1"
 chrono = "0.4.42"
 clap = { version = "4.5.47", features = ["derive"] }
@@ -88,7 +88,7 @@ libc = "0.2.177"
 
 [build-dependencies]
 # Keep these in sync with dependencies above
-anime-game-data = { git = "https://github.com/konkers/anime-game-data", rev = "ddef20de96e6364fbb1bddb0c3265d2e4e67e426" }
+anime-game-data = { git = "https://github.com/konkers/anime-game-data", rev = "dfc03cdb5e27807a876b8d4dff17b3f67a320f5c" }
 flate2 = "1.1.9"
 tokio = { version = "1.47.1", features = [
 	"rt",
