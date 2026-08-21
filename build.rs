@@ -40,5 +40,10 @@ async fn main() -> io::Result<()> {
             )
             .compile()?;
     }
+
+    #[cfg(all(unix, feature = "static-libpcap"))]
+    {
+        println!("cargo:rustc-link-lib=static=pcap");
+    }
     Ok(())
 }
