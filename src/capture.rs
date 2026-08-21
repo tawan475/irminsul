@@ -44,6 +44,7 @@ impl Display for CaptureError {
 pub type Result<T> = std::result::Result<T, CaptureError>;
 
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait CaptureBackend: Send {
     async fn next_packet(&mut self) -> Result<Vec<u8>>;
 }

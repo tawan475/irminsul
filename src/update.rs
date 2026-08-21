@@ -26,7 +26,10 @@ pub fn check_for_new_version() -> Result<Option<Release>> {
         .context("error fetching releases")?;
 
     // Assume the first release is the latest.
-    let release = releases[0].clone();
+    let Some(release) = releases.first().cloned() else {
+        tracing::info!("No releases found, continuing with app startup");
+        return Ok(None);
+    };
     if release.version == self_update::cargo_crate_version!() {
         tracing::info!(
             "{} is current, continuing with app startup",
