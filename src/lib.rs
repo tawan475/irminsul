@@ -98,8 +98,8 @@ pub enum ConnectionPacket {
 
 #[repr(u16)]
 enum CommandId {
-    AvatarDataNotify = 22826,
-    PlayerStoreNotify = 25494,
+    AvatarDataNotify = 6586,
+    PlayerStoreNotify = 8132,
     PlayerPropertyNotify = 2643,
 }
 
@@ -440,12 +440,19 @@ pub fn matches_item_packet(game_command: &GameCommand) -> Option<Vec<r#gen::prot
     
     let mut has_items = false;
     let mut has_store_type = false;
+    let mut fields_found: Vec<u32> = Vec::new();
     for (fnum, fdata) in d_msg.unknown_fields().iter() {
+        fields_found.push(fnum);
         match fnum {
-            2 => if let LengthDelimited(_) = fdata { has_items = true; },
-            1 => if let Varint(_) = fdata { has_store_type = true; },
+            5 => if let LengthDelimited(_) = fdata { has_items = true; },
+            1 | 3 => if let Varint(_) = fdata { has_store_type = true; },
             _ => {}
         }
+    }
+    
+    // Log candidate packets that have field 5 but not both conditions
+    if has_items && !has_store_type {
+        tracing::info!("Candidate item packet (missing store_type): cmd={}, fields={:?}", game_command.command_id, fields_found);
     }
     
     if !has_items || !has_store_type {
@@ -454,8 +461,7 @@ pub fn matches_item_packet(game_command: &GameCommand) -> Option<Vec<r#gen::prot
 
     let items = matches_items_all_data_notify(&game_command.proto_data)?;
     
-    #[cfg(debug_assertions)]
-    tracing::info!("Discovered PlayerStoreNotify! Command ID is: {}", game_command.command_id);
+    tracing::info!("Discovered PlayerStoreNotify! Command ID is: {}, items: {}", game_command.command_id, items.len());
     
     Some(items)
 }
@@ -470,7 +476,7 @@ pub fn matches_avatar_packet(game_command: &GameCommand) -> Option<Vec<r#gen::pr
     
     let mut has_avatars = false;
     for (fnum, fdata) in d_msg.unknown_fields().iter() {
-        if fnum == 14 {
+        if fnum == 6 {
             if let LengthDelimited(_) = fdata { has_avatars = true; }
         }
     }
