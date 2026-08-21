@@ -431,60 +431,19 @@ pub fn matches_achievement_packet(game_command: &GameCommand) -> Option<Vec<Achi
 }
 
 pub fn matches_item_packet(game_command: &GameCommand) -> Option<Vec<r#gen::protos::Item>> {
-    use protobuf::Message;
-    use protobuf::UnknownValueRef::*;
-
-    let Ok(d_msg) = crate::r#gen::protos::Unk::parse_from_bytes(&game_command.proto_data) else {
-        return None;
-    };
-    
-    let mut has_items = false;
-    let mut has_store_type = false;
-    for (fnum, fdata) in d_msg.unknown_fields().iter() {
-        match fnum {
-            2 => if let LengthDelimited(_) = fdata { has_items = true; },
-            1 => if let Varint(_) = fdata { has_store_type = true; },
-            _ => {}
-        }
-    }
-    
-    if !has_items || !has_store_type {
+    if !game_command.is_player_store_notify() {
         return None;
     }
 
-    let items = matches_items_all_data_notify(&game_command.proto_data)?;
-    
-    #[cfg(debug_assertions)]
-    tracing::info!("Discovered PlayerStoreNotify! Command ID is: {}", game_command.command_id);
-    
-    Some(items)
+    return matches_items_all_data_notify(&game_command.proto_data);
 }
 
 pub fn matches_avatar_packet(game_command: &GameCommand) -> Option<Vec<r#gen::protos::AvatarInfo>> {
-    use protobuf::Message;
-    use protobuf::UnknownValueRef::*;
-
-    let Ok(d_msg) = crate::r#gen::protos::Unk::parse_from_bytes(&game_command.proto_data) else {
-        return None;
-    };
-    
-    let mut has_avatars = false;
-    for (fnum, fdata) in d_msg.unknown_fields().iter() {
-        if fnum == 14 {
-            if let LengthDelimited(_) = fdata { has_avatars = true; }
-        }
-    }
-    
-    if !has_avatars {
+    if !game_command.is_avatar_data_notify() {
         return None;
     }
 
-    let avatars = matches_avatars_all_data_notify(&game_command.proto_data)?;
-    
-    #[cfg(debug_assertions)]
-    tracing::info!("Discovered AvatarDataNotify! Command ID is: {}", game_command.command_id);
-    
-    Some(avatars)
+    return matches_avatars_all_data_notify(&game_command.proto_data);
 }
 pub fn matches_player_property_packet(game_command: &GameCommand) -> Option<std::collections::HashMap<u32, u32>> {
     // Instead of a hardcoded command ID check, we dynamically discover it.
