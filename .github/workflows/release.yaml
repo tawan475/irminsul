@@ -7,8 +7,11 @@ on:
         required: true
         default: "0.0.0"
 
-env:
-  TRACKER_API_URL: ${{ vars.TRACKER_API_URL }}
+# TRACKER_API_URL is deliberately NOT set at workflow level: option_env! in
+# src/app.rs yields Some("") for a set-but-empty variable, which would bake an
+# unusable empty base URL into the released binary with no way for a user to
+# fix it. The "Export tracker API URL" step below sets it only when the
+# repository variable actually has a value.
 
 jobs:
   build:
@@ -39,33 +42,48 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      - name: Export tracker API URL
+        if: vars.TRACKER_API_URL != ''
+        shell: bash
+        run: echo "TRACKER_API_URL=${{ vars.TRACKER_API_URL }}" >> "$GITHUB_ENV"
       - run: cargo install toml-cli
       - name: Update Cargo.toml version locally
+        shell: bash
         run: |
           toml set Cargo.toml package.version ${{inputs.nextVersion}} > Cargo.toml.new
           rm Cargo.toml
           mv Cargo.toml.new Cargo.toml
-          cargo generate-lockfile
-      - name: Setup Linux
+          # NEVER `cargo generate-lockfile` here: it throws away every pin in the
+          # committed Cargo.lock and re-resolves the whole graph at release time,
+          # so the shipped binary would be built from a dependency set nothing
+          # ever tested. `--workspace` only refreshes this package's own entry,
+          # which is all the version bump above invalidates.
+          cargo update --workspace
+      - name: Setup Linux GUI dependencies
         if: runner.os == 'Linux'
         run: |
           export DEBIAN_FRONTEND=noninteractive
           echo "set man-db/auto-update false" | sudo debconf-communicate
           sudo dpkg-reconfigure -f noninteractive man-db
-          sudo sed -Ei 's/^# deb-src /deb-src /' /etc/apt/sources.list
-          sudo apt-get update && sudo apt-get build-dep -y libpcap0.8 && sudo apt-get install -y libgtk-3-dev libappindicator3-dev libatk1.0-dev
-          cd /tmp
-          [ ! -f libpcap-1.10.5.tar.gz ] && wget https://www.tcpdump.org/release/libpcap-1.10.5.tar.gz
-          echo "37ced90a19a302a7f32e458224a00c365c117905c2cd35ac544b6880a81488f0  libpcap-1.10.5.tar.gz" | sha256sum -c
-          tar xzf libpcap-1.10.5.tar.gz && cd libpcap-1.10.5
-          ./configure --prefix=/usr --libdir=/usr/lib/x86_64-linux-gnu --disable-dbus
-          make && sudo make install && sudo ldconfig
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libappindicator3-dev libatk1.0-dev
+      - name: Setup libpcap
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/setup-libpcap
       - name: Setup Windows (for pcap builds)
         if: runner.os == 'Windows' && matrix.features == 'pcap'
+        shell: pwsh
         run: |
-          curl https://npcap.com/dist/npcap-sdk-1.15.zip -o sdk.zip
-          unzip sdk.zip
-      - run: cargo build --release --no-default-features --features "${{ matrix.features }}"
+          curl.exe -fsSL https://npcap.com/dist/npcap-sdk-1.15.zip -o sdk.zip
+          $expected = '52c7b9fb4abee3ad9fe739bb545c3efe77b731c8e127122bdf328eafdae3ed4f'
+          $actual = (Get-FileHash sdk.zip -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) {
+            throw "npcap SDK checksum mismatch: expected $expected, got $actual"
+          }
+          Expand-Archive -Path sdk.zip -DestinationPath . -Force
+      # --locked: fail loudly if anything other than the version bump above
+      # would change the lock, rather than silently shipping a different graph.
+      - run: cargo build --release --locked --no-default-features --features "${{ matrix.features }}"
         env:
           LIB: ${{ github.workspace }}/Lib/x64/
       - name: Package Windows
@@ -111,11 +129,15 @@ jobs:
           toml set Cargo.toml package.version ${{inputs.nextVersion}} > Cargo.toml.new
           rm Cargo.toml
           mv Cargo.toml.new Cargo.toml
-          cargo generate-lockfile
+          # See the build job: `cargo update --workspace` refreshes only this
+          # package's lock entry, where `cargo generate-lockfile` would re-resolve
+          # (and silently bump) every dependency and push that to main.
+          cargo update --workspace
           git config user.name "irminsul bot"
           git config user.email "irminsul.bot@users.noreply.github.com"
           git add Cargo.toml Cargo.lock
-          git commit -m "[skip ci] bump version to ${{inputs.nextVersion}}"
+          # No [skip ci]: the version bump lands on main, so let CI build it.
+          git commit -m "bump version to ${{inputs.nextVersion}}"
           git tag v${{inputs.nextVersion}}
           git push origin main
           git push origin --tags

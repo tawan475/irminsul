@@ -2,7 +2,7 @@
 
 # Resources
 
-- [Docs](https://konkers.github.io/irminsul)
+- [Docs](https://tawan475.github.io/irminsul)
 - [Discord](https://discord.gg/aQqdZPHEpP)
 
 # Introduction
@@ -20,7 +20,7 @@ To use the `pcap` capture backend, make sure to install a Pcap library (Npcap/Wi
 Irminsul accepts a handful of command line options for advanced use cases:
 
 - `--capture-backend <pktmon|pcap>`: chooses which capture backend to use. On Windows both `pktmon` (default) and `pcap` are available. On other platforms only `pcap` is available.
-- `--no-admin`: skips the automatic elevation prompt. This can be useful when you prefer to launch the application without requesting higher privileges up front.
+- `--no-admin`: skips the packet-capture privilege check, and the "permissions missing" dialog it would otherwise show, on Linux and macOS. Capture still needs root/`CAP_NET_RAW`/`/dev/bpf` access to work, so this only helps when you want the UI without capture. It has no effect on Windows: the embedded application manifest asks for elevation before `main()` runs, so Windows has already decided by the time the flag is parsed.
 
 ## Features
 

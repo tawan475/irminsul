@@ -8,7 +8,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  TRACKER_API_URL: ${{ vars.TRACKER_API_URL }}
+  # TRACKER_API_URL is deliberately NOT set here: `option_env!("TRACKER_API_URL")`
+  # in src/app.rs yields Some("") for a set-but-empty variable, which would bake
+  # an unusable empty base URL into the released binary. The step below exports
+  # it only when the repository variable actually has a value.
 
 jobs:
   test_matrix:
@@ -35,34 +38,41 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - name: Setup Linux
+      - name: Export tracker API URL
+        if: vars.TRACKER_API_URL != ''
+        shell: bash
+        run: echo "TRACKER_API_URL=${{ vars.TRACKER_API_URL }}" >> "$GITHUB_ENV"
+      - name: Setup Linux GUI dependencies
         if: runner.os == 'Linux'
         run: |
           export DEBIAN_FRONTEND=noninteractive
           echo "set man-db/auto-update false" | sudo debconf-communicate
           sudo dpkg-reconfigure -f noninteractive man-db
-          sudo sed -Ei 's/^# deb-src /deb-src /' /etc/apt/sources.list
-          sudo apt-get update && sudo apt-get build-dep -y libpcap0.8 && sudo apt-get install -y libgtk-3-dev libappindicator3-dev libatk1.0-dev
-          cd /tmp
-          [ ! -f libpcap-1.10.5.tar.gz ] && wget https://www.tcpdump.org/release/libpcap-1.10.5.tar.gz
-          echo "37ced90a19a302a7f32e458224a00c365c117905c2cd35ac544b6880a81488f0  libpcap-1.10.5.tar.gz" | sha256sum -c
-          tar xzf libpcap-1.10.5.tar.gz && cd libpcap-1.10.5
-          ./configure --prefix=/usr --libdir=/usr/lib/x86_64-linux-gnu --disable-dbus
-          make && sudo make install && sudo ldconfig
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libappindicator3-dev libatk1.0-dev
+      - name: Setup libpcap
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/setup-libpcap
       - name: Setup Windows (for pcap builds)
         if: runner.os == 'Windows' && matrix.features == 'pcap'
+        shell: pwsh
         run: |
-          curl https://npcap.com/dist/npcap-sdk-1.15.zip -o sdk.zip
-          unzip sdk.zip
-      - run: rustup component add clippy
+          curl.exe -fsSL https://npcap.com/dist/npcap-sdk-1.15.zip -o sdk.zip
+          $expected = '52c7b9fb4abee3ad9fe739bb545c3efe77b731c8e127122bdf328eafdae3ed4f'
+          $actual = (Get-FileHash sdk.zip -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) {
+            throw "npcap SDK checksum mismatch: expected $expected, got $actual"
+          }
+          Expand-Archive -Path sdk.zip -DestinationPath . -Force
+      # clippy and rustfmt come from rust-toolchain.toml's components list.
       - run: cargo fmt --check
-      - run: cargo clippy --release --no-default-features --features "${{ matrix.features }}" -- -Dwarnings
+      - run: cargo clippy --release --locked --no-default-features --features "${{ matrix.features }}" -- -Dwarnings
         env:
           LIB: ${{ github.workspace }}/Lib/x64/
-      - run: cargo test --release --no-default-features --features "${{ matrix.features }}"
+      - run: cargo test --release --locked --no-default-features --features "${{ matrix.features }}"
         env:
           LIB: ${{ github.workspace }}/Lib/x64/
-      - run: cargo build --release --no-default-features --features "${{ matrix.features }}"
+      - run: cargo build --release --locked --no-default-features --features "${{ matrix.features }}"
         env:
           LIB: ${{ github.workspace }}/Lib/x64/
       - if: ${{matrix.artifact_name}}
@@ -71,3 +81,36 @@ jobs:
         with:
           name: ${{ matrix.artifact_name }}-${{ runner.os }}
           path: target/release/irminsul${{ matrix.suffix }}
+
+  # Everything above builds --release only, so without this leg nothing in CI
+  # ever compiles the #[cfg(debug_assertions)] code (all of src/pcapng.rs, plus
+  # blocks in main.rs and monitor.rs) or runs the tests with overflow checks on.
+  # Windows with default features needs no SDK, and is the configuration that
+  # ships by default.
+  debug_build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Export tracker API URL
+        if: vars.TRACKER_API_URL != ''
+        shell: bash
+        run: echo "TRACKER_API_URL=${{ vars.TRACKER_API_URL }}" >> "$GITHUB_ENV"
+      - run: cargo clippy --locked --no-default-features -- -Dwarnings
+      - run: cargo test --locked --no-default-features
+      - run: cargo build --locked --no-default-features
+
+  # update_rev.py is what turns "upstream pushed something" into a new pinned
+  # revision in Cargo.toml, and its two guards -- refuse to run under an active
+  # [patch], restore the manifest when the verification build fails -- are the
+  # only thing stopping an unverified dependency from being adopted. They get
+  # tested like the rest of the repo. The tests stub out git and cargo, so this
+  # leg needs no toolchain and finishes in seconds.
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: python -m unittest discover -p "test_*.py" -v

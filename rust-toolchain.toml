@@ -1,3 +1,9 @@
+# Pinned to a specific nightly so unrelated nightly churn (a missing clippy for
+# one CI host, a rustfmt output change) cannot break every CI leg and every
+# contributor's `python check.py` on unmodified code. Bump the date in its own
+# PR so the fallout is attributable.
+#
+# Nightly is required by rustfmt.toml's `imports_granularity` / `group_imports`.
 [toolchain]
-channel = "nightly"
-components = ["rustfmt"]
+channel = "nightly-2026-06-20"
+components = ["rustfmt", "clippy"]
