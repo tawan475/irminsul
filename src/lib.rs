@@ -1133,7 +1133,7 @@ fn as_counter(value: i64) -> u64 {
 /// fields are simply absent is a property whose value is 0, and is reported as
 /// such -- proto3 omits zeros, and dropping them is what made a snapshot keep
 /// yesterday's resin count after the resin was spent.
-pub fn prop_value(prop: &PropValue) -> Option<u64> {
+fn prop_value(prop: &PropValue) -> Option<u64> {
     if prop.val != 0 {
         return Some(as_counter(prop.val));
     }
