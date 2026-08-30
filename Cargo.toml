@@ -3,19 +3,38 @@ name = "auto-artifactarium"
 version = "1.4.0"
 edition = "2024"
 license = "MIT"
+repository = "https://github.com/tawan475/auto-artifactarium"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+default = []
+# The `auto-artifactarium` CLI binary (src/main.rs) and the only dependencies it
+# needs. Library consumers (irminsul) depend on the lib target with default
+# features, so they never build clap or anyhow.
+cli = ["dep:anyhow", "dep:clap"]
+
+[lib]
+name = "auto_artifactarium"
+path = "src/lib.rs"
+
+[[bin]]
+name = "auto-artifactarium"
+path = "src/main.rs"
+required-features = ["cli"]
 
 [dependencies]
 base64 = "0.22"
 etherparse = "0.16.0"
-kcp = { git = "https://github.com/hashblen/mhy-kcp" }
+kcp = { git = "https://github.com/hashblen/mhy-kcp", rev = "1acf4ba5938ff91f7f2d2a31e16bf1f8d2db9c8f" }
 protobuf = "3.7.1"
 rand_mt = "4.2"
 tracing = "0.1"
 rsa = "0.9"
-clap = { version = "4.5.47", features = ["derive"] }
-anyhow = "1.0.99"
+
+# CLI-only, enabled by the `cli` feature.
+clap = { version = "4.5.47", features = ["derive"], optional = true }
+anyhow = { version = "1.0.99", optional = true }
 
 [build-dependencies]
 protobuf-codegen = "3.7.1"

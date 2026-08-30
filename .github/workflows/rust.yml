@@ -1,0 +1,57 @@
+name: Rust
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # This crate carries no rust-toolchain.toml on purpose: it has no
+      # nightly-only rustfmt options and builds clean on stable, so CI runs on
+      # the runner's default stable toolchain. Irminsul pins nightly for its own
+      # reasons; gating this dependency on stable is the stricter of the two.
+      - run: rustup component add clippy rustfmt
+
+      - name: Format
+        run: cargo fmt --check
+
+      # --all-features so the `cli` binary (src/main.rs) is linted too; without
+      # it the bin is skipped for want of its required feature.
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -Dwarnings
+
+      - name: Test
+        run: cargo test --all-features
+
+      # Default features must stay CLI-free: this is what irminsul builds, and
+      # it proves clap/anyhow are not in the library's dependency graph.
+      - name: Build (library, default features)
+        run: cargo build
+
+      - name: Build (all features)
+        run: cargo build --all-features
+
+  docs:
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -Dwarnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # Guards the crate-level rustdoc: broken intra-doc links (the kind this
+      # README tells people to read via `cargo doc`) fail the build.
+      - name: Doc
+        run: cargo doc --no-deps --all-features
