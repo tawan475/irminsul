@@ -19,10 +19,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      # This crate carries no rust-toolchain.toml on purpose: it has no
-      # nightly-only rustfmt options and builds clean on stable, so CI runs on
-      # the runner's default stable toolchain. Irminsul pins nightly for its own
-      # reasons; gating this dependency on stable is the stricter of the two.
+      # The toolchain comes from rust-toolchain.toml, so this job and a local
+      # run use the same compiler. Without the pin, CI floated on the runner's
+      # stable and `-D warnings` failed on a lint that did not exist on the
+      # contributor's machine -- unreproducible locally, and unrelated to the
+      # change that happened to be pushed.
       - run: rustup component add clippy rustfmt
 
       - name: Format

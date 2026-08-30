@@ -87,8 +87,14 @@ pub fn new_key_from_seed(seed: u64) -> Vec<u8> {
     // Fill in place: the previous version reserved 512 bytes and then pushed
     // 4096, reallocating three times per candidate key.
     let mut key = vec![0u8; KEY_LEN];
-    for word in key.chunks_exact_mut(8) {
-        word.copy_from_slice(&generator.next_u64().to_be_bytes());
+    // `as_chunks_mut` over `chunks_exact_mut(8)`: the chunk size is a constant,
+    // so this yields `&mut [u8; 8]` and `copy_from_slice` becomes a fixed-size
+    // copy with no length check. Clippy's `chunks_exact_to_as_chunks` asks for
+    // it by name on newer toolchains.
+    let (words, remainder) = key.as_chunks_mut::<8>();
+    debug_assert!(remainder.is_empty(), "KEY_LEN must be a multiple of 8");
+    for word in words {
+        *word = generator.next_u64().to_be_bytes();
     }
     key
 }
