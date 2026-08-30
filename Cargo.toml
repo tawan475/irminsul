@@ -4,14 +4,22 @@ version = "0.2.1-T-1"
 authors = ["Konkers <konkers@konkers.net>"]
 edition = "2024"
 include = ["LICENSE-APACHE", "LICENSE-MIT", "**/*.rs", "Cargo.toml"]
-rust-version = "1.85"
+# The source uses let-chains (e.g. `src/app.rs`, `src/wish.rs`), stable since
+# 1.88, so anything lower will not compile.
+rust-version = "1.88"
 
 [package.metadata.docs.rs]
 all-features = true
-targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
+targets = ["x86_64-unknown-linux-gnu"]
 
-[dependencies]
-# Keep these in sync with dev-dependencies below
+# `build.rs` writes the game data blob that `src/monitor.rs` embeds, so these
+# three crates are used by both the build script and the binary and must not
+# drift apart: flate2 in particular writes the gz on one side and reads it on
+# the other. Declaring them once here and inheriting with `workspace = true`
+# makes that impossible to get wrong.
+[workspace]
+
+[workspace.dependencies]
 anime-game-data = { git = "https://github.com/konkers/anime-game-data", rev = "dfc03cdb5e27807a876b8d4dff17b3f67a320f5c" }
 flate2 = "1.1.9"
 tokio = { version = "1.47.1", features = [
@@ -21,10 +29,16 @@ tokio = { version = "1.47.1", features = [
 	"rt-multi-thread",
 ] }
 
+[dependencies]
+# Shared with [build-dependencies]; see [workspace.dependencies] above.
+anime-game-data = { workspace = true }
+flate2 = { workspace = true }
+tokio = { workspace = true }
+
 anyhow = "1.0.99"
 async-trait = "0.1.89"
 async-watcher = "0.3.0"
-auto-artifactarium = { git = "https://github.com/tawan475/auto-artifactarium", rev = "0c7a8f8f53722b9a8abf8f7371f3d0a883162ece" }
+auto-artifactarium = { git = "https://github.com/tawan475/auto-artifactarium", rev = "01a48e8673dabaccbe6fe4f13f1c98b246491801" }
 base64 = "0.22.1"
 chrono = "0.4.42"
 clap = { version = "4.5.47", features = ["derive"] }
@@ -42,18 +56,30 @@ egui-file-dialog = "0.11.0"
 egui-notify = "0.20.0"
 egui_extras = { version = "0.32.2", features = ["image", "svg", "webp"] }
 egui_material_icons = "0.4.0"
-env_logger = "0.11.8"
 futures = "0.3.31"
 futures-util = "0.3.31"
 indexmap = "2.11.1"
 log = "0.4.27"
-notify = "5.2.0"
+# NOTE: `notify` is used only through `async-watcher`'s re-export
+# (`async_watcher::notify::…`), so it is deliberately not a direct dependency:
+# a direct entry here would pull in a second, independently versioned copy.
 open = "5.3.2"
 regex = "1.11.2"
 reqwest = { version = "0.12.23", features = ["gzip", "stream", "multipart"] }
-self_update = "0.42.0"
+# `compression-flate2` (which pulls in `archive-tar`) is what lets the Linux
+# release tarball be unpacked before `self_replace` installs the binary
+# inside it. Without it `src/update.rs` can only refuse the asset, which
+# leaves Linux with no in-app update path at all.
+self_update = { version = "0.42.0", features = ["compression-flate2"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.143", features = ["alloc"] }
+# Only the `system` feature, and only for a process-name scan (see
+# `src/game_watch.rs`). This is not really a new dependency: `egui-file-dialog`
+# already pulls the same 0.36 line in with `default-features = false,
+# features = ["disk"]`, so this is a feature union on a crate that was already
+# being compiled -- no new version in the tree, and none of `component`,
+# `network` or `user`.
+sysinfo = { version = "0.36.1", default-features = false, features = ["system"] }
 tempfile = "3.21.0"
 tokio-util = "0.7.16"
 tracing = { version = "0.1.41" }
@@ -86,16 +112,17 @@ gtk = "0.18.2"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.177"
 
+[dev-dependencies]
+# Builds the fixture tarball that `src/update.rs` unpacks. Already in the
+# graph through self_update's `archive-tar`; named here so the tests can
+# construct one.
+tar = "0.4"
+
 [build-dependencies]
-# Keep these in sync with dependencies above
-anime-game-data = { git = "https://github.com/konkers/anime-game-data", rev = "dfc03cdb5e27807a876b8d4dff17b3f67a320f5c" }
-flate2 = "1.1.9"
-tokio = { version = "1.47.1", features = [
-	"rt",
-	"tokio-macros",
-	"macros",
-	"rt-multi-thread",
-] }
+# Shared with [dependencies]; see [workspace.dependencies] above.
+anime-game-data = { workspace = true }
+flate2 = { workspace = true }
+tokio = { workspace = true }
 
 winresource = "0.1.23"
 
@@ -109,7 +136,10 @@ pcap = ["dep:pcap"]
 static-libpcap = ["pcap"]
 
 [profile.release]
-opt-level = 2 # fast and small wasm
+# Inherited from the upstream eframe template, where the comment referred to
+# wasm builds irminsul does not produce. Kept at 2 because nothing has measured
+# a benefit from 3 for this workload.
+opt-level = 2
 
 # Optimize all dependencies even in debug builds:
 [profile.dev.package."*"]

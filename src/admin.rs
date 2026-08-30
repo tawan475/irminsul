@@ -22,6 +22,22 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+/// Report whether the process has the privileges raw packet capture needs.
+///
+/// On Windows, elevation is owned entirely by the application manifest that
+/// `build.rs` embeds into the binary (`requestedExecutionLevel
+/// level="requireAdministrator"`). Windows evaluates that manifest before
+/// `main` runs: it shows the UAC prompt itself, and refuses to start the
+/// process at all if the prompt is declined. There is consequently nothing for
+/// this function to escalate — it used to re-launch itself through
+/// `ShellExecuteExW("runas")`, which was dead code in every shipped build and
+/// carried its own bugs (arguments were re-joined with spaces without
+/// `CommandLineToArgvW` quoting, and the process exited with status 0 even
+/// when the re-launch failed).
+///
+/// A consequence of the manifest owning elevation is that `--no-admin` cannot
+/// do anything on Windows: the OS has already decided by the time the flag is
+/// parsed. Keep the flag's help text honest about that (see `main.rs`).
 #[cfg(windows)]
 pub fn ensure_admin() {
     if unsafe { windows::Win32::UI::Shell::IsUserAnAdmin().into() } {
@@ -29,51 +45,13 @@ pub fn ensure_admin() {
         return;
     }
 
-    tracing::info!("Escalating to admin privileges");
-
-    use std::env;
-    use std::os::windows::ffi::OsStrExt;
-
-    use windows::Win32::System::Console::GetConsoleWindow;
-    use windows::Win32::UI::Shell::{
-        SEE_MASK_NO_CONSOLE, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
-    };
-    use windows::Win32::UI::WindowsAndMessaging::{GW_OWNER, GetWindow, SW_SHOWNORMAL};
-    use windows::core::{PCWSTR, w};
-
-    let args_str = env::args().skip(1).collect::<Vec<_>>().join(" ");
-
-    let exe_path = env::current_exe()
-        .expect("Failed to get current exe")
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let args = args_str.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
-
-    unsafe {
-        let mut options = SHELLEXECUTEINFOW {
-            cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
-            fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NO_CONSOLE,
-            hwnd: GetWindow(GetConsoleWindow(), GW_OWNER).unwrap_or(GetConsoleWindow()),
-            lpVerb: w!("runas"),
-            lpFile: PCWSTR(exe_path.as_ptr()),
-            lpParameters: PCWSTR(args.as_ptr()),
-            lpDirectory: PCWSTR::null(),
-            nShow: SW_SHOWNORMAL.0,
-            lpIDList: std::ptr::null_mut(),
-            lpClass: PCWSTR::null(),
-            dwHotKey: 0,
-            ..Default::default()
-        };
-
-        if let Err(e) = ShellExecuteExW(&mut options) {
-            tracing::error!("unable to run self with admin privs: {e}");
-        }
-    };
-
-    // Exit the current process since we launched a new elevated one
-    std::process::exit(0);
+    // Only reachable in a build whose manifest did not apply, e.g. one where
+    // the resource compiler was unavailable. Packet capture will fail, so say
+    // so plainly rather than silently relaunching or exiting.
+    tracing::warn!(
+        "Not running with admin privileges even though the embedded manifest requires them; \
+         packet capture will fail. Restart Irminsul with \"Run as administrator\"."
+    );
 }
 
 #[cfg(unix)]
@@ -94,8 +72,22 @@ pub fn ensure_admin() {
 
     // On macOS, /dev/bpf access is sufficient
     #[cfg(target_os = "macos")]
-    if std::fs::File::open("/dev/bpf0").is_ok() {
-        return;
+    {
+        use std::io::ErrorKind;
+
+        // Each capturing process takes exclusive ownership of one bpf device,
+        // so /dev/bpf0 alone says nothing: if Wireshark (or any other libpcap
+        // consumer) holds it, opening it fails with EBUSY even though our
+        // permissions are fine. Probe the first few devices and treat "busy"
+        // as proof that permissions are correct, so only a genuine permission
+        // failure on every device reaches the dialog below.
+        for n in 0..=9 {
+            match std::fs::File::open(format!("/dev/bpf{n}")) {
+                Ok(_) => return,
+                Err(e) if e.kind() == ErrorKind::ResourceBusy => return,
+                Err(_) => continue,
+            }
+        }
     }
 
     show_packet_capture_permissions_missing_dialog();
