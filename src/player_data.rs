@@ -291,12 +291,13 @@ impl PlayerData {
 
     /// Forget everything captured about the account, keeping the game data.
     ///
-    /// Captured state is otherwise insert-only for the lifetime of the process,
-    /// which this tool requires to be long: it has to be running before the game
-    /// starts. Artifacts fed as fodder and decomposed gear therefore linger in
-    /// every later export. Reached from the UI's "Clear data" control via
-    /// `Message::ClearData`, and from the handshake-latched reset that stops a
-    /// second account's inventory being merged into the first one's.
+    /// Reached from the UI's "Clear data" control via `Message::ClearData`, and
+    /// from the handshake-latched reset that stops a second account's inventory
+    /// being merged into the first one's. Still the only way to drop captured
+    /// state the game never announces a change for: destroyed items are tracked
+    /// by [`remove_items`](Self::remove_items), but a stack whose count merely
+    /// falls is only corrected by the next full inventory notify, which the
+    /// game sends at login.
     pub fn reset(&mut self) {
         self.achievements.clear();
         self.characters.clear();
@@ -339,17 +340,9 @@ impl PlayerData {
 
     /// Fold an inventory notify into the captured item set.
     ///
-    /// **Known gap — the inventory is insert-only within a game session.** The
-    /// game announces destroyed items in a delete notify (a repeated guid
-    /// list); neither `auto_artifactarium` nor this type understands one yet, so
-    /// there is no `remove_items`. Artifacts fed as fodder, decomposed gear and
-    /// consumed materials therefore stay in every later export of that session,
-    /// get content hashed, and are minted as permanent rows in the tracker's
-    /// history. The two escapes are [`reset`](Self::reset): the UI's "Clear
-    /// data" button, and the handshake latch that fires on a new game session.
-    /// Until the delete notify is wired up, a snapshot taken after in-session
-    /// fodder consumption over-reports the inventory, and restarting irminsul
-    /// (or clearing captured data) before exporting is the workaround.
+    /// Additions arrive here; destructions arrive at
+    /// [`remove_items`](Self::remove_items), so the captured inventory tracks
+    /// the account for the whole session rather than only growing.
     pub fn process_items(&mut self, items: &[Item]) {
         for item in items {
             // Item 120292 is a quest prop named `"Adventurer's Experience"`,
@@ -370,6 +363,37 @@ impl PlayerData {
                 self.items.insert((item.item_id, item.guid), item.clone());
             }
         }
+    }
+
+    /// Drop items the game says are gone, returning how many were actually held.
+    ///
+    /// The guids come from `auto_artifactarium`'s delete matcher, which reports
+    /// *candidates*: the packet shape it keys on is shared with roughly two
+    /// dozen other messages. This intersection is what makes acting on them
+    /// safe, and it is why the return value matters — a caller should treat
+    /// zero as "that was some other packet" rather than as a deletion of
+    /// nothing, and must not stamp an inventory-changed timestamp for it.
+    ///
+    /// Guid 0 is never removed. Virtual items (Primogems, resin) all carry it,
+    /// so they are keyed by item id alone; a delete list cannot legitimately
+    /// contain it, and honouring one would wipe every currency at once.
+    pub fn remove_items(&mut self, guids: &[u64]) -> usize {
+        let doomed: HashSet<u64> = guids.iter().copied().filter(|guid| *guid != 0).collect();
+        if doomed.is_empty() {
+            return 0;
+        }
+
+        let before = self.items.len();
+        self.items.retain(|(_, guid), _| !doomed.contains(guid));
+        let removed = before - self.items.len();
+
+        // Gear is unequipped before it can be destroyed, so this is normally
+        // already empty of these guids -- but a stale mapping would attribute a
+        // destroyed artifact's slot to whoever last held it.
+        self.character_equip_guid_map
+            .retain(|guid, _| !doomed.contains(guid));
+
+        removed
     }
 
     pub fn export_achievements(&self) -> Result<Vec<u32>> {
@@ -1332,5 +1356,56 @@ mod tests {
         assert!(data.properties.is_empty());
         assert!(data.achievements.is_empty());
         assert!(data.character_equip_guid_map.is_empty());
+    }
+
+    #[test]
+    fn destroyed_items_stop_being_exported() {
+        let mut data = player_data();
+        data.process_items(&[
+            material_item(104003, 7, 12),
+            material_item(104003, 8, 3),
+            material_item(104004, 9, 1),
+        ]);
+
+        assert_eq!(data.remove_items(&[8, 9]), 2);
+
+        assert_eq!(data.items.len(), 1);
+        assert!(data.items.contains_key(&(104003, 7)));
+    }
+
+    #[test]
+    fn a_delete_list_the_inventory_does_not_hold_changes_nothing() {
+        // The delete matcher reports candidates, and the shape it keys on is
+        // shared with avatar-team packets whose guids are drawn from the same
+        // counter. Reporting 0 is what tells the caller not to stamp an
+        // inventory-changed timestamp.
+        let mut data = player_data();
+        data.process_items(&[material_item(104003, 7, 12)]);
+
+        assert_eq!(data.remove_items(&[8, 9, 10]), 0);
+        assert_eq!(data.items.len(), 1);
+    }
+
+    #[test]
+    fn destroying_gear_clears_its_character_attribution() {
+        let mut data = player_data();
+        data.process_items(&[material_item(104003, 7, 1)]);
+        data.process_characters(&[avatar(10000021, &[7])]);
+        assert_eq!(data.character_equip_guid_map.get(&7), Some(&10000021));
+
+        data.remove_items(&[7]);
+
+        assert!(data.character_equip_guid_map.is_empty());
+    }
+
+    #[test]
+    fn guid_zero_is_never_honoured_in_a_delete_list() {
+        // Every virtual item (Primogems, resin) carries guid 0, so honouring it
+        // would wipe the lot in one packet.
+        let mut data = player_data();
+        data.process_items(&[material_item(201, 0, 1600), material_item(106, 0, 80)]);
+
+        assert_eq!(data.remove_items(&[0]), 0);
+        assert_eq!(data.items.len(), 2);
     }
 }
