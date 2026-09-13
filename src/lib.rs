@@ -145,9 +145,31 @@ const MAX_PLAUSIBLE_PROPERTY: u64 = 1_000_000_000_000;
 /// deliberately wide so a new release cannot age this check out.
 const PLAYER_AVATAR_IDS: std::ops::RangeInclusive<u32> = 10_000_000..=10_999_999;
 
+/// Distinct top-level fields a delete notify is allowed to carry.
+///
+/// `StoreItemDelNotify` is `{repeated uint64 guid_list, StoreType store_type}`.
+/// Sweeping Grasscutter's generated protos for messages that carry exactly one
+/// repeated-uint64 list and nothing but scalars beside it finds 23 of them at
+/// three fields or fewer, so this bound is what the shape actually looks like
+/// rather than a guess.
+const MAX_ITEM_DEL_FIELDS: usize = 3;
+
+/// Ceiling for the non-guid scalars in a delete notify.
+///
+/// The only one the message defines is `StoreType` (0, 1 or 2). The bound is
+/// left far above that so an added retcode or count field does not reject a
+/// real delete, while still ruling out a message whose "scalar" is a timestamp
+/// or an id -- that is some other packet wearing a similar shape.
+const MAX_ITEM_DEL_SCALAR: u64 = u16::MAX as u64;
+
+/// Largest delete list believed. The inventory caps out in the low thousands,
+/// so anything past this is a misparse rather than a mass decompose.
+const MAX_ITEM_DEL_GUIDS: usize = 4096;
+
 /// One-shot flags for the "this is what that command id is" discovery lines, so
 /// a long capture logs each discovery once instead of once per packet.
 static STORE_NOTIFY_LOGGED: AtomicBool = AtomicBool::new(false);
+static ITEM_DEL_NOTIFY_LOGGED: AtomicBool = AtomicBool::new(false);
 static PROPERTY_NOTIFY_LOGGED: AtomicBool = AtomicBool::new(false);
 static AVATAR_NOTIFY_LOGGED: AtomicBool = AtomicBool::new(false);
 static ACHIEVEMENT_NOTIFY_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -897,6 +919,10 @@ pub enum CommandMatch {
     Properties(HashMap<u32, u64>),
     Avatars(Vec<AvatarInfo>),
     Achievements(Vec<Achievement>),
+    /// Guids the game says are gone. Candidates, not gospel -- see
+    /// [`matches_item_del_packet`] for why the caller must intersect them with
+    /// an inventory it actually holds.
+    DeletedItems(Vec<u64>),
 }
 
 impl CommandMatch {
@@ -907,6 +933,7 @@ impl CommandMatch {
             Self::Properties(_) => "properties",
             Self::Avatars(_) => "avatars",
             Self::Achievements(_) => "achievements",
+            Self::DeletedItems(_) => "deleted items",
         }
     }
 }
@@ -931,6 +958,12 @@ pub fn classify_command(game_command: &GameCommand) -> Option<CommandMatch> {
     }
     if let Some(achievements) = matches_achievement_packet(game_command) {
         claims.push(CommandMatch::Achievements(achievements));
+    }
+    // Last on purpose. Its shape -- one packed uint64 list beside a scalar or
+    // two -- is the least specific of the five, so anything another matcher can
+    // explain is not a delete notify.
+    if let Some(guids) = matches_item_del_packet(game_command) {
+        claims.push(CommandMatch::DeletedItems(guids));
     }
 
     if claims.len() > 1 {
@@ -1023,6 +1056,165 @@ pub fn matches_item_packet(game_command: &GameCommand) -> Option<Vec<Item>> {
         );
     }
     Some(items)
+}
+
+/// Decode a packed repeated-varint field, or `None` if the bytes are not one.
+///
+/// Requires the buffer to be consumed exactly: a trailing partial varint means
+/// this blob is a submessage or a string that happened to start with
+/// varint-shaped bytes, not a packed list.
+fn decode_packed_varints(bytes: &[u8]) -> Option<Vec<u64>> {
+    let mut values = Vec::new();
+    let mut offset = 0usize;
+
+    while offset < bytes.len() {
+        let mut value = 0u64;
+        let mut shift = 0u32;
+        loop {
+            let byte = *bytes.get(offset)?;
+            offset += 1;
+            // A u64 varint is ten bytes at most; past that the shift would panic
+            // in a debug build and silently drop bits in a release one.
+            if shift >= 64 {
+                return None;
+            }
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        values.push(value);
+    }
+
+    Some(values)
+}
+
+/// `true` if every value could be an item guid from one account.
+///
+/// The game mints guids as `(uid << 32) + counter` (Grasscutter's
+/// `Player::getNextGuid`), so a real guid never fits in 32 bits and every guid
+/// belonging to one account shares its top half. That pair of facts is what
+/// separates a guid list from any other packed varint field: ids, counts,
+/// timestamps and flags all live below `u32::MAX`.
+fn plausible_guid_list(values: &[u64]) -> bool {
+    if values.is_empty() || values.len() > MAX_ITEM_DEL_GUIDS {
+        return false;
+    }
+
+    let uid = values[0] >> 32;
+    uid != 0 && values.iter().all(|guid| guid >> 32 == uid)
+}
+
+/// Recover the guids a `StoreItemDelNotify` says are gone, or `None` if this is
+/// not one.
+///
+/// Observed command id: `StoreItemDelNotify` was 636 in 7.0, kept as
+/// documentation only -- like every other matcher here this goes on shape,
+/// because command ids are reshuffled every game version.
+///
+/// **The result is a list of candidates, and the caller must treat it as one.**
+/// The shape -- one packed uint64 list beside a scalar or two -- is the least
+/// specific this library matches on: sweeping Grasscutter's protos finds 23
+/// messages wearing it, among them `AvatarDelNotify`, the avatar-team packets
+/// and `ReliquaryDecomposeReq`. What makes acting on it safe is not this
+/// function but the intersection the caller performs: remove only guids the
+/// inventory actually holds. Every colliding message then resolves to one of
+/// two harmless outcomes -- it carries avatar guids, which are drawn from the
+/// same counter but are never an item's guid, so nothing intersects; or it
+/// carries item guids that really are being destroyed (a decompose request, a
+/// talent conversion), where acting early reaches the same state the delete
+/// notify would a moment later.
+pub fn matches_item_del_packet(game_command: &GameCommand) -> Option<Vec<u64>> {
+    let msg = Unk::parse_from_bytes(&game_command.proto_data).ok()?;
+
+    let mut blobs: Vec<(u32, &[u8])> = Vec::new();
+    let mut varints: Vec<(u32, u64)> = Vec::new();
+
+    for (number, value) in msg.unknown_fields().iter() {
+        match value {
+            LengthDelimited(bytes) => blobs.push((number, bytes)),
+            Varint(scalar) => varints.push((number, scalar)),
+            // A delete notify has no fixed-width fields. Something that does is
+            // a different message.
+            Fixed32(_) | Fixed64(_) => return None,
+        }
+    }
+
+    let mut numbers: Vec<u32> = blobs
+        .iter()
+        .map(|(number, _)| *number)
+        .chain(varints.iter().map(|(number, _)| *number))
+        .collect();
+    numbers.sort_unstable();
+    numbers.dedup();
+    if numbers.is_empty() || numbers.len() > MAX_ITEM_DEL_FIELDS {
+        return None;
+    }
+
+    // The guid list is packed in every proto3 build of this message, so the
+    // usual case is exactly one blob. More than one means a message carrying
+    // submessages or strings, which a delete notify does not have.
+    let (guid_field, guids) = match blobs.as_slice() {
+        [(number, bytes)] => {
+            let values = decode_packed_varints(bytes)?;
+            if !plausible_guid_list(&values) {
+                return None;
+            }
+            (*number, values)
+        }
+        // No blob at all: an unpacked encoding, where each guid is its own
+        // varint under one field number. Accepted because `packed` is a wire
+        // detail the server is free to change.
+        [] => {
+            let mut candidate = None;
+            for &number in &numbers {
+                let values: Vec<u64> = varints
+                    .iter()
+                    .filter(|(field, _)| *field == number)
+                    .map(|(_, scalar)| *scalar)
+                    .collect();
+                if plausible_guid_list(&values) {
+                    if candidate.is_some() {
+                        // Two guid-shaped fields is not this message.
+                        return None;
+                    }
+                    candidate = Some((number, values));
+                }
+            }
+            candidate?
+        }
+        _ => return None,
+    };
+
+    // Whatever else the message carries has to be a small scalar -- `StoreType`
+    // and at most a retcode-sized companion.
+    for (number, scalar) in &varints {
+        if *number != guid_field && *scalar > MAX_ITEM_DEL_SCALAR {
+            trace!(
+                command_id = game_command.command_id,
+                field = *number,
+                scalar = *scalar,
+                "guid-shaped list, but a companion scalar is too large for a delete notify"
+            );
+            return None;
+        }
+    }
+
+    if first_time(&ITEM_DEL_NOTIFY_LOGGED) {
+        info!(
+            command_id = game_command.command_id,
+            count = guids.len(),
+            "discovered StoreItemDelNotify"
+        );
+    } else {
+        debug!(
+            command_id = game_command.command_id,
+            count = guids.len(),
+            "item delete packet"
+        );
+    }
+    Some(guids)
 }
 
 /// Recover the character roster from an `AvatarDataNotify`, or `None` if this is
@@ -2004,5 +2196,124 @@ mod tests {
     #[test]
     fn a_command_that_matches_nothing_is_classified_as_nothing() {
         assert!(classify_command(&command(field_varint(1, 1))).is_none());
+    }
+
+    // -- item delete matcher ---------------------------------------------------
+
+    /// Field numbers of the real `StoreItemDelNotify`, from Grasscutter. The
+    /// matcher must not depend on them; using the real ones keeps the fixtures
+    /// honest.
+    const DEL_GUID_LIST_TAG: u32 = 4;
+    const DEL_STORE_TYPE_TAG: u32 = 15;
+
+    /// A guid as the game mints them: `(uid << 32) + counter`.
+    fn guid(uid: u64, counter: u64) -> u64 {
+        (uid << 32) | counter
+    }
+
+    fn packed(values: &[u64]) -> Vec<u8> {
+        values.iter().flat_map(|value| varint(*value)).collect()
+    }
+
+    /// A `StoreItemDelNotify`: a packed guid list plus `store_type`.
+    fn delete_packet(guids: &[u64]) -> Vec<u8> {
+        let mut out = field_bytes(DEL_GUID_LIST_TAG, &packed(guids));
+        out.extend(field_varint(DEL_STORE_TYPE_TAG, 1));
+        out
+    }
+
+    #[test]
+    fn a_delete_notify_yields_its_guid_list() {
+        let guids = [guid(800_123_456, 17), guid(800_123_456, 4096)];
+        let command = command(delete_packet(&guids));
+
+        assert_eq!(matches_item_del_packet(&command).expect("match"), guids);
+        assert!(matches!(
+            classify_command(&command),
+            Some(CommandMatch::DeletedItems(_))
+        ));
+    }
+
+    #[test]
+    fn an_unpacked_guid_list_is_also_recognised() {
+        // `packed` is a wire detail the server may change; each guid as its own
+        // varint under one field number has to work too.
+        let guids = [guid(800_123_456, 1), guid(800_123_456, 2)];
+        let mut payload = Vec::new();
+        for value in guids {
+            payload.extend(field_varint(DEL_GUID_LIST_TAG, value));
+        }
+        payload.extend(field_varint(DEL_STORE_TYPE_TAG, 1));
+
+        assert_eq!(
+            matches_item_del_packet(&command(payload)).expect("match"),
+            guids
+        );
+    }
+
+    #[test]
+    fn a_list_of_small_ids_is_not_a_guid_list() {
+        // `AVATAR_ID_LIST` and friends wear the same shape but hold ids, which
+        // never reach the uid half of a guid.
+        let ids = [10_000_002u64, 10_000_003, 10_000_007];
+        assert!(
+            matches_item_del_packet(&command(field_bytes(DEL_GUID_LIST_TAG, &packed(&ids))))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn guids_from_two_accounts_are_not_a_delete_notify() {
+        let mixed = [guid(800_123_456, 1), guid(900_654_321, 2)];
+        assert!(matches_item_del_packet(&command(delete_packet(&mixed))).is_none());
+    }
+
+    #[test]
+    fn a_companion_scalar_too_large_for_a_store_type_is_rejected() {
+        // A plausible guid list beside a timestamp is some other message.
+        let mut payload = field_bytes(DEL_GUID_LIST_TAG, &packed(&[guid(800_123_456, 1)]));
+        payload.extend(field_varint(2, 1_757_000_000_000));
+        assert!(matches_item_del_packet(&command(payload)).is_none());
+    }
+
+    #[test]
+    fn a_trailing_partial_varint_is_not_a_packed_list() {
+        // A submessage or string that merely starts varint-shaped must not be
+        // read as a guid list.
+        let mut blob = packed(&[guid(800_123_456, 1)]);
+        blob.push(0x80); // continuation bit set, no byte after it
+        assert!(matches_item_del_packet(&command(field_bytes(DEL_GUID_LIST_TAG, &blob))).is_none());
+    }
+
+    #[test]
+    fn a_message_carrying_submessages_is_not_a_delete_notify() {
+        // An inventory has a blob per item; a delete notify has exactly one.
+        let command = command(item_packet(40));
+        assert!(matches_item_del_packet(&command).is_none());
+        assert!(matches!(
+            classify_command(&command),
+            Some(CommandMatch::Items(_))
+        ));
+    }
+
+    #[test]
+    fn a_message_with_too_many_fields_is_not_a_delete_notify() {
+        let mut payload = field_bytes(DEL_GUID_LIST_TAG, &packed(&[guid(800_123_456, 1)]));
+        payload.extend(field_varint(1, 1));
+        payload.extend(field_varint(2, 2));
+        payload.extend(field_varint(3, 3));
+        assert!(matches_item_del_packet(&command(payload)).is_none());
+    }
+
+    #[test]
+    fn a_fixed_width_field_rules_out_a_delete_notify() {
+        let mut payload = field_bytes(DEL_GUID_LIST_TAG, &packed(&[guid(800_123_456, 1)]));
+        payload.extend(field_fixed32(2, 1));
+        assert!(matches_item_del_packet(&command(payload)).is_none());
+    }
+
+    #[test]
+    fn an_empty_guid_list_is_not_a_delete_notify() {
+        assert!(matches_item_del_packet(&command(field_bytes(DEL_GUID_LIST_TAG, &[]))).is_none());
     }
 }
