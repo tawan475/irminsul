@@ -992,6 +992,28 @@ impl Monitor {
                     updated.achievements_updated_time = Some(chrono::Local::now());
                     has_new_data = true;
                 }
+                Some(CommandMatch::DeletedItems(guids)) => {
+                    // The matcher reports candidates -- its shape is shared with
+                    // a couple of dozen other messages -- so the inventory
+                    // intersection is the real test. Removing nothing means this
+                    // was one of those others, and must not stamp a timestamp
+                    // that tells the UI and the automation gate the inventory
+                    // just changed.
+                    let removed = self.player_data.remove_items(&guids);
+                    if removed > 0 {
+                        tracing::info!(
+                            "Item delete packet removed {removed} of {} guids",
+                            guids.len()
+                        );
+                        updated.items_updated = Some(now);
+                        has_new_data = true;
+                    } else {
+                        tracing::debug!(
+                            "Item delete packet held none of the captured inventory ({} guids)",
+                            guids.len()
+                        );
+                    }
+                }
                 _ => {}
             }
         }

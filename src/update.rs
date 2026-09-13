@@ -249,6 +249,27 @@ fn asset_for_current_platform(release: &Release) -> Result<ReleaseAsset> {
 /// after the matrix's `binary` field. Renaming that means renaming this.
 const TARBALL_EXECUTABLE_ENTRY: &str = "irminsul";
 
+/// The executable inside the macOS release bundle.
+///
+/// `.github/workflows/release.yaml` assembles `Irminsul.app` by hand and tars
+/// the whole directory, so this is the path of the Mach-O *within* the archive.
+/// It is also where `current_exe()` lands at run time: the `Info.plist`
+/// launcher execs `Contents/MacOS/irminsul`, so replacing this one file is
+/// replacing the running program.
+///
+/// What this does not update is the rest of the bundle -- `Info.plist`, the
+/// icon and the launcher script. A release that changes any of those needs a
+/// manual reinstall to pick them up; the version Finder reports comes from the
+/// plist, so it keeps reading the installed version rather than the running
+/// one. That is the price of updating in place, and it is worth it against the
+/// alternative of macOS having no in-app updates at all.
+///
+/// It also sidesteps the quarantine dance the quickstart documents: an update
+/// written by this process is not tagged `com.apple.quarantine` the way a
+/// browser download is, so the `xattr -dr` step is a first-install concern
+/// only.
+const MACOS_BUNDLE_EXECUTABLE_ENTRY: &str = "Irminsul.app/Contents/MacOS/irminsul";
+
 /// How a downloaded release asset becomes the file handed to `self_replace`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InstallPlan {
@@ -264,18 +285,14 @@ enum InstallPlan {
 /// Decide how an asset can be installed, or refuse it.
 ///
 /// Only shapes this function knows how to turn into a native executable are
-/// accepted. A macOS `.app` is the one release asset that genuinely cannot be
-/// installed this way: it is a directory tree, and replacing the Mach-O inside
-/// the installed bundle is not what `self_replace` does.
+/// accepted. A macOS `.app` is a directory tree rather than a file, so it is
+/// not installed as one: the bundle irminsul publishes is unsigned, which means
+/// the Mach-O inside it can be replaced on its own without invalidating a
+/// signature, and that file is exactly what `current_exe()` points at.
 fn install_plan_for(asset: &ReleaseAsset) -> Result<InstallPlan> {
     // Checked before the plain `.tar.gz` arm below, which it also matches.
     if asset.name.ends_with(".app.tar.gz") {
-        return Err(anyhow!(
-            "the release asset for this platform ({}) is a macOS application bundle, which \
-             Irminsul cannot install over itself; download it from {RELEASES_URL} and \
-             replace the installed copy by hand",
-            asset.name
-        ));
+        return Ok(InstallPlan::UnpackTarGz(MACOS_BUNDLE_EXECUTABLE_ENTRY));
     }
 
     if asset.name.ends_with(".tar.gz") || asset.name.ends_with(".tgz") {
@@ -319,6 +336,12 @@ fn extract_tar_gz_entry(archive: &Path, into_dir: &Path, entry: &str) -> Result<
 
 const PE_MAGIC: &[u8] = b"MZ";
 const ELF_MAGIC: &[u8] = b"\x7fELF";
+/// `MH_MAGIC_64` (0xFEEDFACF) as it lands on disk on a little-endian target,
+/// which is what a thin arm64 build is.
+const MACHO_MAGIC_64: &[u8] = b"\xcf\xfa\xed\xfe";
+/// `FAT_MAGIC`, stored big-endian by definition. Accepted so a universal build
+/// would still install if the release ever ships one.
+const MACHO_FAT_MAGIC: &[u8] = b"\xca\xfe\xba\xbe";
 
 /// No Irminsul build is anywhere near this small; an HTTP error page is.
 const MIN_ASSET_LEN: u64 = 64 * 1024;
@@ -347,10 +370,12 @@ fn check_minimum_size(path: &Path) -> Result<()> {
 /// overwrites the running one. Installing the wrong platform's binary leaves an
 /// app that cannot run, and so cannot update itself back out of it.
 fn check_is_native_executable(path: &Path) -> Result<()> {
-    let magic = if cfg!(windows) {
-        PE_MAGIC
+    let magics: &[&[u8]] = if cfg!(windows) {
+        &[PE_MAGIC]
     } else if cfg!(target_os = "linux") {
-        ELF_MAGIC
+        &[ELF_MAGIC]
+    } else if cfg!(target_os = "macos") {
+        &[MACHO_MAGIC_64, MACHO_FAT_MAGIC]
     } else {
         return Err(anyhow!(
             "Irminsul cannot verify a downloaded update on this platform"
@@ -362,7 +387,7 @@ fn check_is_native_executable(path: &Path) -> Result<()> {
         .with_context(|| format!("could not open the downloaded update at {path:?}"))?
         .read(&mut header)?;
 
-    if !header[..read].starts_with(magic) {
+    if !magics.iter().any(|magic| header[..read].starts_with(magic)) {
         return Err(anyhow!(
             "the downloaded update is not an executable for this platform"
         ));
@@ -708,12 +733,20 @@ mod tests {
     }
 
     #[test]
-    fn a_macos_bundle_and_a_zip_are_still_refused() {
-        // A .app is a directory tree: there is no single file self_replace can
-        // put in place of the running one. Note it also ends with `.tar.gz`, so
-        // the order of the checks in `install_plan_for` is load bearing.
-        install_plan_for(&asset("Irminsul-macos-arm64.app.tar.gz"))
-            .expect_err("a macOS bundle cannot be installed over a single executable");
+    fn a_macos_bundle_is_unpacked_from_inside_the_app() {
+        // The .app is a directory tree, so what gets installed is the Mach-O
+        // inside it -- which is also what `current_exe()` points at. Note the
+        // name also ends with `.tar.gz`, so the order of the checks in
+        // `install_plan_for` is load bearing: the bare-tarball arm would look
+        // for a top-level `irminsul` that a bundle does not have.
+        assert_eq!(
+            install_plan_for(&asset("Irminsul-macos-arm64.app.tar.gz")).unwrap(),
+            InstallPlan::UnpackTarGz(MACOS_BUNDLE_EXECUTABLE_ENTRY),
+        );
+    }
+
+    #[test]
+    fn a_zip_is_still_refused() {
         install_plan_for(&asset("irminsul.zip")).expect_err("nothing unpacks zips");
     }
 
@@ -763,6 +796,31 @@ mod tests {
         check_minimum_size(&extracted).expect("the unpacked binary is a plausible size");
         check_minimum_size(&archive_path)
             .expect_err("the compressed archive is far below the floor");
+    }
+
+    #[test]
+    fn the_macos_bundle_yields_the_executable_from_inside_it() {
+        // The entry is a nested path, not a bare name, so this also pins that
+        // the extractor writes it under the staging directory rather than
+        // flattening it -- `self_update` matches tar entries by whole path.
+        let dir = tempfile::tempdir().unwrap();
+        let archive_path = dir.path().join("Irminsul-macos-arm64.app.tar.gz");
+
+        let mut payload = MACHO_MAGIC_64.to_vec();
+        payload.resize(MIN_ASSET_LEN as usize + 1, 0);
+        write_tarball(
+            &archive_path,
+            &[
+                ("Irminsul.app/Contents/Info.plist", b"<plist/>"),
+                (MACOS_BUNDLE_EXECUTABLE_ENTRY, &payload),
+            ],
+        );
+
+        let extracted =
+            extract_tar_gz_entry(&archive_path, dir.path(), MACOS_BUNDLE_EXECUTABLE_ENTRY).unwrap();
+        assert_eq!(extracted, dir.path().join(MACOS_BUNDLE_EXECUTABLE_ENTRY));
+        assert_eq!(std::fs::read(&extracted).unwrap(), payload);
+        check_minimum_size(&extracted).expect("the unpacked binary is a plausible size");
     }
 
     #[test]
