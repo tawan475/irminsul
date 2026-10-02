@@ -586,7 +586,7 @@ dependencies = [
 [[package]]
 name = "auto-artifactarium"
 version = "1.4.0"
-source = "git+https://github.com/tawan475/auto-artifactarium?rev=8cbd224a68b10f21d8bd4a1e6bb1dc95518a9232#8cbd224a68b10f21d8bd4a1e6bb1dc95518a9232"
+source = "git+https://github.com/tawan475/auto-artifactarium?rev=7f36b1407d17be3ad3522a34224916eb6f970099#7f36b1407d17be3ad3522a34224916eb6f970099"
 dependencies = [
  "base64",
  "etherparse",
