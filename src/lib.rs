@@ -1461,8 +1461,8 @@ mod tests {
     use crate::cs_rand::Random;
 
     const PROP_MAP_TAG: u32 = 4;
-    const ITEM_LIST_TAG: u32 = 5;
-    const AVATAR_LIST_TAG: u32 = 6;
+    const ITEM_LIST_TAG: u32 = 6;
+    const AVATAR_LIST_TAG: u32 = 7;
 
     fn varint(mut value: u64) -> Vec<u8> {
         let mut out = Vec::new();
