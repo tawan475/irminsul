@@ -14,3 +14,5 @@ Issues in code this fork has not touched are best reported upstream at
 
 Irminsul is open source. This fork lives at <https://github.com/tawan475/irminsul>
 and tracks upstream at <https://github.com/konkers/irminsul>.
+The packet-parsing library it uses, auto-artifactarium, is part of the same
+repository, under `crates/auto-artifactarium`.
