@@ -1,7 +1,7 @@
 name: Rust
 
 # develop is the integration branch; main only receives develop when releasing.
-# Both are protected and require these checks, so both must trigger them.
+# main is protected and requires these checks; develop runs them on every push.
 on:
   push:
     branches: ["main", "develop"]
@@ -39,7 +39,19 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # Keep the in-tree auto-artifactarium crate compiled between runs (its
+      # generated protobuf code is the slowest thing to build and rarely
+      # changes), and write caches only from pushes to develop/main: pull
+      # requests restore them but don't save, which used to overflow the 10 GB
+      # cache budget and evict the branch caches.
       - uses: Swatinem/rust-cache@v2
+        with:
+          # One cache per leg; the two Windows legs used to share one key. Not
+          # keyed on `features`: cache keys can't contain commas, and the Linux
+          # leg's "pcap,static-libpcap" silently disabled its cache.
+          key: ${{ matrix.artifact_name }}
+          cache-workspace-crates: true
+          save-if: ${{ github.event_name == 'push' }}
       - name: Export tracker API URL
         if: vars.TRACKER_API_URL != ''
         shell: bash
@@ -95,7 +107,15 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      # Keep the in-tree auto-artifactarium crate compiled between runs (its
+      # generated protobuf code is the slowest thing to build and rarely
+      # changes), and write caches only from pushes to develop/main: pull
+      # requests restore them but don't save, which used to overflow the 10 GB
+      # cache budget and evict the branch caches.
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-workspace-crates: true
+          save-if: ${{ github.event_name == 'push' }}
       - name: Export tracker API URL
         if: vars.TRACKER_API_URL != ''
         shell: bash
@@ -104,20 +124,28 @@ jobs:
       - run: cargo test --locked --no-default-features
       - run: cargo build --locked --no-default-features
 
-  # crates/auto-artifactarium, the packet-parsing library. It has no capture
-  # backend and no system dependencies, so unlike the legs above it needs
-  # neither GTK nor a pcap SDK, and it is checked once per OS rather than once
-  # per irminsul feature set. Same checks the library ran in its own repository,
-  # now on the workspace toolchain (rust-toolchain.toml) and lockfile.
+  # crates/auto-artifactarium, the packet-parsing library: its own tests, the
+  # `cli` feature, and its docs. It is pure Rust with no platform-specific code
+  # or system dependencies, so it runs once, on Linux; the legs above already
+  # compile and lint it on Windows and macOS (clippy --workspace --all-targets).
+  # The one-entry matrix keeps the check name "library (ubuntu-latest)", which
+  # main's branch protection requires.
   library:
     strategy:
-      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # Keep the in-tree auto-artifactarium crate compiled between runs (its
+      # generated protobuf code is the slowest thing to build and rarely
+      # changes), and write caches only from pushes to develop/main: pull
+      # requests restore them but don't save, which used to overflow the 10 GB
+      # cache budget and evict the branch caches.
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-workspace-crates: true
+          save-if: ${{ github.event_name == 'push' }}
       # --all-features so the `cli` binary (src/main.rs) is linted and tested
       # too; without it the bin is skipped for want of its required feature.
       - run: cargo clippy --locked -p auto-artifactarium --all-targets --all-features -- -Dwarnings
@@ -127,9 +155,8 @@ jobs:
       - run: cargo build --locked -p auto-artifactarium
       - run: cargo build --locked -p auto-artifactarium --all-features
       # Broken intra-doc links (e.g. a public doc linking to a private item)
-      # fail the build. Rustdoc output does not differ per OS, so one is enough.
+      # fail the build.
       - name: Doc
-        if: runner.os == 'Linux'
         run: cargo doc --locked -p auto-artifactarium --no-deps --all-features
         env:
           RUSTDOCFLAGS: -Dwarnings

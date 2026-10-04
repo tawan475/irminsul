@@ -1113,24 +1113,22 @@ impl Monitor {
             "game poll"
         );
 
-        // Once, and only from the very first look. The user-facing notification
-        // is `app.rs`'s modal, which offers the three ways out; this is the log
-        // record, so a support log still shows why a session captured nothing.
-        // Matched on the specific cause, not on `LaunchMissed(_)`: the toast
-        // below says "already running" in so many words, and that is the only
-        // verdict a first look can reach today. Pinning it here means a later
-        // change to the transition table cannot quietly put the wrong sentence
-        // in front of the user.
-        if first_look
-            && matches!(
-                status,
-                GameStatus::LaunchMissed(game_watch::MissedLaunch::AlreadyRunning)
-            )
-        {
+        // The log record behind `app.rs`'s modal, so a support log shows why a
+        // session captured nothing. An already-open game is not a miss by
+        // itself (it may still be on the title screen); only game traffic
+        // without a login makes it one.
+        if first_look && status == GameStatus::AwaitingLogin {
+            tracing::info!(
+                "Genshin was already open when Irminsul started; waiting to see the login \
+                 (entering the world)"
+            );
+        }
+        let missed = GameStatus::LaunchMissed(game_watch::MissedLaunch::AlreadyRunning);
+        if status == missed && self.app_state.app_state.game_status != missed {
             tracing::warn!(
-                "Genshin was already running when Irminsul started: the login handshake, and \
-                 with it the session key, was missed, so nothing from this game session can be \
-                 decrypted"
+                "Genshin was already in the world when Irminsul started: game traffic arrived \
+                 with no login in it, so the session key was missed and nothing from this \
+                 game session can be decrypted"
             );
         }
 
@@ -1149,6 +1147,10 @@ impl Monitor {
                 .unwrap_or_default();
             let _ = writer.write_packet(ts, &packet);
         }
+
+        // Game traffic: for a game that was already open, starts the clock on
+        // telling "still on the title screen" from "already in the world".
+        self.game_watch.note_game_traffic();
 
         let Some(sniffer) = self.sniffer.as_ref() else {
             return;
@@ -1369,11 +1371,18 @@ impl Monitor {
     /// so nothing is lost by ignoring these here.
     fn handle_connection_packet(&mut self, conn: &ConnectionPacket) {
         match conn {
-            ConnectionPacket::HandshakeRequested => {
-                tracing::info!("Connection: Handshake Requested");
-            }
-            ConnectionPacket::HandshakeEstablished => {
-                tracing::info!("Connection: Handshake Established")
+            ConnectionPacket::HandshakeRequested | ConnectionPacket::HandshakeEstablished => {
+                if matches!(conn, ConnectionPacket::HandshakeRequested) {
+                    tracing::info!("Connection: Handshake Requested");
+                } else {
+                    tracing::info!("Connection: Handshake Established");
+                }
+                // A login being watched: whatever the process timing said, this
+                // connection's key exchange is inside the capture window.
+                if self.game_watch.note_login_seen() {
+                    let status = self.game_watch.status();
+                    self.app_state.update_game_status(status);
+                }
             }
             ConnectionPacket::Disconnected => {
                 tracing::info!("Connection: Disconnected");
@@ -1716,12 +1725,24 @@ async fn upload_to_tracker(
     }
 }
 
+/// What the tracker says about an import key (`verify-key`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrackerAccount {
+    pub name: String,
+    pub uid: String,
+    pub server: String,
+    /// The account's page in the tracker's web app, when the tracker reports
+    /// one (the hosted tracker does; the old backend does not). Only http(s)
+    /// URLs are kept: the UI opens this in the user's browser.
+    pub dashboard_url: Option<String>,
+}
+
 /// Ask the tracker who an import key belongs to.
 async fn verify_tracker_key(
     client: &reqwest::Client,
     url: &str,
     key: &str,
-) -> Result<(String, String, String)> {
+) -> Result<TrackerAccount> {
     let response = client
         .get(url)
         .header("x-import-key", key)
@@ -1739,11 +1760,14 @@ async fn verify_tracker_key(
     if !status.is_success() {
         return Err(anyhow!("Verify failed: HTTP {}", status));
     }
+    parse_verify_response(&body)
+}
 
+/// Reads a successful `verify-key` body. The old backend wraps it in
+/// `{ data: { ... } }`; the hosted tracker answers at the top level.
+fn parse_verify_response(body: &str) -> Result<TrackerAccount> {
     let json: serde_json::Value =
-        serde_json::from_str(&body).map_err(|_| anyhow!("Invalid JSON response"))?;
-
-    // Backend wraps responses in { data: { ... } }
+        serde_json::from_str(body).map_err(|_| anyhow!("Invalid JSON response"))?;
     let inner = json.get("data").unwrap_or(&json);
     let name = inner
         .get("accountName")
@@ -1763,8 +1787,26 @@ async fn verify_tracker_key(
         .and_then(|v| v.as_str())
         .unwrap_or("N/A")
         .to_string();
+    let dashboard_url = inner
+        .get("dashboardUrl")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|url| is_web_url(url))
+        .map(str::to_owned);
 
-    Ok((name, uid, server))
+    Ok(TrackerAccount {
+        name,
+        uid,
+        server,
+        dashboard_url,
+    })
+}
+
+/// Whether a server-supplied link is safe to hand to the browser: an absolute
+/// http(s) URL with a host, nothing like `file:` or `javascript:`.
+fn is_web_url(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
 }
 
 async fn get_database(
@@ -1840,6 +1882,61 @@ fn load_keys() -> Result<HashMap<u16, Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verify_reads_the_hosted_trackers_answer_and_its_dashboard_link() {
+        let body = r#"{"accountId":11,"accountName":"Main","uid":"813152114","server":"ASIA","dashboardUrl":"https://genshin-tracker.475.dev/app/a/11"}"#;
+        assert_eq!(
+            parse_verify_response(body).unwrap(),
+            TrackerAccount {
+                name: "Main".into(),
+                uid: "813152114".into(),
+                server: "ASIA".into(),
+                dashboard_url: Some("https://genshin-tracker.475.dev/app/a/11".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn verify_reads_the_old_backends_wrapped_answer_without_a_dashboard() {
+        let body = r#"{"status":200,"message":"ok","data":{"accountName":"Alt","uid":800000000,"server":null}}"#;
+        let account = parse_verify_response(body).unwrap();
+        assert_eq!(account.name, "Alt");
+        assert_eq!(account.uid, "800000000");
+        assert_eq!(account.server, "N/A");
+        assert_eq!(account.dashboard_url, None);
+    }
+
+    #[test]
+    fn verify_only_keeps_web_links_for_the_dashboard() {
+        for url in [
+            "javascript:alert(1)",
+            "file:///C:/Windows/System32/calc.exe",
+            "/app/a/11",
+            "",
+            "https://",
+        ] {
+            let body = serde_json::json!({ "accountName": "x", "dashboardUrl": url }).to_string();
+            assert_eq!(
+                parse_verify_response(&body).unwrap().dashboard_url,
+                None,
+                "{url}"
+            );
+        }
+        let body = r#"{"accountName":"x","dashboardUrl":" http://localhost:5173/app/a/1 "}"#;
+        assert_eq!(
+            parse_verify_response(body)
+                .unwrap()
+                .dashboard_url
+                .as_deref(),
+            Some("http://localhost:5173/app/a/1")
+        );
+    }
+
+    #[test]
+    fn verify_rejects_a_body_that_is_not_json() {
+        assert!(parse_verify_response("<html>").is_err());
+    }
 
     fn command(command_id: u16, header: &[u8], data: &[u8]) -> GameCommand {
         GameCommand {
