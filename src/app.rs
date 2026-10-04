@@ -22,6 +22,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::capture;
+use crate::monitor::TrackerAccount;
 
 type AsyncRuntimeHandles = (
     mpsc::UnboundedSender<Message>,
@@ -402,8 +403,8 @@ pub struct IrminsulApp {
     saved_state: SavedAppState,
 
     tracker_key_modal_open: bool,
-    tracker_account_name: Option<(String, String, String)>,
-    tracker_verify_rx: Option<oneshot::Receiver<Result<(String, String, String)>>>,
+    tracker_account: Option<TrackerAccount>,
+    tracker_verify_rx: Option<oneshot::Receiver<Result<TrackerAccount>>>,
     tracker_upload_rx: Option<oneshot::Receiver<Result<(), String>>>,
 
     /// The "Genshin is already running" modal.
@@ -813,7 +814,7 @@ impl IrminsulApp {
             optimizer_export_target: OptimizerExportTarget::None,
             restarting: false,
             tracker_key_modal_open: false,
-            tracker_account_name: None,
+            tracker_account: None,
             tracker_verify_rx,
             tracker_upload_rx: None,
             tray_icon,
@@ -1137,7 +1138,7 @@ impl IrminsulApp {
             Err(e) => {
                 if matches!(tracker_error_status(&e), Some(401 | 403)) {
                     self.saved_state.tracker_verified = false;
-                    self.tracker_account_name = None;
+                    self.tracker_account = None;
                     self.request_tracker_verify();
                 }
                 self.toasts.error(format!("Tracker sync failed: {e}"));
@@ -1561,7 +1562,7 @@ impl IrminsulApp {
         ui.set_width(520.0);
         ui.heading(match cause {
             Some(MissedLaunch::CaptureStopped) => "Genshin ran while capture was off",
-            _ => "Genshin is already running",
+            _ => "Genshin was already in the world",
         });
         ui.separator();
         ui.label(match cause {
@@ -1569,13 +1570,13 @@ impl IrminsulApp {
                 "Genshin was running while packet capture was stopped, so Irminsul missed the login handshake and has no key for this session. Nothing can be captured from it, however long you leave it running."
             }
             _ => {
-                "Genshin was already running when Irminsul started, so Irminsul never saw the login handshake and has no key for this session. Nothing can be captured from it, however long you leave it running."
+                "This game session logged in before Irminsul started: game traffic is arriving with no login in it, so Irminsul has no key for this session. Nothing can be captured from it, however long you leave it running. (Opening Irminsul while Genshin is on the title screen is fine; this only appears once you are in the world.)"
             }
         });
         ui.add_space(6.0);
         ui.label(
             RichText::new(
-                "Fix: close Genshin and start it again, leaving Irminsul running with capture on.",
+                "Fix: with Irminsul running, return to the title screen and enter the world again, or close Genshin and start it again.",
             )
             .strong(),
         );
@@ -1836,14 +1837,14 @@ impl IrminsulApp {
         });
     }
 
-    fn apply_tracker_verify_result(&mut self, result: Result<(String, String, String)>) {
+    fn apply_tracker_verify_result(&mut self, result: Result<TrackerAccount>) {
         match result {
             Ok(info) => {
-                self.tracker_account_name = Some(info);
+                self.tracker_account = Some(info);
                 self.saved_state.tracker_verified = true;
             }
             Err(e) => {
-                self.tracker_account_name = None;
+                self.tracker_account = None;
                 self.saved_state.tracker_verified = false;
                 self.toasts
                     .error(format!("Failed to verify tracker key: {}", e));
@@ -1854,7 +1855,7 @@ impl IrminsulApp {
     fn request_tracker_verify(&mut self) {
         let key = self.saved_state.tracker_import_key.clone();
         if key.is_empty() {
-            self.tracker_account_name = None;
+            self.tracker_account = None;
             self.saved_state.tracker_verified = false;
             // Drop any in-flight request too, so its (now meaningless) answer
             // cannot land later and re-toast a failure for a key that is gone.
@@ -1870,7 +1871,7 @@ impl IrminsulApp {
             .ui_message_tx
             .send(Message::VerifyTrackerKey(url, key, tx));
         self.tracker_verify_rx = Some(rx);
-        self.tracker_account_name = None;
+        self.tracker_account = None;
         self.saved_state.tracker_verified = false;
     }
 
@@ -1914,7 +1915,7 @@ impl IrminsulApp {
                     .clicked()
                 {
                     self.saved_state.tracker_import_key.clear();
-                    self.tracker_account_name = None;
+                    self.tracker_account = None;
                     self.saved_state.tracker_verified = false;
                     self.tracker_verify_rx = None;
                 }
@@ -1922,12 +1923,15 @@ impl IrminsulApp {
                 if self.tracker_verify_rx.is_some() {
                     ui.label(RichText::new("Verifying key…").color(Color32::YELLOW));
                 } else if self.saved_state.tracker_verified {
-                    if let Some((name, uid, server)) = &self.tracker_account_name {
+                    if let Some(account) = &self.tracker_account {
                         ui.label(
-                            RichText::new(format!("Valid: {name} (UID {uid})"))
+                            RichText::new(format!("Valid: {} (UID {})", account.name, account.uid))
                                 .color(Color32::from_hex("#00ab3f").unwrap()),
                         );
-                        ui.label(RichText::new(format!("Server: {server}")).color(Color32::GRAY));
+                        ui.label(
+                            RichText::new(format!("Server: {}", account.server))
+                                .color(Color32::GRAY),
+                        );
                     }
                 } else if !self.saved_state.tracker_import_key.is_empty() {
                     ui.label(RichText::new("Key invalid or unreachable").color(Color32::RED));
@@ -1942,6 +1946,13 @@ impl IrminsulApp {
                 self.tracker_key_modal_open = false;
             }
         }
+
+        // Only while the key is verified: `tracker_account` is set by a
+        // successful verify and cleared whenever one starts or fails.
+        let dashboard_url = self
+            .tracker_account
+            .as_ref()
+            .and_then(|account| account.dashboard_url.clone());
 
         ui.add_enabled_ui(true, |ui| {
             ui.vertical(|ui| {
@@ -1982,6 +1993,14 @@ impl IrminsulApp {
                                     }
                                 },
                             );
+                            if let Some(url) = &dashboard_url
+                                && ui
+                                    .button(egui_material_icons::icons::ICON_OPEN_IN_NEW)
+                                    .on_hover_text("Open dashboard")
+                                    .clicked()
+                            {
+                                ui.ctx().open_url(OpenUrl::new_tab(url));
+                            }
                             if ui
                                 .button(egui_material_icons::icons::ICON_SETTINGS)
                                 .clicked()
@@ -1995,15 +2014,20 @@ impl IrminsulApp {
 
                 if self.saved_state.tracker_import_key.is_empty() {
                     ui.label("No account linked.");
-                } else if let Some((name, uid, server)) = &self.tracker_account_name {
+                } else if let Some(account) = &self.tracker_account {
                     ui.label(
-                        RichText::new(format!("Account: {}", name))
+                        RichText::new(format!("Account: {}", account.name))
                             .color(Color32::from_hex("#00ab3f").unwrap()),
                     );
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("UID: {}", uid)).color(Color32::GRAY));
+                        ui.label(
+                            RichText::new(format!("UID: {}", account.uid)).color(Color32::GRAY),
+                        );
                         ui.label(RichText::new("•").color(Color32::DARK_GRAY));
-                        ui.label(RichText::new(format!("Server: {}", server)).color(Color32::GRAY));
+                        ui.label(
+                            RichText::new(format!("Server: {}", account.server))
+                                .color(Color32::GRAY),
+                        );
                     });
                 } else if self.tracker_verify_rx.is_some() {
                     ui.label(RichText::new("Verifying...").color(Color32::YELLOW));
