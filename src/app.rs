@@ -479,6 +479,9 @@ pub struct IrminsulApp {
     /// last raised for, so it appears once per occurrence rather than per
     /// frame. See `note_uid_mismatch`.
     uid_mismatch_warned: Option<(String, u32)>,
+    /// The (linked UID, captured UID) pair last logged as agreeing, so the
+    /// "UIDs match" line is written once rather than every frame.
+    uid_match_logged: Option<(String, u32)>,
 
     /// The "Genshin is already running" modal.
     game_missed_modal_open: bool,
@@ -891,6 +894,7 @@ impl IrminsulApp {
             tracker_verify_rx,
             tracker_upload_rx: None,
             uid_mismatch_warned: None,
+            uid_match_logged: None,
             tray_icon,
             state_rx,
             wish_url_rx,
@@ -1952,6 +1956,19 @@ impl IrminsulApp {
         let Some((account, captured)) = mismatch else {
             // Re-armed, so a later recurrence speaks up again.
             self.uid_mismatch_warned = None;
+            // Say so when the two agree too: the UID is derived from guids by
+            // a scheme that is still being verified, and a match is the proof.
+            if let (Some(account), Some(captured)) = (&self.tracker_account, captured_uid) {
+                let pair = (account.uid.trim().to_string(), captured);
+                if self.uid_match_logged.as_ref() != Some(&pair) {
+                    tracing::info!(
+                        captured,
+                        linked = %pair.0,
+                        "the captured UID matches the tracker key's account"
+                    );
+                    self.uid_match_logged = Some(pair);
+                }
+            }
             return;
         };
 

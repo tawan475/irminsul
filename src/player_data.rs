@@ -677,17 +677,21 @@ impl PlayerData {
     }
 
     /// The account UID, read off the captured item guids.
+    pub fn account_uid(&self) -> Option<u32> {
+        self.uid_check().uid
+    }
+
+    /// How the account UID is read off the captured item guids, with the
+    /// evidence (exported as `gi_debug.uidCheck` so it can be checked).
     ///
-    /// The game mints item guids as `(uid << 32) + counter` (Grasscutter's
-    /// `Player::getNextGuid`; auto-artifactarium's delete matcher only accepts
-    /// guid lists of that shape, and deletes match on live servers), so the
-    /// top half of an item guid is the UID. Virtual items carry guid 0 and are
-    /// skipped. The UID is the top half nearly every item agrees on
-    /// ([`UID_MAJORITY`]); a few strays (an item from some other source) don't
-    /// spoil it, a real split claims nothing. Avatar guids don't vote: their
-    /// field is unverified on 7.1, and a capture of 7.1 found no UID while
-    /// they did vote. One INFO line shows the top halves either way.
-    fn account_uid(&self) -> Option<u32> {
+    /// Assumed, not documented: the game mints item guids as
+    /// `(uid << 32) + counter` (Grasscutter's `Player::getNextGuid`;
+    /// auto-artifactarium's delete matcher only accepts guid lists of that
+    /// shape), so the top half of an item guid would be the UID. Virtual items
+    /// carry guid 0 and are skipped. The UID is the top half at least
+    /// [`UID_MAJORITY`] of the items share; a real split claims nothing. Avatar
+    /// guids are counted but don't vote: their field is unverified on 7.1.
+    pub fn uid_check(&self) -> good::UidCheck {
         let mut item_tops: BTreeMap<u64, usize> = BTreeMap::new();
         for (_, guid) in self.items.keys() {
             if *guid != 0 {
@@ -698,34 +702,30 @@ impl PlayerData {
         for avatar in self.characters.values() {
             *avatar_tops.entry(avatar.guid >> 32).or_default() += 1;
         }
-        let top_counts = |tops: &BTreeMap<u64, usize>| {
-            let mut list: Vec<_> = tops.iter().map(|(top, n)| (*top, *n)).collect();
-            list.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        let most_first = |tops: &BTreeMap<u64, usize>| {
+            let mut list: Vec<(u64, usize)> = tops.iter().map(|(top, n)| (*top, *n)).collect();
+            list.sort_by_key(|(top, n)| (std::cmp::Reverse(*n), *top));
             list.truncate(5);
             list
         };
-        tracing::info!(
-            items = ?top_counts(&item_tops),
-            avatars = ?top_counts(&avatar_tops),
-            "guid top halves (account UID check)"
-        );
 
         let total: usize = item_tops.values().sum();
-        let (top, count) = item_tops
+        let best = item_tops
             .iter()
             .filter(|(top, _)| **top != 0)
             .max_by_key(|(_, n)| **n)
-            .map(|(top, n)| (*top, *n))?;
-        if (count as f64) < (total as f64) * UID_MAJORITY {
-            tracing::debug!(
-                top,
-                count,
-                total,
-                "no top half is a clear majority; not reporting a UID"
-            );
-            return None;
+            .map(|(top, n)| (*top, *n));
+        let agreeing = best.map_or(0, |(_, n)| n);
+        let uid = best
+            .filter(|(_, n)| (*n as f64) >= (total as f64) * UID_MAJORITY)
+            .and_then(|(top, _)| u32::try_from(top).ok());
+        good::UidCheck {
+            uid,
+            agreeing,
+            total,
+            item_top_halves: most_first(&item_tops),
+            avatar_top_halves: most_first(&avatar_tops),
         }
-        u32::try_from(top).ok()
     }
 
     /// `gi_player` for the captured data, plus every property value that was
@@ -805,6 +805,24 @@ impl PlayerData {
             );
         }
         tracing::info!(?gi_player, "account values for this export");
+        let uid_check = self.uid_check();
+        match uid_check.uid {
+            Some(uid) => tracing::info!(
+                uid,
+                agreeing = uid_check.agreeing,
+                total = uid_check.total,
+                items = ?uid_check.item_top_halves,
+                avatars = ?uid_check.avatar_top_halves,
+                "account UID read from the item guids"
+            ),
+            None => tracing::info!(
+                agreeing = uid_check.agreeing,
+                total = uid_check.total,
+                items = ?uid_check.item_top_halves,
+                avatars = ?uid_check.avatar_top_halves,
+                "no account UID: the item guids' top halves don't agree enough"
+            ),
+        }
 
         let mut good = good::Good {
             format: "GOOD".to_string(),
@@ -838,6 +856,11 @@ impl PlayerData {
                 .filter(|times| !times.is_empty()),
             // Filled in with the characters below.
             gi_characters: None,
+            gi_debug: (uid_check.total > 0 || !uid_check.avatar_top_halves.is_empty()).then(|| {
+                good::GiDebug {
+                    uid_check: Some(uid_check),
+                }
+            }),
         };
 
         if settings.include_characters {
@@ -2292,11 +2315,40 @@ mod tests {
         data
     }
 
+    /// The export without `gi_debug`, which is diagnostics, not data: it
+    /// appears whenever guids were captured and is checked on its own below.
     fn golden_json(data: &PlayerData) -> String {
         let mut report = ExportReport::default();
-        let good = data.build_good(&settings(), &mut report, GOLDEN_TIMESTAMP_MS);
+        let mut good = data.build_good(&settings(), &mut report, GOLDEN_TIMESTAMP_MS);
         assert!(report.is_empty(), "{}", report.summary());
+        good.gi_debug = None;
         serde_json::to_string(&good).unwrap()
+    }
+
+    #[test]
+    fn gi_debug_shows_how_the_uid_was_read_and_comes_last() {
+        let data = golden_player_data(true);
+        let mut report = ExportReport::default();
+        let good = data.build_good(&settings(), &mut report, GOLDEN_TIMESTAMP_MS);
+        let check = good
+            .gi_debug
+            .as_ref()
+            .and_then(|debug| debug.uid_check.as_ref());
+        let check = check.expect("guids were captured");
+        assert_eq!(
+            check.uid,
+            good.gi_player.as_ref().and_then(|player| player.uid)
+        );
+        assert_eq!(check.agreeing, check.total);
+        let json = serde_json::to_string(&good).unwrap();
+        let debug_at = json
+            .find(r#","gi_debug":{"uidCheck":{"#)
+            .expect("gi_debug serialized");
+        assert!(json[..debug_at].ends_with('}'));
+        assert!(
+            json.find(r#""gi_characters""#).unwrap() < debug_at,
+            "{json}"
+        );
     }
 
     /// The GOOD part of an export, byte for byte. A change here is a change to
@@ -2352,6 +2404,7 @@ mod tests {
         good.gi_player = None;
         good.gi_achievement_times = None;
         good.gi_characters = None;
+        good.gi_debug = None;
         let without = serde_json::to_string(&good).unwrap();
 
         let good_part = without.strip_suffix('}').unwrap();
