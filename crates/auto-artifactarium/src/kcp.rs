@@ -9,6 +9,44 @@ pub(crate) struct KcpSniffer {
     pub(crate) conv_id: u32,
     kcp: Kcp<Vec<u8>>,
     time_start: Instant,
+    foreign: ForeignTally,
+}
+
+/// Segments rejected for belonging to another conversation, for logging.
+#[derive(Default)]
+struct ForeignTally {
+    /// Conversation of the last rejected segment.
+    last: Option<u32>,
+    /// Every rejected segment.
+    total: u64,
+    /// Conversations announced so far, up to [`FOREIGN_FIRST_WARNINGS`].
+    announced: usize,
+}
+
+impl ForeignTally {
+    /// Count one rejected segment and log it if it is news: a conversation
+    /// not seen just before (a handful of times per sniffer), or a round
+    /// number of rejections.
+    fn note(&mut self, expected: u32, incoming: u32) {
+        self.total += 1;
+        let changed = self.last != Some(incoming);
+        self.last = Some(incoming);
+
+        if changed && self.announced < FOREIGN_FIRST_WARNINGS {
+            self.announced += 1;
+            warn!(
+                expected,
+                incoming, "kcp segment belongs to another conversation; ignoring it"
+            );
+        } else if self.total.is_multiple_of(FOREIGN_SUMMARY_EVERY) {
+            warn!(
+                expected,
+                incoming,
+                count = self.total,
+                "kcp segments of another conversation are still arriving; ignoring them"
+            );
+        }
+    }
 }
 
 impl KcpSniffer {
@@ -28,6 +66,7 @@ impl KcpSniffer {
             conv_id,
             kcp: new_kcp(conv_id),
             time_start: Instant::now(),
+            foreign: ForeignTally::default(),
         }
     }
 
@@ -40,10 +79,7 @@ impl KcpSniffer {
         trace!("message data: {}", bytes_as_hex(segments));
 
         if conv_id != self.conv_id {
-            warn!(
-                expected = self.conv_id,
-                "packet did not belong to conversation"
-            );
+            self.foreign.note(self.conv_id, conv_id);
             return Vec::new();
         }
 
@@ -153,6 +189,18 @@ const MAX_FRAGMENT_INDEX: u8 = 254;
 ///   ACK costs nothing (its `parse_ack`/`update_ack` work on a permanently empty
 ///   send queue).
 const MAX_TIMEDIFF_OPERAND: u32 = 1 << 31;
+
+/// Foreign conversations announced individually per sniffer before only the
+/// periodic summary is left.
+const FOREIGN_FIRST_WARNINGS: usize = 8;
+
+/// One summary line per this many segments rejected for belonging to another
+/// conversation.
+///
+/// A wedged sniffer rejects every segment of the live conversation -- 10,384
+/// of them in 31 s in the 2026-10-04 log, pktmon's eight copies included --
+/// and a WARN per segment buries everything else the log could have said.
+const FOREIGN_SUMMARY_EVERY: u64 = 1000;
 
 fn validate_kcp_segment(payload: &[u8]) -> Option<u32> {
     if payload.len() < GAME_KCP_OVERHEAD {
@@ -507,6 +555,52 @@ mod tests {
 
             assert_eq!(received, vec![vec![0xAA; 6]], "ts {ts:#x} lost its payload");
         }
+    }
+
+    #[test]
+    fn a_foreign_conversation_is_named_and_its_flood_is_summarised() {
+        // 2026-10-04 06:59: a sniffer bound to the wrong conversation rejected
+        // the real one 10,384 times in 31 s, one WARN each, and every one of
+        // them named only the conversation it expected.
+        let mut sniffer = KcpSniffer::new(123_542);
+        let logged = crate::test_support::warnings(|| {
+            for sn in 0..10_384 {
+                assert!(
+                    sniffer
+                        .receive_segments(&game_segment(123_582, sn % 1024, &[0xAA; 4]))
+                        .is_empty()
+                );
+            }
+        });
+
+        assert!(
+            logged[0].contains("123542") && logged[0].contains("123582"),
+            "the first warning names both conversations: {logged:#?}"
+        );
+        assert!(
+            logged.len() <= 1 + 10_384 / FOREIGN_SUMMARY_EVERY as usize,
+            "{} warnings",
+            logged.len()
+        );
+        assert!(
+            logged.iter().skip(1).all(|line| line.contains("count=")),
+            "later lines are counted summaries: {logged:#?}"
+        );
+    }
+
+    #[test]
+    fn alternating_foreign_conversations_cannot_flood_the_log() {
+        let mut sniffer = KcpSniffer::new(1);
+        let logged = crate::test_support::warnings(|| {
+            for i in 0..5_000u32 {
+                sniffer.receive_segments(&game_segment(2 + i % 50, 0, &[]));
+            }
+        });
+        assert!(
+            logged.len() <= FOREIGN_FIRST_WARNINGS + 5_000 / FOREIGN_SUMMARY_EVERY as usize,
+            "{} warnings",
+            logged.len()
+        );
     }
 
     /// One hostile segment does not cost the good segments sharing its datagram.

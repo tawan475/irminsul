@@ -88,6 +88,8 @@ mod connection;
 mod crypto;
 mod cs_rand;
 mod kcp;
+#[cfg(test)]
+mod test_support;
 mod unk_util;
 
 const PORTS: [u16; 2] = [22101, 22102];
@@ -1545,6 +1547,7 @@ mod tests {
     use super::*;
     use crate::crypto::new_key_from_seed;
     use crate::cs_rand::Random;
+    use crate::test_support::warnings;
 
     const PROP_MAP_TAG: u32 = 4;
     const ITEM_LIST_TAG: u32 = 6;
@@ -2322,54 +2325,6 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), sniffer.time_anchors.len(), "no duplicates");
-    }
-
-    /// Runs `f` and returns every WARN event it logged on this thread, each as
-    /// its message followed by its other fields.
-    fn warnings(f: impl FnOnce()) -> Vec<String> {
-        use std::sync::{Arc, Mutex};
-
-        use tracing::field::{Field, Visit};
-        use tracing::span::{Attributes, Id, Record};
-        use tracing::{Event, Level, Metadata, Subscriber};
-
-        struct Capture(Arc<Mutex<Vec<String>>>);
-
-        struct Fields(String);
-
-        impl Visit for Fields {
-            fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-                if field.name() == "message" {
-                    self.0.insert_str(0, &format!("{value:?}"));
-                } else {
-                    let _ = write!(self.0, " {}={value:?}", field.name());
-                }
-            }
-        }
-
-        impl Subscriber for Capture {
-            fn enabled(&self, _: &Metadata<'_>) -> bool {
-                true
-            }
-            fn new_span(&self, _: &Attributes<'_>) -> Id {
-                Id::from_u64(1)
-            }
-            fn record(&self, _: &Id, _: &Record<'_>) {}
-            fn record_follows_from(&self, _: &Id, _: &Id) {}
-            fn event(&self, event: &Event<'_>) {
-                if *event.metadata().level() == Level::WARN {
-                    let mut fields = Fields(String::new());
-                    event.record(&mut fields);
-                    self.0.lock().unwrap().push(fields.0);
-                }
-            }
-            fn enter(&self, _: &Id) {}
-            fn exit(&self, _: &Id) {}
-        }
-
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        tracing::subscriber::with_default(Capture(Arc::clone(&seen)), f);
-        seen.lock().unwrap().clone()
     }
 
     #[test]
