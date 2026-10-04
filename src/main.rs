@@ -117,6 +117,9 @@ pub struct AppState {
     /// says nothing about whether the traffic it sees can be decrypted at all.
     /// See [`game_watch`].
     game_status: GameStatus,
+    /// What the captured data says about the account (`gi_player`), for the
+    /// data panel and the tracker's UID check. `None` until something is known.
+    player: Option<good::GiPlayer>,
 }
 
 impl AppState {
@@ -126,6 +129,7 @@ impl AppState {
             capturing: false,
             updated: DataUpdated::new(),
             game_status: GameStatus::default(),
+            player: None,
         }
     }
 }

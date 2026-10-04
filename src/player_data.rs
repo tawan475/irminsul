@@ -71,6 +71,62 @@ fn tps_avatar_ids(game_data: &AnimeGameData) -> [u32; 2] {
     ]
 }
 
+/// A player property `gi_player` reports: its client `PROP_*` id, and the range
+/// a real value falls in.
+///
+/// The ids are the game's own enum rather than anything in the Excel data, so
+/// `anime-game-data` cannot supply them. They have been stable since 1.0
+/// (Grasscutter's `PlayerProperty.java` is the reference) and a 7.1 login
+/// carries every one. A value outside its range is left out of `gi_player`
+/// rather than sent: these numbers are only ever read as facts, and the
+/// property matcher works by shape.
+struct PlayerProp {
+    id: u32,
+    range: RangeInclusive<u64>,
+}
+
+/// `PROP_PLAYER_LEVEL`. 1..=60 is the tracker's own range for an account's
+/// Adventure Rank, so nothing outside it could be stored anyway.
+const PROP_ADVENTURE_RANK: PlayerProp = PlayerProp {
+    id: 10013,
+    range: 1..=60,
+};
+/// `PROP_PLAYER_EXP`, EXP toward the next rank. The bound only rules out a
+/// misread (a timestamp, an id): a whole rank is far below it.
+const PROP_ADVENTURE_EXP: PlayerProp = PlayerProp {
+    id: 10014,
+    range: 0..=10_000_000,
+};
+/// `PROP_PLAYER_WORLD_LEVEL`. 0..=9 is the tracker's range; World Level 9 is
+/// real (a 7.1 account reports a limit of 9), Grasscutter's 0..=8 predates it.
+const PROP_WORLD_LEVEL: PlayerProp = PlayerProp {
+    id: 10019,
+    range: 0..=9,
+};
+/// `PROP_PLAYER_WORLD_LEVEL_LIMIT`, the highest World Level the account may
+/// choose.
+const PROP_WORLD_LEVEL_LIMIT: PlayerProp = PlayerProp {
+    id: 10039,
+    range: 0..=9,
+};
+/// `PROP_PLAYER_RESIN`, Original Resin: refills can take it past the natural
+/// cap, up to 2000.
+const PROP_RESIN: PlayerProp = PlayerProp {
+    id: 10020,
+    range: 0..=2_000,
+};
+/// `PROP_PLAYER_LEGENDARY_KEY`, Story Keys. Loose: only rules out a misread.
+const PROP_STORY_KEYS: PlayerProp = PlayerProp {
+    id: 10027,
+    range: 0..=1_000,
+};
+/// `PROP_MAX_STAMINA`, in the game's units (24000 is the 240 it shows). Loose,
+/// so a raised cap is not dropped; zero is not a stamina bar.
+const PROP_MAX_STAMINA: PlayerProp = PlayerProp {
+    id: 10010,
+    range: 1..=100_000,
+};
+
 /// Why, and how often, an export fell short of the captured data.
 ///
 /// The game data is baked into the binary at build time, so after a Genshin
@@ -300,6 +356,9 @@ pub struct PlayerData {
     properties: HashMap<u32, u64>,
 
     character_equip_guid_map: HashMap<u64, u32>,
+
+    /// The dump commit `game_data` was built from, for `gi_player.gameData`.
+    game_data_sha: Option<String>,
 }
 
 impl PlayerData {
@@ -311,7 +370,15 @@ impl PlayerData {
             items: HashMap::new(),
             properties: HashMap::new(),
             character_equip_guid_map: HashMap::new(),
+            game_data_sha: None,
         }
+    }
+
+    /// Name the dump commit `game_data` was built from, which exports then
+    /// report as `gi_player.gameData`.
+    pub fn with_game_data_sha(mut self, sha: Option<&str>) -> Self {
+        self.game_data_sha = sha.map(str::to_owned);
+        self
     }
 
     /// Forget everything captured about the account, keeping the game data.
@@ -440,6 +507,88 @@ impl PlayerData {
         Ok(ids)
     }
 
+    /// A captured player property, if it lies in the range a real one can.
+    ///
+    /// An out-of-range value is pushed onto `rejected` as `(id, value)`.
+    fn plausible_property(&self, prop: &PlayerProp, rejected: &mut Vec<(u32, u64)>) -> Option<u32> {
+        let value = *self.properties.get(&prop.id)?;
+        match u32::try_from(value) {
+            Ok(narrow) if prop.range.contains(&value) => Some(narrow),
+            _ => {
+                rejected.push((prop.id, value));
+                None
+            }
+        }
+    }
+
+    /// The account UID, read off the captured guids.
+    ///
+    /// The game mints every item and avatar guid as `(uid << 32) + counter`
+    /// (Grasscutter's `Player::getNextGuid`; auto-artifactarium's delete matcher
+    /// relies on the same scheme), so the top half of each guid is the UID.
+    /// Guids whose top half is zero carry none -- virtual items all use guid 0
+    /// -- and are skipped. Two guids that disagree mean the scheme does not hold
+    /// for this capture, and then no UID is claimed at all.
+    fn account_uid(&self) -> Option<u32> {
+        let item_guids = self.items.keys().map(|(_, guid)| *guid);
+        let avatar_guids = self.characters.values().map(|avatar| avatar.guid);
+
+        let mut uid = None;
+        for guid in item_guids.chain(avatar_guids) {
+            let Ok(top) = u32::try_from(guid >> 32) else {
+                continue;
+            };
+            if top == 0 {
+                continue;
+            }
+            match uid {
+                None => uid = Some(top),
+                Some(seen) if seen == top => {}
+                Some(seen) => {
+                    tracing::debug!(
+                        seen,
+                        other = top,
+                        "captured guids name two different UIDs; not reporting one"
+                    );
+                    return None;
+                }
+            }
+        }
+        uid
+    }
+
+    /// `gi_player` for the captured data, plus every property value that was
+    /// left out of it for failing its range check, as `(id, value)`.
+    fn checked_gi_player(&self) -> (Option<good::GiPlayer>, Vec<(u32, u64)>) {
+        let mut rejected = Vec::new();
+        let player = good::GiPlayer {
+            uid: self.account_uid(),
+            ar: self.plausible_property(&PROP_ADVENTURE_RANK, &mut rejected),
+            ar_exp: self.plausible_property(&PROP_ADVENTURE_EXP, &mut rejected),
+            wl: self.plausible_property(&PROP_WORLD_LEVEL, &mut rejected),
+            wl_limit: self.plausible_property(&PROP_WORLD_LEVEL_LIMIT, &mut rejected),
+            resin: self.plausible_property(&PROP_RESIN, &mut rejected),
+            story_keys: self.plausible_property(&PROP_STORY_KEYS, &mut rejected),
+            max_stamina: self.plausible_property(&PROP_MAX_STAMINA, &mut rejected),
+            game_data: None,
+        };
+        // Nothing about the account is known: say nothing, rather than send a
+        // key that only names the game data.
+        if player == good::GiPlayer::default() {
+            return (None, rejected);
+        }
+        let player = good::GiPlayer {
+            game_data: self.game_data_sha.clone(),
+            ..player
+        };
+        (Some(player), rejected)
+    }
+
+    /// What the captured data says about the account: `gi_player`.
+    pub fn gi_player(&self) -> Option<good::GiPlayer> {
+        self.checked_gi_player().0
+    }
+
     /// Build the GOOD export and report what had to be left out of it.
     ///
     /// Callers with a UI should surface [`ExportReport::summary`]: a snapshot
@@ -452,6 +601,39 @@ impl PlayerData {
         settings: &ExportSettings,
     ) -> Result<(String, ExportReport)> {
         let mut report = ExportReport::default();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let good = self.build_good(settings, &mut report, now_ms);
+
+        if report.has_degradations() {
+            tracing::debug!(
+                "export kept defaults for some fields: {}",
+                report.degraded_summary()
+            );
+        }
+
+        let json = serde_json::to_string(&good)?;
+        tracing::trace!("{json}");
+        Ok((json, report))
+    }
+
+    /// The export, stamped `now_ms` (epoch milliseconds).
+    fn build_good(
+        &self,
+        settings: &ExportSettings,
+        report: &mut ExportReport,
+        now_ms: u64,
+    ) -> good::Good {
+        let (gi_player, rejected) = self.checked_gi_player();
+        if !rejected.is_empty() {
+            tracing::warn!(
+                ?rejected,
+                "player properties outside their plausible range were left out of gi_player"
+            );
+        }
+        tracing::info!(?gi_player, "account values for this export");
 
         let mut good = good::Good {
             format: "GOOD".to_string(),
@@ -478,20 +660,16 @@ impl PlayerData {
                     None
                 }
             },
-            timestamp: Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64,
-            ),
+            timestamp: Some(now_ms),
+            gi_player,
         };
 
         if settings.include_characters {
-            good.characters = self.export_genshin_optimizer_characters(settings, &mut report);
+            good.characters = self.export_genshin_optimizer_characters(settings, report);
         }
 
         if settings.include_artifacts {
-            let artifacts = self.export_genshin_optimizer_artifacts(settings, &mut report);
+            let artifacts = self.export_genshin_optimizer_artifacts(settings, report);
             good.artifacts = if settings.fake_initialize_4th_line {
                 fake_uninitialized_4th_line(artifacts)
             } else {
@@ -500,23 +678,14 @@ impl PlayerData {
         }
 
         if settings.include_weapons {
-            good.weapons = self.export_genshin_optimizer_weapons(settings, &mut report);
+            good.weapons = self.export_genshin_optimizer_weapons(settings, report);
         }
 
         if settings.include_materials {
-            good.materials = self.export_genshin_optimizer_materials(&mut report);
+            good.materials = self.export_genshin_optimizer_materials(report);
         }
 
-        if report.has_degradations() {
-            tracing::debug!(
-                "export kept defaults for some fields: {}",
-                report.degraded_summary()
-            );
-        }
-
-        let json = serde_json::to_string(&good)?;
-        tracing::trace!("{json}");
-        Ok((json, report))
+        good
     }
 
     pub fn export_genshin_optimizer_characters(
@@ -1515,5 +1684,318 @@ mod tests {
 
         assert_eq!(data.remove_items(&[0]), 0);
         assert_eq!(data.items.len(), 2);
+    }
+
+    // -- gi_player ---------------------------------------------------------------
+
+    /// The property values of a real 7.1 login notify that `gi_player` and the
+    /// currency export read, as captured on 2026-10-04 (currencies changed).
+    fn login_properties() -> HashMap<u32, u64> {
+        HashMap::from([
+            (10010, 24_000),        // max stamina
+            (10011, 22_320),        // current stamina: not reported
+            (10013, 60),            // Adventure Rank
+            (10014, 0),             // AR EXP
+            (10015, 1_600),         // Primogems
+            (10016, 12_345_678),    // Mora
+            (10019, 8),             // World Level
+            (10020, 124),           // Original Resin
+            (10025, 0),             // Genesis Crystals
+            (10027, 3),             // Story Keys
+            (10039, 9),             // World Level limit
+            (10040, 1_790_953_954), // WL adjust cooldown: not reported
+            (10042, 2_400),         // Realm Currency
+        ])
+    }
+
+    /// `(uid << 32) + counter`, the way the game mints guids.
+    fn minted_guid(uid: u64, counter: u64) -> u64 {
+        (uid << 32) | counter
+    }
+
+    #[test]
+    fn gi_player_reads_the_login_property_snapshot() {
+        let mut data = player_data().with_game_data_sha(Some("792978e5"));
+        data.process_properties(&login_properties());
+        data.process_items(&[material_item(104003, minted_guid(813_152_114, 7), 12)]);
+
+        assert_eq!(
+            data.gi_player(),
+            Some(good::GiPlayer {
+                uid: Some(813_152_114),
+                ar: Some(60),
+                ar_exp: Some(0),
+                wl: Some(8),
+                wl_limit: Some(9),
+                resin: Some(124),
+                story_keys: Some(3),
+                max_stamina: Some(24_000),
+                game_data: Some("792978e5".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn the_currency_export_is_unchanged_by_gi_player() {
+        let mut data = player_data();
+        data.process_properties(&login_properties());
+
+        let mut report = ExportReport::default();
+        let materials = data.export_genshin_optimizer_materials(&mut report);
+
+        assert_eq!(
+            materials,
+            HashMap::from([
+                ("Primogem".to_string(), 1_600),
+                ("Mora".to_string(), 12_345_678),
+                ("OriginalResin".to_string(), 124),
+                ("GenesisCrystal".to_string(), 0),
+                ("RealmCurrency".to_string(), 2_400),
+            ])
+        );
+        assert!(report.is_empty());
+    }
+
+    #[test]
+    fn implausible_player_values_are_left_out() {
+        let mut data = player_data();
+        data.process_properties(&HashMap::from([
+            (10013, 61),            // AR above the tracker's 60
+            (10019, 10),            // WL above 9
+            (10039, 9),             // fine
+            (10020, 2_001),         // resin above the refill cap
+            (10027, 3),             // fine
+            (10010, 0),             // no stamina bar is empty
+            (10014, 1_790_953_954), // a timestamp where EXP should be
+        ]));
+
+        let (player, mut rejected) = data.checked_gi_player();
+        assert_eq!(
+            player,
+            Some(good::GiPlayer {
+                wl_limit: Some(9),
+                story_keys: Some(3),
+                ..Default::default()
+            })
+        );
+        rejected.sort_unstable();
+        assert_eq!(
+            rejected,
+            [
+                (10010, 0),
+                (10013, 61),
+                (10014, 1_790_953_954),
+                (10019, 10),
+                (10020, 2_001),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_range_edges_are_plausible() {
+        let mut data = player_data();
+        data.process_properties(&HashMap::from([(10013, 1), (10019, 0), (10020, 2_000)]));
+        let player = data.gi_player().expect("values were captured");
+        assert_eq!(player.ar, Some(1));
+        assert_eq!(player.wl, Some(0));
+        assert_eq!(player.resin, Some(2_000));
+    }
+
+    #[test]
+    fn nothing_known_about_the_account_means_no_gi_player() {
+        // Not even the game data is reported on its own.
+        let data = player_data().with_game_data_sha(Some("792978e5"));
+        assert_eq!(data.gi_player(), None);
+
+        // Guids too small to carry a UID, and no properties.
+        let mut data = player_data();
+        data.process_items(&[material_item(104003, 7, 12)]);
+        data.process_characters(&[avatar(10000046, &[])]);
+        assert_eq!(data.gi_player(), None);
+    }
+
+    #[test]
+    fn the_uid_comes_from_items_and_avatars_alike() {
+        let mut data = player_data();
+        let mut hu_tao = avatar(10000046, &[]);
+        hu_tao.guid = minted_guid(800_000_001, 2);
+        data.process_characters(&[hu_tao]);
+        assert_eq!(data.account_uid(), Some(800_000_001));
+
+        // Virtual items carry guid 0 and say nothing either way.
+        data.process_items(&[
+            material_item(201, 0, 1_600),
+            material_item(104003, minted_guid(800_000_001, 9), 3),
+        ]);
+        assert_eq!(data.account_uid(), Some(800_000_001));
+    }
+
+    #[test]
+    fn guids_that_disagree_claim_no_uid() {
+        let mut data = player_data();
+        data.process_items(&[
+            material_item(104003, minted_guid(800_000_001, 1), 3),
+            material_item(104004, minted_guid(800_000_002, 2), 3),
+        ]);
+        assert_eq!(data.account_uid(), None);
+        assert_eq!(data.gi_player(), None);
+    }
+
+    #[test]
+    fn reset_forgets_the_account_but_not_the_game_data() {
+        let mut data = player_data().with_game_data_sha(Some("792978e5"));
+        data.process_properties(&login_properties());
+        data.reset();
+        assert_eq!(data.gi_player(), None);
+
+        data.process_properties(&HashMap::from([(10013, 45)]));
+        assert_eq!(
+            data.gi_player().and_then(|player| player.game_data),
+            Some("792978e5".to_string())
+        );
+    }
+
+    // -- the GOOD part stays byte-identical ----------------------------------------
+
+    const GOLDEN_UID: u64 = 800_123_456;
+    const GOLDEN_TIMESTAMP_MS: u64 = 1_756_000_000_000;
+
+    /// One of everything GOOD carries -- a character, an artifact and a weapon
+    /// on them, one material, one achievement -- and, with `extras`, everything
+    /// Irminsul adds beside GOOD. The two differ in nothing GOOD can see.
+    fn golden_player_data(extras: bool) -> PlayerData {
+        let game_data = TestGameData {
+            affix_map: r#""501204": {"property": "CritRate", "value": 3.89},
+                          "501234": {"property": "CritDamage", "value": 7.77}"#,
+            artifact_map: r#""81524": {"set": "Crimson Witch of Flames", "slot": "Flower", "rarity": 5}"#,
+            character_map: r#""10000046": "Hu Tao""#,
+            material_map: r#""104003": "Hero's Wit""#,
+            property_map: r#""10001": "Hp""#,
+            skill_type_map: r#""10461": "Auto", "10462": "Skill", "10465": "Burst""#,
+            weapon_map: r#""13501": {"name": "Staff of Homa", "rarity": 5}"#,
+            ..Default::default()
+        };
+        let mut data = PlayerData::new(game_data.build())
+            .with_game_data_sha(Some("792978e5503ecfba73dcb3562ed44a0d35a2abe2"));
+
+        // Guids only carry a UID with the extras; GOOD never shows a guid.
+        let guid = |counter: u64| {
+            if extras {
+                minted_guid(GOLDEN_UID, counter)
+            } else {
+                counter
+            }
+        };
+
+        let mut weapon = Item::new();
+        weapon.item_id = 13501;
+        weapon.guid = guid(1);
+        let mut equip = auto_artifactarium::r#gen::protos::Equip::new();
+        equip.is_locked = true;
+        let mut homa = auto_artifactarium::r#gen::protos::Weapon::new();
+        homa.level = 90;
+        homa.promote_level = 6;
+        homa.affix_map.insert(113501, 0);
+        equip.set_weapon(homa);
+        weapon.set_equip(equip);
+
+        let mut artifact = Item::new();
+        artifact.item_id = 81524;
+        artifact.guid = guid(2);
+        let mut equip = auto_artifactarium::r#gen::protos::Equip::new();
+        equip.is_locked = true;
+        let mut reliquary = auto_artifactarium::r#gen::protos::Reliquary::new();
+        reliquary.level = 21;
+        reliquary.main_prop_id = 10001;
+        reliquary.append_prop_id_list = vec![501204, 501234, 501204];
+        equip.set_reliquary(reliquary);
+        artifact.set_equip(equip);
+
+        data.process_items(&[weapon, artifact, material_item(104003, guid(3), 12)]);
+
+        let mut hu_tao = character(10000046, &[(10461, 10), (10462, 9), (10465, 8)]);
+        hu_tao.guid = guid(4);
+        hu_tao.equip_guid_list = vec![guid(1), guid(2)];
+        data.process_characters(&[hu_tao]);
+
+        data.process_achievements(&[Achievement {
+            id: 80014,
+            status: 3,
+            finish_timestamp: None,
+        }]);
+
+        if extras {
+            // Everything but the currencies, which GOOD exports as materials.
+            data.process_properties(&HashMap::from([
+                (10010, 24_000),
+                (10013, 60),
+                (10014, 0),
+                (10019, 8),
+                (10027, 3),
+                (10039, 9),
+            ]));
+        }
+        data
+    }
+
+    fn golden_json(data: &PlayerData) -> String {
+        let mut report = ExportReport::default();
+        let good = data.build_good(&settings(), &mut report, GOLDEN_TIMESTAMP_MS);
+        assert!(report.is_empty(), "{}", report.summary());
+        serde_json::to_string(&good).unwrap()
+    }
+
+    /// The GOOD part of an export, byte for byte. A change here is a change to
+    /// what Genshin Optimizer, the old backend and the tracker all read.
+    const GOLDEN_GOOD: &str = concat!(
+        r#"{"format":"GOOD","version":3,"source":"Irminsul","#,
+        r#""characters":[{"key":"HuTao","level":90,"constellation":0,"ascension":6,"#,
+        r#""talent":{"auto":10,"skill":9,"burst":8}}],"#,
+        r#""artifacts":[{"setKey":"CrimsonWitchOfFlames","slotKey":"flower","level":20,"#,
+        r#""rarity":5,"mainStatKey":"hp","location":"HuTao","lock":true,"#,
+        r#""substats":[{"key":"critRate_","value":7.8,"initialValue":3.9},"#,
+        r#"{"key":"critDMG_","value":7.8,"initialValue":7.8}],"#,
+        r#""totalRolls":3,"astralMark":false,"elixerCrafted":false,"unactivatedSubstats":[]}],"#,
+        r#""weapons":[{"key":"StaffOfHoma","level":90,"ascension":6,"refinement":1,"#,
+        r#""location":"HuTao","lock":true}],"#,
+        r#""materials":{"HerosWit":12},"gi_achievements":[80014],"timestamp":1756000000000}"#,
+    );
+
+    /// What the extras append after the last GOOD field.
+    const GOLDEN_EXTRAS: &str = concat!(
+        r#","gi_player":{"uid":800123456,"ar":60,"arExp":0,"wl":8,"wlLimit":9,"#,
+        r#""storyKeys":3,"maxStamina":24000,"#,
+        r#""gameData":"792978e5503ecfba73dcb3562ed44a0d35a2abe2"}}"#,
+    );
+
+    #[test]
+    fn the_good_part_of_an_export_is_byte_identical_with_and_without_the_extras() {
+        let without = golden_json(&golden_player_data(false));
+        assert_eq!(without, GOLDEN_GOOD);
+
+        let with = golden_json(&golden_player_data(true));
+        let good_part = GOLDEN_GOOD.strip_suffix('}').unwrap();
+        assert_eq!(with, format!("{good_part}{GOLDEN_EXTRAS}"));
+    }
+
+    #[test]
+    fn dropping_the_extras_from_an_export_leaves_exactly_its_good_part() {
+        // A full login, currencies included, so `materials` has several
+        // entries: hash order is only stable within one map, so this compares
+        // one export against itself with the extras taken off.
+        let mut data = golden_player_data(true);
+        data.process_properties(&login_properties());
+
+        let mut report = ExportReport::default();
+        let mut good = data.build_good(&settings(), &mut report, GOLDEN_TIMESTAMP_MS);
+        assert!(good.gi_player.is_some());
+        let with = serde_json::to_string(&good).unwrap();
+
+        good.gi_player = None;
+        let without = serde_json::to_string(&good).unwrap();
+
+        let good_part = without.strip_suffix('}').unwrap();
+        assert!(with.starts_with(good_part), "{with}\n{without}");
+        assert!(with[good_part.len()..].starts_with(r#","gi_player":"#));
     }
 }

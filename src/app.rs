@@ -38,6 +38,7 @@ use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::game_watch::{GameStatus, MissedLaunch, Severity};
+use crate::good::GiPlayer;
 use crate::monitor::Monitor;
 use crate::player_data::ExportSettings;
 use crate::update::{InstallLock, UpdateAnswer, check_for_app_update};
@@ -355,6 +356,52 @@ fn missing_export_data_toast(missing: &[&'static str]) -> String {
         "No {} captured yet. Log in to the game with the account you want to export.",
         missing.join(" or ")
     )
+}
+
+/// The data panel's account line, e.g. `AR 60 · WL 8 · Resin 124 at login`.
+///
+/// `None` when none of the three was captured. "At login" because that is
+/// when the game sends them: nothing here follows play, and resin in
+/// particular keeps regenerating after the snapshot.
+fn player_summary(player: &GiPlayer) -> Option<String> {
+    let parts: Vec<String> = [
+        player.ar.map(|ar| format!("AR {ar}")),
+        player.wl.map(|wl| format!("WL {wl}")),
+        player.resin.map(|resin| format!("Resin {resin}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| format!("{} at login", parts.join(" · ")))
+}
+
+/// The tooltip on [`player_summary`]'s line: the caveat, then the rest of what
+/// `gi_player` holds.
+fn player_details(player: &GiPlayer) -> String {
+    let facts: Vec<String> = [
+        player.uid.map(|uid| format!("UID {uid}")),
+        player.ar_exp.map(|exp| format!("AR EXP {exp}")),
+        player
+            .wl_limit
+            .map(|limit| format!("World Level limit {limit}")),
+        player.story_keys.map(|keys| format!("Story Keys {keys}")),
+        // The game counts stamina in hundredths.
+        player
+            .max_stamina
+            .map(|stamina| format!("Max stamina {}", stamina / 100)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    let mut details = "A snapshot from login: the game sends these when you enter the world and \
+                       Irminsul does not follow them while you play (resin keeps regenerating)."
+        .to_string();
+    if !facts.is_empty() {
+        details.push_str("\n\n");
+        details.push_str(&facts.join("\n"));
+    }
+    details
 }
 
 pub struct IrminsulApp {
@@ -1490,6 +1537,13 @@ impl IrminsulApp {
                 Self::data_state(ui, "Characters", app_state.updated.characters_updated);
                 Self::data_state(ui, "Achievements", app_state.updated.achievements_updated);
             });
+
+        if let Some(player) = &app_state.player
+            && let Some(summary) = player_summary(player)
+        {
+            ui.label(RichText::new(summary).color(Color32::GRAY))
+                .on_hover_text(player_details(player));
+        }
 
         ui.add_space(4.0);
 
@@ -2890,5 +2944,56 @@ mod tests {
             None
         );
         assert_eq!(tracker_error_status("HTTP - no status"), None);
+    }
+
+    fn login_player() -> GiPlayer {
+        GiPlayer {
+            uid: Some(813_152_114),
+            ar: Some(60),
+            ar_exp: Some(0),
+            wl: Some(8),
+            wl_limit: Some(9),
+            resin: Some(124),
+            story_keys: Some(3),
+            max_stamina: Some(24_000),
+            game_data: Some("792978e5".to_string()),
+        }
+    }
+
+    #[test]
+    fn the_account_line_says_its_values_are_from_login() {
+        assert_eq!(
+            player_summary(&login_player()).as_deref(),
+            Some("AR 60 · WL 8 · Resin 124 at login")
+        );
+
+        // Only what was captured.
+        let partial = GiPlayer {
+            ar: Some(45),
+            ..Default::default()
+        };
+        assert_eq!(player_summary(&partial).as_deref(), Some("AR 45 at login"));
+
+        // A UID alone is no line.
+        let uid_only = GiPlayer {
+            uid: Some(813_152_114),
+            ..Default::default()
+        };
+        assert_eq!(player_summary(&uid_only), None);
+    }
+
+    #[test]
+    fn the_account_tooltip_carries_the_caveat_and_the_rest() {
+        let details = player_details(&login_player());
+        assert!(details.starts_with("A snapshot from login"), "{details}");
+        for fact in [
+            "UID 813152114",
+            "AR EXP 0",
+            "World Level limit 9",
+            "Story Keys 3",
+            "Max stamina 240",
+        ] {
+            assert!(details.contains(fact), "{fact} missing from {details}");
+        }
     }
 }
