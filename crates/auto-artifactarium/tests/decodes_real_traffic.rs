@@ -259,12 +259,12 @@ fn an_avatar_capture_decodes_into_a_roster() {
 #[test]
 fn a_property_capture_decodes_into_properties() {
     let mut notify = PlayerPropertyNotify::new();
-    notify.prop_map1.insert(10015, prop(10015, 60)); // world level
-    notify.prop_map1.insert(10016, prop(10016, 0)); // a zero: still a value
-    notify.prop_map1.insert(1002, prop(1002, 160)); // resin
-    notify.prop_map1.insert(1022, prop(1022, 1022)); // value == its own id
-    notify.prop_map1.insert(1004, prop(1004, 9_999_999_999)); // Mora, capped
-    notify.prop_map1.insert(1005, prop(1005, 2_400_000));
+    notify.prop_map1.insert(10013, prop(10013, 60)); // adventure rank
+    notify.prop_map1.insert(10025, prop(10025, 0)); // a zero: still a value
+    notify.prop_map1.insert(10020, prop(10020, 160)); // resin
+    notify.prop_map1.insert(10042, prop(10042, 10042)); // value == its own id
+    notify.prop_map1.insert(10016, prop(10016, 9_999_999_999)); // Mora, capped
+    notify.prop_map1.insert(10015, prop(10015, 2_400)); // primogems
 
     let payload = notify.write_to_bytes().unwrap();
     let mut capture = Capture::new();
@@ -273,17 +273,17 @@ fn a_property_capture_decodes_into_properties() {
     let properties =
         matches_player_property_packet(&command).expect("a six-property notify must be recognised");
     assert_eq!(properties.len(), 6);
-    assert_eq!(properties[&10015], 60);
+    assert_eq!(properties[&10013], 60);
     assert_eq!(
-        properties[&10016], 0,
+        properties[&10025], 0,
         "a property worth zero is still a property"
     );
     assert_eq!(
-        properties[&1022], 1022,
+        properties[&10042], 10042,
         "a value equal to its own id survives"
     );
     assert_eq!(
-        properties[&1004], 9_999_999_999,
+        properties[&10016], 9_999_999_999,
         "Mora at its cap does not fit in u32 and must not be truncated"
     );
 }
@@ -348,7 +348,7 @@ fn a_sequence_of_commands_over_one_connection_all_decode() {
     let roster_bytes = roster.write_to_bytes().unwrap();
 
     let mut props = PlayerPropertyNotify::new();
-    for id in [10015u32, 1002, 1004, 1005, 1006] {
+    for id in [10013u32, 10015, 10016, 10019, 10020] {
         props.prop_map1.insert(id, prop(id, i64::from(id) * 2));
     }
     let props_bytes = props.write_to_bytes().unwrap();

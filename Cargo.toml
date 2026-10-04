@@ -130,6 +130,11 @@ anime-game-data = { workspace = true }
 flate2 = { workspace = true }
 tokio = { workspace = true }
 
+# Read the dump commit back out of the game data blob (see build.rs). Both are
+# already in the graph at these versions as anime-game-data's and irminsul's
+# own dependencies.
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
 winresource = "0.1.23"
 
 [features]

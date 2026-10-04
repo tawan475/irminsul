@@ -116,8 +116,11 @@ impl AppStateManager {
         let _ = self.state_tx.send(self.app_state.clone());
     }
 
-    pub fn update_timestamps(&mut self, updated: DataUpdated) {
+    /// Publish what the captured data now holds: when each class last arrived,
+    /// and what it says about the account.
+    pub fn update_captured(&mut self, updated: DataUpdated, player: Option<crate::good::GiPlayer>) {
         self.app_state.updated = updated;
+        self.app_state.player = player;
         let _ = self.state_tx.send(self.app_state.clone());
     }
 
@@ -149,6 +152,19 @@ impl AppStateManager {
 /// Both upload paths run the same request; only the reporting differs, and
 /// keeping them in one function is what stops them drifting apart again (the
 /// repo's own `CLAUDE.md` calls the duplication out).
+/// Whether a capture from `source` may export automatically or upload.
+///
+/// Not when replaying a recording (`-r`): its data is old, and uploading it
+/// would file a stale snapshot under today's capture. `--replay-export` is the
+/// supported way to inspect a recording; it never reaches this code at all.
+fn uploads_allowed(source: &CaptureSource) -> bool {
+    !matches!(source, CaptureSource::File(_))
+}
+
+/// What `spawn_tracker_upload` answers instead of uploading during a replay.
+const REPLAY_UPLOAD_REFUSED: &str =
+    "Uploads are off while replaying a recording (-r); use --replay-export to inspect one";
+
 enum UploadReport {
     /// Answer the UI's oneshot. `app.rs` turns it into a toast and drops the
     /// verified state when it recognises a 401/403.
@@ -190,7 +206,8 @@ struct SnifferThread {
 ///
 /// The [`GameSniffer`] itself never crosses the channel, so its session state
 /// has to be reported alongside the packets rather than queried by the monitor.
-enum SnifferEvent {
+/// `replay.rs` consumes the same events, from the same [`decode_one_packet`].
+pub(crate) enum SnifferEvent {
     /// auto-artifactarium concluded that the game connection restarted. Always
     /// sent *before* the packet that concluded it.
     SessionReset,
@@ -201,11 +218,11 @@ enum SnifferEvent {
 /// The sniffer's key situation, reported with every packet because the
 /// [`GameSniffer`] itself never leaves its thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct KeyReport {
+pub(crate) struct KeyReport {
     /// Only [`KeyState::Session`] means commands are the account's data.
-    state: KeyState,
+    pub(crate) state: KeyState,
     /// The search for the current connection's session key gave up.
-    recovery_failed: bool,
+    pub(crate) recovery_failed: bool,
 }
 
 impl KeyReport {
@@ -227,13 +244,13 @@ impl KeyReport {
 /// own, which replaces it then. An account switch therefore still replaces
 /// the data, just at the moment the new account's arrives.
 #[derive(Debug, Default)]
-struct DataReplacement {
+pub(crate) struct DataReplacement {
     pending: bool,
 }
 
 /// What to do with one classified command.
 #[derive(Debug, PartialEq, Eq)]
-enum DataVerdict {
+pub(crate) enum DataVerdict {
     /// Fold it into the captured data, as always.
     Apply,
     /// First data of a new connection: drop the old connection's, then apply.
@@ -246,7 +263,7 @@ enum DataVerdict {
 impl DataReplacement {
     /// A new connection began. Returns whether that is news: the copies of
     /// one handshake, or resets before any data arrived, collapse into one.
-    fn connection_reset(&mut self) -> bool {
+    pub(crate) fn connection_reset(&mut self) -> bool {
         !std::mem::replace(&mut self.pending, true)
     }
 
@@ -268,6 +285,128 @@ impl DataReplacement {
         }
         DataVerdict::Hold
     }
+
+    /// [`verdict`](Self::verdict) for one decoded batch: it may replace the
+    /// old snapshot when anything in it is real account data, which a delete
+    /// notify on its own is not (its shape is too common).
+    pub(crate) fn verdict_for_batch(
+        &mut self,
+        key: KeyState,
+        classified: &[(u16, CommandMatch)],
+    ) -> DataVerdict {
+        let replaces = classified
+            .iter()
+            .any(|(_, found)| !matches!(found, CommandMatch::DeletedItems(_)));
+        self.verdict(key, replaces)
+    }
+}
+
+/// Which classes of captured data one batch of commands changed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AppliedData {
+    /// The inventory: an item notify, or a delete notify that removed
+    /// something actually held.
+    pub(crate) items: bool,
+    pub(crate) characters: bool,
+    pub(crate) achievements: bool,
+    /// Player properties. They stamp no timestamp of their own (see
+    /// [`Monitor::handle_game_packet`]) but are still new data.
+    pub(crate) properties: bool,
+}
+
+impl AppliedData {
+    pub(crate) fn any(&self) -> bool {
+        self.items || self.characters || self.achievements || self.properties
+    }
+
+    /// Everything either side changed.
+    pub(crate) fn union(self, other: Self) -> Self {
+        Self {
+            items: self.items || other.items,
+            characters: self.characters || other.characters,
+            achievements: self.achievements || other.achievements,
+            properties: self.properties || other.properties,
+        }
+    }
+}
+
+/// Run the command matchers over a decoded batch, keeping what they claimed.
+///
+/// One classification pass instead of an `else if` chain of matchers: the
+/// chain could not notice that two of them claimed the same command, which is
+/// exactly how a shape collision turns into silently missing data.
+pub(crate) fn classify_commands(commands: &[GameCommand]) -> Vec<(u16, CommandMatch)> {
+    commands
+        .iter()
+        .filter_map(|command| {
+            let _span = tracing::info_span!("command", id = command.command_id).entered();
+            classify_command(command).map(|found| (command.command_id, found))
+        })
+        .collect()
+}
+
+/// Fold classified commands into the captured data.
+///
+/// The one place a decoded command changes [`PlayerData`]: the live monitor
+/// and `--replay-export` both apply commands through here, so a replay builds
+/// exactly the state the app would have.
+pub(crate) fn apply_commands(
+    player_data: &mut PlayerData,
+    classified: Vec<(u16, CommandMatch)>,
+) -> AppliedData {
+    let mut applied = AppliedData::default();
+    for (command_id, found) in classified {
+        let _span = tracing::info_span!("command", id = command_id).entered();
+        match found {
+            CommandMatch::Items(items) => {
+                tracing::info!("Found item packet with {} items", items.len());
+                player_data.process_items(&items);
+                applied.items = true;
+            }
+            CommandMatch::Properties(properties) => {
+                tracing::info!("Found properties packet: {:?}", properties);
+                player_data.process_properties(&properties);
+                applied.properties = true;
+            }
+            CommandMatch::Avatars(avatars) => {
+                tracing::info!("Found avatar packet with {} avatars", avatars.len());
+                player_data.process_characters(&avatars);
+                applied.characters = true;
+            }
+            CommandMatch::Achievements(achievements) => {
+                tracing::info!(
+                    "Found achievement packet with {} achievements",
+                    achievements.len()
+                );
+                player_data.process_achievements(&achievements);
+                applied.achievements = true;
+            }
+            CommandMatch::DeletedItems(guids) => {
+                // The matcher reports candidates -- its shape is shared with
+                // a couple of dozen other messages -- so the inventory
+                // intersection is the real test. Removing nothing means this
+                // was one of those others, and must not count as an inventory
+                // change: that would tell the UI and the automation gate the
+                // inventory just changed.
+                let removed = player_data.remove_items(&guids);
+                if removed > 0 {
+                    tracing::info!(
+                        "Item delete packet removed {removed} of {} guids",
+                        guids.len()
+                    );
+                    applied.items = true;
+                } else {
+                    tracing::debug!(
+                        "Item delete packet held none of the captured inventory ({} guids)",
+                        guids.len()
+                    );
+                }
+            }
+            // `CommandMatch` is non-exhaustive.
+            _ => {}
+        }
+    }
+    applied
 }
 
 /// How often the sniffer thread logs what it has been doing.
@@ -280,7 +419,7 @@ const STATS_INTERVAL: Duration = Duration::from_secs(60);
 /// the key was missing, or which conversation each direction was stuck on.
 /// This is that line.
 #[derive(Debug, Default)]
-struct SnifferStats {
+pub(crate) struct SnifferStats {
     /// Frames this interval.
     frames: u64,
     /// Frames the interval before, so going quiet is reported once.
@@ -435,7 +574,7 @@ fn spawn_sniffer_thread(
 /// going dead). Latching on the raw event instead handed anyone a one-packet
 /// "erase this user's capture" button, one layer above the library check that
 /// exists to prevent exactly that.
-fn decode_one_packet(
+pub(crate) fn decode_one_packet(
     sniffer: &mut GameSniffer,
     last_generation: &mut u64,
     packet: Vec<u8>,
@@ -698,7 +837,7 @@ impl Monitor {
     ) -> Result<Self> {
         let mut app_state = AppStateManager::new(state_tx.borrow().clone(), state_tx.clone());
         let game_data = get_database(&mut app_state, &mut ui_message_rx).await?;
-        let player_data = PlayerData::new(game_data);
+        let player_data = PlayerData::new(game_data).with_game_data_sha(embedded_game_data_sha());
         let keys = load_keys()?;
         let sniffer = GameSniffer::new().set_initial_keys(keys);
         let (packet_tx, packet_rx) = mpsc::unbounded_channel();
@@ -1242,34 +1381,25 @@ impl Monitor {
         }
 
         let log_packets = *self.log_packet_rx.borrow_and_update();
+        if log_packets {
+            for command in &commands {
+                let _span = tracing::info_span!("command", id = command.command_id).entered();
+                if let Err(e) = self.packet_log.append(command) {
+                    tracing::info!("error logging command {e}");
+                }
+            }
+        }
 
         // Classify the whole batch first: whether it replaces the previous
         // connection's data has to be settled before its timestamps are taken,
         // because replacing restarts the automation cycle they are compared
         // against.
-        let mut classified = Vec::with_capacity(commands.len());
-        for command in commands {
-            let _span = tracing::info_span!("command", id = command.command_id).entered();
-            if log_packets && let Err(e) = self.packet_log.append(&command) {
-                tracing::info!("error logging command {e}");
-            }
-
-            // One classification pass instead of an `else if` chain of matchers:
-            // the chain could not notice that two of them claimed the same
-            // command, which is exactly how a shape collision turns into
-            // silently missing data.
-            if let Some(found) = classify_command(&command) {
-                classified.push((command.command_id, found));
-            }
-        }
+        let classified = classify_commands(&commands);
         if classified.is_empty() {
             return;
         }
 
-        let replaces = classified
-            .iter()
-            .any(|(_, found)| !matches!(found, CommandMatch::DeletedItems(_)));
-        match self.data_replacement.verdict(key, replaces) {
+        match self.data_replacement.verdict_for_batch(key, &classified) {
             DataVerdict::Apply => {}
             DataVerdict::ReplaceThenApply => {
                 self.replace_captured_data("the new game connection delivered data");
@@ -1284,76 +1414,32 @@ impl Monitor {
             }
         }
 
+        let applied = apply_commands(&mut self.player_data, classified);
+        if !applied.any() {
+            return;
+        }
+
         let mut updated = self.app_state.app_state.updated.clone();
-        let mut has_new_data = false;
         let now = instant_after(self.automation_cycle_started_at);
-
-        for (command_id, found) in classified {
-            let _span = tracing::info_span!("command", id = command_id).entered();
-            match found {
-                CommandMatch::Items(items) => {
-                    tracing::info!("Found item packet with {} items", items.len());
-                    self.player_data.process_items(&items);
-                    updated.items_updated = Some(now);
-                    has_new_data = true;
-                }
-                CommandMatch::Properties(properties) => {
-                    tracing::info!("Found properties packet: {:?}", properties);
-                    self.player_data.process_properties(&properties);
-                    // Deliberately stamps no timestamp: a property packet used
-                    // to set `items_updated`, so the UI's "Items" tick and the
-                    // export/upload readiness gate could both be green with not
-                    // one item ever parsed.
-                    has_new_data = true;
-                }
-                CommandMatch::Avatars(avatars) => {
-                    tracing::info!("Found avatar packet with {} avatars", avatars.len());
-                    self.player_data.process_characters(&avatars);
-                    updated.characters_updated = Some(now);
-                    has_new_data = true;
-                }
-                CommandMatch::Achievements(achievements) => {
-                    tracing::info!(
-                        "Found achievement packet with {} achievements",
-                        achievements.len()
-                    );
-                    self.player_data.process_achievements(&achievements);
-                    updated.achievements_updated = Some(now);
-                    updated.achievements_updated_time = Some(chrono::Local::now());
-                    has_new_data = true;
-                }
-                CommandMatch::DeletedItems(guids) => {
-                    // The matcher reports candidates -- its shape is shared with
-                    // a couple of dozen other messages -- so the inventory
-                    // intersection is the real test. Removing nothing means this
-                    // was one of those others, and must not stamp a timestamp
-                    // that tells the UI and the automation gate the inventory
-                    // just changed.
-                    let removed = self.player_data.remove_items(&guids);
-                    if removed > 0 {
-                        tracing::info!(
-                            "Item delete packet removed {removed} of {} guids",
-                            guids.len()
-                        );
-                        updated.items_updated = Some(now);
-                        has_new_data = true;
-                    } else {
-                        tracing::debug!(
-                            "Item delete packet held none of the captured inventory ({} guids)",
-                            guids.len()
-                        );
-                    }
-                }
-                // `CommandMatch` is non-exhaustive.
-                _ => {}
-            }
+        if applied.items {
+            updated.items_updated = Some(now);
         }
-
-        if has_new_data {
-            self.capture_timestamp_ms = Some(Local::now().timestamp_millis());
-            self.app_state.update_timestamps(updated);
-            self.check_automation_trigger();
+        if applied.characters {
+            updated.characters_updated = Some(now);
         }
+        if applied.achievements {
+            updated.achievements_updated = Some(now);
+            updated.achievements_updated_time = Some(chrono::Local::now());
+        }
+        // Properties deliberately stamp no timestamp: a property packet used
+        // to set `items_updated`, so the UI's "Items" tick and the
+        // export/upload readiness gate could both be green with not one item
+        // ever parsed. They are still new data, though.
+
+        self.capture_timestamp_ms = Some(Local::now().timestamp_millis());
+        let player = self.player_data.gi_player();
+        self.app_state.update_captured(updated, player);
+        self.check_automation_trigger();
     }
 
     /// Log a connection event. Deliberately does not touch captured data.
@@ -1396,7 +1482,7 @@ impl Monitor {
     fn replace_captured_data(&mut self, reason: &str) {
         tracing::info!(reason, "clearing captured data");
         self.player_data.reset();
-        self.app_state.update_timestamps(DataUpdated::new());
+        self.app_state.update_captured(DataUpdated::new(), None);
         self.capture_timestamp_ms = None;
         // Without these the signature check can suppress the first export after
         // an account switch, because it still matches the previous account's.
@@ -1422,6 +1508,9 @@ impl Monitor {
     }
 
     fn check_automation_trigger(&mut self) {
+        if !uploads_allowed(&self.capture_source) {
+            return;
+        }
         let saved_state = self.saved_state_rx.borrow().clone();
         let want_file = saved_state.save_result_to_file;
         // The same predicate the manual upload button uses. This used to omit
@@ -1590,9 +1679,15 @@ impl Monitor {
         let ctx = self.ctx.clone();
         let toast_tx = self.toast_tx.clone();
         let captured_at = self.capture_timestamp_ms;
+        let allowed = uploads_allowed(&self.capture_source);
 
         tokio::spawn(async move {
-            let result = upload_to_tracker(&client, &url, &key, json, captured_at).await;
+            let result = if allowed {
+                upload_to_tracker(&client, &url, &key, json, captured_at).await
+            } else {
+                tracing::warn!("{REPLAY_UPLOAD_REFUSED}");
+                Err(REPLAY_UPLOAD_REFUSED.to_string())
+            };
             match report {
                 UploadReport::Reply(reply_tx) => {
                     let _ = reply_tx.send(result);
@@ -1814,12 +1909,29 @@ async fn get_database(
     _ui_message_rx: &mut mpsc::UnboundedReceiver<Message>,
 ) -> Result<AnimeGameData> {
     app_state.update_app_state(State::CheckingForData);
+    load_game_data()
+}
 
+/// The game data `build.rs` embedded in this binary.
+pub(crate) fn load_game_data() -> Result<AnimeGameData> {
     static DATABASE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/game_data.gz"));
     let reader = GzDecoder::new(DATABASE);
     let db = anime_game_data::AnimeGameData::new_from_reader(reader)?;
+    tracing::info!(
+        dump = embedded_game_data_sha().unwrap_or("unknown"),
+        "loaded the embedded game data"
+    );
 
     Ok(db)
+}
+
+/// The Dimbreath dump commit the embedded game data was built from.
+///
+/// `build.rs` reads it back out of the `game_data.gz` it embeds; `None` when it
+/// could not. A binary built before a game patch carries an older dump, and
+/// this is what says so next to the `unknown_*` gaps in its exports.
+pub fn embedded_game_data_sha() -> Option<&'static str> {
+    Some(env!("IRMINSUL_GAME_DATA_SHA")).filter(|sha| !sha.is_empty())
 }
 
 async fn capture_task(
@@ -1871,7 +1983,7 @@ async fn capture_task(
     Ok(())
 }
 
-fn load_keys() -> Result<HashMap<u16, Vec<u8>>> {
+pub(crate) fn load_keys() -> Result<HashMap<u16, Vec<u8>>> {
     let keys: HashMap<u16, String> = serde_json::from_slice(include_bytes!("../keys/gi.json"))?;
 
     keys.iter()
@@ -1880,8 +1992,19 @@ fn load_keys() -> Result<HashMap<u16, Vec<u8>>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn a_replayed_recording_never_uploads_or_auto_exports() {
+        assert!(!uploads_allowed(&CaptureSource::File(PathBuf::from(
+            "old.pcapng"
+        ))));
+        assert!(uploads_allowed(&CaptureSource::Device(None)));
+        assert!(uploads_allowed(&CaptureSource::Device(Some(
+            PathBuf::from("rec.pcap")
+        ))));
+    }
 
     #[test]
     fn verify_reads_the_hosted_trackers_answer_and_its_dashboard_link() {
@@ -1931,6 +2054,19 @@ mod tests {
                 .as_deref(),
             Some("http://localhost:5173/app/a/1")
         );
+    }
+
+    #[test]
+    fn the_embedded_game_data_names_its_dump_commit() {
+        // `build.rs` only emits something that looks like a commit, or nothing.
+        if let Some(sha) = embedded_game_data_sha() {
+            assert!((7..=64).contains(&sha.len()), "{sha}");
+            assert!(
+                sha.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "{sha}"
+            );
+        }
     }
 
     #[test]
@@ -2000,7 +2136,7 @@ mod tests {
     /// Both checksums are left zero: `SlicedPacket::from_ethernet`, which is
     /// what auto-artifactarium parses with, does not verify them, and a zero UDP
     /// checksum means "not computed" over IPv4 anyway.
-    fn udp_frame(src_port: u16, dest_port: u16, payload: &[u8]) -> Vec<u8> {
+    pub(crate) fn udp_frame(src_port: u16, dest_port: u16, payload: &[u8]) -> Vec<u8> {
         let udp_len = (8 + payload.len()) as u16;
         let total_len = 20 + udp_len;
 
@@ -2037,13 +2173,13 @@ mod tests {
         udp_frame(50000, 22102, &payload)
     }
 
-    fn handshake_frame() -> Vec<u8> {
+    pub(crate) fn handshake_frame() -> Vec<u8> {
         connection_frame(0xFF)
     }
 
     /// One segment in the game's KCP framing: `conv(4) extra(4) cmd(1) frg(1)
     /// wnd(2) ts(4) sn(4) una(4) len(4) extra(4) content`.
-    fn segment_frame(conv: u32, content: &[u8]) -> Vec<u8> {
+    pub(crate) fn segment_frame(conv: u32, content: &[u8]) -> Vec<u8> {
         let mut segment = Vec::new();
         segment.extend_from_slice(&conv.to_le_bytes());
         segment.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes());

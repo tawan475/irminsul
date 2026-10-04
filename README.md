@@ -15,6 +15,8 @@ Irminsul utilizes packet capture instead of the common optical character recogni
 
 To use the `pcap` capture backend, make sure to install a Pcap library (Npcap/WinPcap on Windows, libpcap on Linux). The released Linux binary has libpcap linked into it, so this only applies there when building Irminsul yourself.
 
+On Windows a build with `--features pcap` links `wpcap.dll` at load time, and Npcap (unless installed in WinPcap-compatible mode) puts it in `C:\Windows\System32\Npcap`, which is not on the DLL search path. Such a build then fails to start with "wpcap.dll was not found"; put that directory on `PATH` first (Git Bash: `PATH="/c/Windows/System32/Npcap:$PATH" ./irminsul.exe ...`).
+
 ## Repository layout
 
 This repository is a Cargo workspace:
@@ -43,6 +45,24 @@ Irminsul accepts a handful of command line options for advanced use cases:
 
 - `--capture-backend <pktmon|pcap>`: chooses which capture backend to use. On Windows both `pktmon` (default) and `pcap` are available. On other platforms only `pcap` is available.
 - `--no-admin`: skips the packet-capture privilege check, and the "permissions missing" dialog it would otherwise show, on Linux and macOS. Capture still needs root/`CAP_NET_RAW`/`/dev/bpf` access to work, so this only helps when you want the UI without capture. It has no effect on Windows: the embedded application manifest asks for elevation before `main()` runs, so Windows has already decided by the time the flag is parsed.
+- `--replay-export <OUT_JSON> <RECORDING>`: decodes a recording without starting the app and writes its export to `OUT_JSON`; see below.
+
+## Development: replaying a recording
+
+Debug builds record every captured frame to `irminsul-data/log/latest.pcapng` under their working directory (the previous run's file is renamed to its timestamp at startup; six are kept). A recorded session can then be decoded again as often as needed -- to debug an export, check which items carry another UID (`gi_debug.uidCheck`), or look at character fields -- without logging in again:
+
+```bash
+cargo build                              # any build; no pcap feature needed
+cp irminsul-data/log/latest.pcapng /somewhere/session.pcapng   # replay a copy
+target/debug/irminsul --replay-export /somewhere/session.json /somewhere/session.pcapng
+```
+
+The recording must contain the login (start Irminsul before the game connects), exactly as for live capture: the session key is recovered from the recorded handshake. Classic pcap files (`-b pcap <template>`) and Wireshark pcapng files work too. Each login or reconnect in the recording is logged, with its recorded time; the state at the end is exported, where a later login's data replaces an earlier one's once it arrives, as in the app.
+
+- **Output**: `OUT_JSON` is the full export, pretty-printed, including the `gi_*` extras and `gi_debug`, made with the default export settings and stamped with the time its data was captured. The log, ending in a summary and the export report, goes to stdout and to `OUT_JSON.log`; `RUST_LOG=debug` shows more.
+- **Exit code**: 0 when an export was written; 1 when nothing could be decoded (no login in the recording, a key that was never recovered, no game traffic...), with the reason in the last error line, and no `OUT_JSON` is written.
+- **Safe to run at any time**: a replay never uploads or verifies a tracker key, never saves an automation file or checks for updates, never reads or writes the app's settings (`app.ron`) or anything under its data directory, and does not take the single-instance lock, so it runs beside a live Irminsul. It needs no administrator rights; on Windows the executable's manifest still asks for elevation before any code runs, so on a machine with UAC set `__COMPAT_LAYER=RunAsInvoker` to start it unelevated.
+- Release builds have no console window on Windows; read `OUT_JSON.log` there, or use a debug build.
 
 ## Features
 
