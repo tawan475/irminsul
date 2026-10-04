@@ -1,11 +1,11 @@
 name: Create Release
+# Press "Run workflow" on main. The version is not typed: next_version.py takes
+# the base from Cargo.toml and appends the next -T-N from the existing tags
+# (v0.2.2-T-1, v0.2.2-T-2 -> 0.2.2-T-3; bumping Cargo.toml to 0.2.3 -> 0.2.3-T-1).
+# Nothing is committed to main (it's protected): the version is set only in the
+# build, and the release tag points at the commit that was built.
 on:
   workflow_dispatch:
-    inputs:
-      nextVersion:
-        description: "Release Version"
-        required: true
-        default: "0.0.0"
 
 # TRACKER_API_URL is deliberately NOT set at workflow level: option_env! in
 # src/app.rs yields Some("") for a set-but-empty variable, which would bake an
@@ -14,7 +14,21 @@ on:
 # repository variable actually has a value.
 
 jobs:
+  version:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the tags decide the next -T-N
+      - id: next
+        run: python3 next_version.py --github-output >> "$GITHUB_OUTPUT"
+      - run: echo "Releasing v${{ steps.next.outputs.version }}"
+
   build:
+    needs: [version]
     strategy:
       matrix:
         include:
@@ -50,7 +64,7 @@ jobs:
       - name: Update Cargo.toml version locally
         shell: bash
         run: |
-          toml set Cargo.toml package.version ${{inputs.nextVersion}} > Cargo.toml.new
+          toml set Cargo.toml package.version ${{ needs.version.outputs.version }} > Cargo.toml.new
           rm Cargo.toml
           mv Cargo.toml.new Cargo.toml
           # NEVER `cargo generate-lockfile` here: it throws away every pin in the
@@ -103,7 +117,7 @@ jobs:
       - name: Package macOS app
         if: runner.os == 'macOS'
         run: |
-          version=${{ inputs.nextVersion }}
+          version=${{ needs.version.outputs.version }}
           mkdir -p Irminsul.app/Contents/{MacOS,Resources}
           sed "s/APPVERSION/$version/g" macos/Info.plist > Irminsul.app/Contents/Info.plist
           cp macos/AppIcon.icns Irminsul.app/Contents/Resources/
@@ -118,36 +132,20 @@ jobs:
 
   create-release:
     runs-on: ubuntu-latest
-    needs: [build]
+    needs: [version, build]
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - run: cargo install toml-cli
-      - name: Update version, commit, and tag
-        run: |
-          toml set Cargo.toml package.version ${{inputs.nextVersion}} > Cargo.toml.new
-          rm Cargo.toml
-          mv Cargo.toml.new Cargo.toml
-          # See the build job: `cargo update --workspace` refreshes only this
-          # package's lock entry, where `cargo generate-lockfile` would re-resolve
-          # (and silently bump) every dependency and push that to main.
-          cargo update --workspace
-          git config user.name "irminsul bot"
-          git config user.email "irminsul.bot@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock
-          # No [skip ci]: the version bump lands on main, so let CI build it.
-          git commit -m "bump version to ${{inputs.nextVersion}}"
-          git tag v${{inputs.nextVersion}}
-          git push origin main
-          git push origin --tags
       - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+      # The action creates the tag on the commit this run built; main itself is
+      # never pushed to, so branch protection needs no bypass.
       - name: Create release
         uses: ncipollo/release-action@v1
         with:
-          tag: v${{ inputs.nextVersion }}
-          name: "v${{ inputs.nextVersion }}"
+          tag: v${{ needs.version.outputs.version }}
+          commit: ${{ github.sha }}
+          name: "v${{ needs.version.outputs.version }}"
           artifacts: "artifacts/*/*"
