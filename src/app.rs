@@ -1079,7 +1079,11 @@ impl eframe::App for IrminsulApp {
                     if settings_button.clicked() {
                         self.app_settings_open = true;
                     }
-                    ui.label(env!("CARGO_PKG_VERSION").to_string());
+                    ui.label(env!("CARGO_PKG_VERSION").to_string())
+                        .on_hover_text(format!(
+                            "Game data: Dimbreath dump {}, embedded when this build was made",
+                            crate::monitor::embedded_game_data_sha().unwrap_or("unknown")
+                        ));
                     egui::warn_if_debug_build(ui);
                 });
             });

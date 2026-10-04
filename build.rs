@@ -65,6 +65,22 @@ async fn main() -> io::Result<()> {
         write_game_data_gz(&db, &gz_path)?;
     }
 
+    // Which Dimbreath dump the binary carries, for the log and the export's
+    // `gi_player.gameData`. Read back out of the gz rather than the json cache:
+    // the gz is what `monitor.rs` embeds, and the cache is only written on a
+    // best-effort basis. Cargo replays this directive from its saved build
+    // script output on builds that do not re-run the script. Empty when it
+    // cannot be read, which the binary treats as "unknown"; that is not worth
+    // failing a build over.
+    let game_data_sha = match read_game_data_sha(&gz_path) {
+        Ok(sha) => sha,
+        Err(e) => {
+            println!("cargo:warning=unable to read the game data's dump commit ({e})");
+            String::new()
+        }
+    };
+    println!("cargo:rustc-env=IRMINSUL_GAME_DATA_SHA={game_data_sha}");
+
     // Add icon to windows binary.
     if env::var_os("CARGO_CFG_WINDOWS").is_some() {
         WindowsResource::new()
@@ -131,6 +147,29 @@ fn gz_is_complete(gz_path: &Path) -> bool {
             Err(_) => return false,
         }
     }
+}
+
+/// The part of the game data blob this script reads back: `anime-game-data`
+/// serializes the Dimbreath commit it was built from as `git_hash`, but has no
+/// public accessor for it.
+#[derive(serde::Deserialize)]
+struct GameDataMeta {
+    git_hash: String,
+}
+
+/// The dump commit recorded in `game_data.gz`, checked to look like one.
+fn read_game_data_sha(gz_path: &Path) -> io::Result<String> {
+    let reader = io::BufReader::new(GzDecoder::new(File::open(gz_path)?));
+    let meta: GameDataMeta = serde_json::from_reader(reader).map_err(io::Error::other)?;
+    let sha = meta.git_hash.trim();
+    let looks_like_a_commit =
+        (7..=64).contains(&sha.len()) && sha.bytes().all(|b| b.is_ascii_hexdigit());
+    if !looks_like_a_commit {
+        return Err(io::Error::other(format!(
+            "{sha:?} does not look like a commit hash"
+        )));
+    }
+    Ok(sha.to_ascii_lowercase())
 }
 
 /// Writes the compressed game data to a temporary file and renames it into
