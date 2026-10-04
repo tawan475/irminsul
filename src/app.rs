@@ -1947,6 +1947,13 @@ impl IrminsulApp {
             }
         }
 
+        // Only while the key is verified: `tracker_account` is set by a
+        // successful verify and cleared whenever one starts or fails.
+        let dashboard_url = self
+            .tracker_account
+            .as_ref()
+            .and_then(|account| account.dashboard_url.clone());
+
         ui.add_enabled_ui(true, |ui| {
             ui.vertical(|ui| {
                 egui::Sides::new().show(
@@ -1986,6 +1993,14 @@ impl IrminsulApp {
                                     }
                                 },
                             );
+                            if let Some(url) = &dashboard_url
+                                && ui
+                                    .button(egui_material_icons::icons::ICON_OPEN_IN_NEW)
+                                    .on_hover_text("Open dashboard")
+                                    .clicked()
+                            {
+                                ui.ctx().open_url(OpenUrl::new_tab(url));
+                            }
                             if ui
                                 .button(egui_material_icons::icons::ICON_SETTINGS)
                                 .clicked()
@@ -2014,19 +2029,6 @@ impl IrminsulApp {
                                 .color(Color32::GRAY),
                         );
                     });
-                    // Only once the key verified: `tracker_account` is set by a
-                    // successful verify and cleared whenever one starts or fails.
-                    if let Some(url) = &account.dashboard_url
-                        && ui
-                            .button(format!(
-                                "{} Open dashboard",
-                                egui_material_icons::icons::ICON_OPEN_IN_NEW
-                            ))
-                            .on_hover_text(url)
-                            .clicked()
-                    {
-                        ui.ctx().open_url(OpenUrl::new_tab(url));
-                    }
                 } else if self.tracker_verify_rx.is_some() {
                     ui.label(RichText::new("Verifying...").color(Color32::YELLOW));
                 } else {
