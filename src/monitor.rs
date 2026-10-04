@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use anime_game_data::AnimeGameData;
 use anyhow::{Context, Result, anyhow};
 use auto_artifactarium::{
-    CommandMatch, ConnectionPacket, GameCommand, GamePacket, GameSniffer, classify_command,
+    CommandMatch, ConnectionPacket, GameCommand, GamePacket, GameSniffer, KeyState,
+    PacketDirection, classify_command,
 };
 use base64::prelude::*;
 use chrono::prelude::*;
@@ -193,7 +194,155 @@ enum SnifferEvent {
     /// auto-artifactarium concluded that the game connection restarted. Always
     /// sent *before* the packet that concluded it.
     SessionReset,
-    Packet(GamePacket),
+    /// A decoded packet, with the sniffer's key situation once it was decoded.
+    Packet(GamePacket, KeyReport),
+}
+
+/// The sniffer's key situation, reported with every packet because the
+/// [`GameSniffer`] itself never leaves its thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyReport {
+    /// Only [`KeyState::Session`] means commands are the account's data.
+    state: KeyState,
+    /// The search for the current connection's session key gave up.
+    recovery_failed: bool,
+}
+
+impl KeyReport {
+    fn of(sniffer: &GameSniffer) -> Self {
+        Self {
+            state: sniffer.key_state(),
+            recovery_failed: sniffer.key_recovery_failed(),
+        }
+    }
+}
+
+/// Captured data waiting to be replaced by a new connection's.
+///
+/// A session reset used to wipe the captured data on the spot. When the new
+/// connection's key was then never recovered -- every in-game reconnect, until
+/// recently -- the user was left with nothing at all: not the new data, and no
+/// longer the snapshot that had been captured perfectly well before. Now the
+/// old data stays, exportable, until the new connection delivers data of its
+/// own, which replaces it then. An account switch therefore still replaces
+/// the data, just at the moment the new account's arrives.
+#[derive(Debug, Default)]
+struct DataReplacement {
+    pending: bool,
+}
+
+/// What to do with one classified command.
+#[derive(Debug, PartialEq, Eq)]
+enum DataVerdict {
+    /// Fold it into the captured data, as always.
+    Apply,
+    /// First data of a new connection: drop the old connection's, then apply.
+    ReplaceThenApply,
+    /// A new connection began but this proves nothing about it yet: leave the
+    /// captured data alone and skip it.
+    Hold,
+}
+
+impl DataReplacement {
+    /// A new connection began. Returns whether that is news: the copies of
+    /// one handshake, or resets before any data arrived, collapse into one.
+    fn connection_reset(&mut self) -> bool {
+        !std::mem::replace(&mut self.pending, true)
+    }
+
+    /// The user cleared the data, so there is nothing left to replace.
+    fn clear(&mut self) {
+        self.pending = false;
+    }
+
+    /// Decide what a classified command does. `key` is what it decrypted
+    /// under; `replaces` is whether it is real account data that may stand in
+    /// for the old snapshot (a delete notify's shape is too common for that).
+    fn verdict(&mut self, key: KeyState, replaces: bool) -> DataVerdict {
+        if !self.pending {
+            return DataVerdict::Apply;
+        }
+        if key == KeyState::Session && replaces {
+            self.pending = false;
+            return DataVerdict::ReplaceThenApply;
+        }
+        DataVerdict::Hold
+    }
+}
+
+/// How often the sniffer thread logs what it has been doing.
+const STATS_INTERVAL: Duration = Duration::from_secs(60);
+
+/// What the sniffer thread did, for one INFO line a minute.
+///
+/// The log of 2026-10-04 had nothing to show for the hour and three quarters
+/// in which nothing decoded: no line said frames were still arriving, that
+/// the key was missing, or which conversation each direction was stuck on.
+/// This is that line.
+#[derive(Debug, Default)]
+struct SnifferStats {
+    /// Frames this interval.
+    frames: u64,
+    /// Frames the interval before, so going quiet is reported once.
+    previous_frames: u64,
+    /// Deepest the queue to this thread got this interval.
+    max_queue: usize,
+    /// Commands decoded since the last session reset.
+    commands_since_reset: u64,
+    /// When commands last decoded.
+    last_decode: Option<Instant>,
+    /// The process-wide duplicate count at the last report.
+    duplicates_reported: u64,
+}
+
+/// One stats line.
+#[derive(Debug)]
+struct StatsLine {
+    frames: u64,
+    duplicates: u64,
+    max_queue: usize,
+    commands_since_reset: u64,
+    last_decode_age: Option<Duration>,
+}
+
+impl SnifferStats {
+    /// A frame was taken off the queue, which then held `queued` (this one
+    /// included).
+    fn note_frame(&mut self, queued: usize) {
+        self.frames += 1;
+        self.max_queue = self.max_queue.max(queued);
+    }
+
+    fn note_commands(&mut self, count: usize, now: Instant) {
+        if count > 0 {
+            self.commands_since_reset += count as u64;
+            self.last_decode = Some(now);
+        }
+    }
+
+    fn note_reset(&mut self) {
+        self.commands_since_reset = 0;
+    }
+
+    /// The line for the interval ending `now`, given the process-wide count of
+    /// dropped duplicates. `None` while capture is idle: a line is due when
+    /// frames arrived this interval, or the interval before (so the drop to
+    /// zero is reported once).
+    fn report(&mut self, duplicates_total: u64, now: Instant) -> Option<StatsLine> {
+        let due = self.frames > 0 || self.previous_frames > 0;
+        let line = due.then(|| StatsLine {
+            frames: self.frames,
+            duplicates: duplicates_total.saturating_sub(self.duplicates_reported),
+            max_queue: self.max_queue,
+            commands_since_reset: self.commands_since_reset,
+            last_decode_age: self.last_decode.map(|at| now.saturating_duration_since(at)),
+        });
+        self.previous_frames = self.frames;
+        self.frames = 0;
+        self.max_queue = 0;
+        self.duplicates_reported = duplicates_total;
+        line
+    }
 }
 
 /// Move packet decoding off the monitor's `select!` loop.
@@ -216,13 +365,50 @@ fn spawn_sniffer_thread(
         .name("irminsul-sniffer".to_string())
         .spawn(move || {
             let mut last_generation = sniffer.session_generation();
-            // Ends when the monitor drops its sender, i.e. when the app exits.
-            while let Ok(packet) = packet_rx.recv() {
-                let delivered =
-                    decode_one_packet(&mut sniffer, &mut last_generation, packet, &decoded_tx);
-                thread_queued.fetch_sub(1, Ordering::Relaxed);
-                if !delivered {
-                    break;
+            let mut stats = SnifferStats::default();
+            let mut next_report = Instant::now() + STATS_INTERVAL;
+            loop {
+                // Woken at least once per interval, so the stats line keeps its
+                // schedule when no packet arrives.
+                let wait = next_report.saturating_duration_since(Instant::now());
+                match packet_rx.recv_timeout(wait) {
+                    Ok(packet) => {
+                        stats.note_frame(thread_queued.load(Ordering::Relaxed));
+                        let delivered = decode_one_packet(
+                            &mut sniffer,
+                            &mut last_generation,
+                            packet,
+                            &decoded_tx,
+                            &mut stats,
+                        );
+                        thread_queued.fetch_sub(1, Ordering::Relaxed);
+                        if !delivered {
+                            break;
+                        }
+                    }
+                    Err(blocking_mpsc::RecvTimeoutError::Timeout) => {}
+                    // The monitor dropped its sender, i.e. the app is exiting.
+                    Err(blocking_mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+
+                let now = Instant::now();
+                if now >= next_report {
+                    next_report = now + STATS_INTERVAL;
+                    let duplicates = capture::DUPLICATES_DROPPED.load(Ordering::Relaxed);
+                    if let Some(line) = stats.report(duplicates, now) {
+                        tracing::info!(
+                            frames = line.frames,
+                            duplicates_dropped = line.duplicates,
+                            max_queue = line.max_queue,
+                            commands_since_reset = line.commands_since_reset,
+                            key = ?sniffer.key_state(),
+                            key_given_up = sniffer.key_recovery_failed(),
+                            sent_conv = ?sniffer.bound_conversation(PacketDirection::Sent),
+                            recv_conv = ?sniffer.bound_conversation(PacketDirection::Received),
+                            last_decode_secs = ?line.last_decode_age.map(|age| age.as_secs()),
+                            "capture stats (last minute)"
+                        );
+                    }
                 }
             }
             tracing::info!("sniffer thread exiting");
@@ -254,19 +440,27 @@ fn decode_one_packet(
     last_generation: &mut u64,
     packet: Vec<u8>,
     decoded_tx: &mpsc::UnboundedSender<SnifferEvent>,
+    stats: &mut SnifferStats,
 ) -> bool {
     let decoded = sniffer.receive_packet(packet);
 
     let generation = sniffer.session_generation();
     if generation != *last_generation {
         *last_generation = generation;
+        stats.note_reset();
         if decoded_tx.send(SnifferEvent::SessionReset).is_err() {
             return false;
         }
     }
 
+    if let Some(GamePacket::Commands(commands)) = &decoded {
+        stats.note_commands(commands.len(), Instant::now());
+    }
+
     match decoded {
-        Some(decoded) => decoded_tx.send(SnifferEvent::Packet(decoded)).is_ok(),
+        Some(decoded) => decoded_tx
+            .send(SnifferEvent::Packet(decoded, KeyReport::of(sniffer)))
+            .is_ok(),
         None => true,
     }
 }
@@ -397,6 +591,33 @@ const CAPTURE_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(3
 /// capture device) settles into a slow poll instead of hammering the OS.
 const CAPTURE_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long a capture that has been delivering frames may then deliver none,
+/// while the game runs, before it is restarted.
+///
+/// A connected game talks continuously -- heartbeats every few seconds even
+/// when idle -- so a minute of nothing is a capture that has stopped seeing
+/// traffic without reporting an error.
+const CAPTURE_SILENCE_LIMIT: Duration = Duration::from_secs(60);
+
+/// Whether a capture that is up has gone silent on a running game.
+///
+/// `last_frame` is when the current capture last delivered a frame, `None` if
+/// it has delivered none since it started. Only a capture that *was*
+/// delivering counts: a game on its title screen sends nothing, and restarting
+/// a capture that never heard anything would only open more blind windows --
+/// including right after this watchdog's own restart, which therefore happens
+/// at most once per silence.
+fn capture_stalled(
+    game_running: bool,
+    capturing: bool,
+    last_frame: Option<Instant>,
+    now: Instant,
+) -> bool {
+    game_running
+        && capturing
+        && last_frame.is_some_and(|at| now.saturating_duration_since(at) >= CAPTURE_SILENCE_LIMIT)
+}
+
 /// How long to let a killed game process actually exit before re-deriving the
 /// game status. See `Message::KillGame`.
 const KILL_GAME_SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
@@ -406,6 +627,7 @@ pub struct Monitor {
     ui_message_rx: mpsc::UnboundedReceiver<Message>,
     log_packet_rx: watch::Receiver<bool>,
     player_data: PlayerData,
+    data_replacement: DataReplacement,
     /// `None` once the decoding thread has died. Nothing can be decoded after
     /// that, and the user has been told.
     sniffer: Option<SnifferThread>,
@@ -426,6 +648,9 @@ pub struct Monitor {
     capture_retry_at: Option<Instant>,
     /// Consecutive capture failures, for the backoff.
     capture_failures: u32,
+    /// When the current capture last delivered a frame; `None` until it has.
+    /// See [`capture_stalled`].
+    last_frame_at: Option<Instant>,
     game_watch: GameWatch,
     game_detector: SystemProcessDetector,
     game_poll: tokio::time::Interval,
@@ -514,6 +739,7 @@ impl Monitor {
         Ok(Self {
             app_state,
             player_data,
+            data_replacement: DataReplacement::default(),
             ui_message_rx,
             log_packet_rx,
             sniffer: Some(sniffer),
@@ -528,6 +754,7 @@ impl Monitor {
             capture_source,
             capture_retry_at: None,
             capture_failures: 0,
+            last_frame_at: None,
             game_watch: GameWatch::default(),
             game_detector: SystemProcessDetector::new(),
             game_poll,
@@ -593,6 +820,7 @@ impl Monitor {
                 _ = self.game_poll.tick() => {
                     self.poll_game_status();
                     self.supervise_capture().await;
+                    self.watch_capture_silence().await;
                 }
                 capture_result = join_capture(&mut self.capture_handle) => {
                     self.handle_capture_exit(capture_result);
@@ -618,7 +846,14 @@ impl Monitor {
                 self.stop_capture().await;
             }
             Message::ClearData => {
-                self.reset_captured_data("clear data requested");
+                self.data_replacement.clear();
+                self.replace_captured_data("clear data requested");
+                // Nothing has decoded for whatever comes next, so the status
+                // line drops back to what the process transitions can prove.
+                if self.game_watch.note_data_cleared() {
+                    let status = self.game_watch.status();
+                    self.app_state.update_game_status(status);
+                }
             }
             Message::KillGame(reply_tx) => {
                 let killed = self.game_detector.kill_game_processes();
@@ -692,6 +927,7 @@ impl Monitor {
         ));
         self.capture_cancel_token = Some(cancel_token);
         self.capture_handle = Some(capture_handle);
+        self.last_frame_at = None;
         self.automation_cycle_started_at = Some(Instant::now());
         // Not `true`: everything that can fail -- no elevation, no such device,
         // an ETW session already owned by a previous process -- fails inside the
@@ -725,6 +961,30 @@ impl Monitor {
             .min(CAPTURE_RETRY_MAX);
         self.capture_failures = attempt;
         self.capture_retry_at = Some(Instant::now() + backoff);
+    }
+
+    /// Restart a capture that stopped delivering frames while the game runs.
+    ///
+    /// The supervisor above only sees a backend that failed or ended. One that
+    /// stays up and silently stops delivering -- its packet stream still open,
+    /// nothing in it -- looks healthy to everything else in this app.
+    async fn watch_capture_silence(&mut self) {
+        let now = Instant::now();
+        if !capture_stalled(
+            self.game_watch.game_running(),
+            self.app_state.app_state.capturing,
+            self.last_frame_at,
+            now,
+        ) {
+            return;
+        }
+        tracing::warn!(
+            silent_secs = self
+                .last_frame_at
+                .map(|at| now.saturating_duration_since(at).as_secs()),
+            "no packets captured for a minute while the game is running; restarting capture"
+        );
+        self.start_capture().await;
     }
 
     /// Cancel the capture task *and wait for it to finish*.
@@ -769,7 +1029,10 @@ impl Monitor {
             CaptureEvent::Started => {
                 tracing::debug!("ignoring a start report from a capture that already stopped");
             }
-            CaptureEvent::Packet(packet) => self.handle_packet(packet),
+            CaptureEvent::Packet(packet) => {
+                self.last_frame_at = Some(Instant::now());
+                self.handle_packet(packet);
+            }
             CaptureEvent::Failed(e) => {
                 tracing::error!("Capture task encountered an error: {e}");
                 let _ = self
@@ -915,16 +1178,39 @@ impl Monitor {
         match event {
             // Sent by the sniffer thread before any packet from the new
             // connection, so nothing from the new account can land in the old
-            // account's maps. Captured state is insert-only, so without this a
-            // second account logged in without restarting Irminsul uploads the
-            // *union* of both inventories to whichever tracker account holds the
-            // import key.
-            SnifferEvent::SessionReset => self.reset_captured_data("new game session"),
-            SnifferEvent::Packet(packet) => self.handle_game_packet(packet),
+            // account's maps: the new connection's first data replaces them
+            // (see `DataReplacement`). Captured state is insert-only, so without
+            // this a second account logged in without restarting Irminsul
+            // uploads the *union* of both inventories to whichever tracker
+            // account holds the import key.
+            SnifferEvent::SessionReset => self.handle_connection_reset(),
+            SnifferEvent::Packet(packet, report) => self.handle_game_packet(packet, report),
         }
     }
 
-    fn handle_game_packet(&mut self, game_packet: GamePacket) {
+    /// The game connection restarted. The captured data stays until the new
+    /// connection replaces it (see [`DataReplacement`]); the old connection's
+    /// claim to be decrypting ends now.
+    fn handle_connection_reset(&mut self) {
+        if self.data_replacement.connection_reset() {
+            tracing::info!(
+                "new game connection; keeping the captured data until it delivers its own"
+            );
+        }
+        if self.game_watch.note_session_reset() {
+            let status = self.game_watch.status();
+            self.app_state.update_game_status(status);
+        }
+        self.ctx.request_repaint();
+    }
+
+    fn handle_game_packet(&mut self, game_packet: GamePacket, report: KeyReport) {
+        let key = report.state;
+        if report.recovery_failed && self.game_watch.note_key_recovery_failed() {
+            let status = self.game_watch.status();
+            self.app_state.update_game_status(status);
+        }
+
         let commands = match game_packet {
             GamePacket::Commands(commands) => commands,
             GamePacket::Connection(conn) => {
@@ -936,20 +1222,30 @@ impl Monitor {
         // Non-empty is the whole point: a bare KCP ACK decodes to
         // `Commands(vec![])` with no key involved at all, while an actual
         // command batch means the XOR stream decrypted and the protobuf parsed.
-        // That is the only evidence this app has that the session key was
-        // really recovered, so it is what the status line is allowed to claim
-        // "decrypting" on.
-        if !commands.is_empty() && self.game_watch.note_decoded_data() {
-            let status = self.game_watch.status();
-            self.app_state.update_game_status(status);
+        // Under the session key that is the evidence the status line may claim
+        // "decrypting" on. Under the dispatch key it is only a login being
+        // watched -- every reconnect of 2026-10-04 got that far and no further
+        // while the line read "data decrypting" -- so it starts the clock on
+        // the key arriving instead.
+        if !commands.is_empty() {
+            let changed = if key == KeyState::Session {
+                self.game_watch.note_decoded_data()
+            } else {
+                self.game_watch.note_login_traffic()
+            };
+            if changed {
+                let status = self.game_watch.status();
+                self.app_state.update_game_status(status);
+            }
         }
 
         let log_packets = *self.log_packet_rx.borrow_and_update();
 
-        let mut updated = self.app_state.app_state.updated.clone();
-        let mut has_new_data = false;
-        let now = Instant::now();
-
+        // Classify the whole batch first: whether it replaces the previous
+        // connection's data has to be settled before its timestamps are taken,
+        // because replacing restarts the automation cycle they are compared
+        // against.
+        let mut classified = Vec::with_capacity(commands.len());
         for command in commands {
             let _span = tracing::info_span!("command", id = command.command_id).entered();
             if log_packets && let Err(e) = self.packet_log.append(&command) {
@@ -960,14 +1256,46 @@ impl Monitor {
             // the chain could not notice that two of them claimed the same
             // command, which is exactly how a shape collision turns into
             // silently missing data.
-            match classify_command(&command) {
-                Some(CommandMatch::Items(items)) => {
+            if let Some(found) = classify_command(&command) {
+                classified.push((command.command_id, found));
+            }
+        }
+        if classified.is_empty() {
+            return;
+        }
+
+        let replaces = classified
+            .iter()
+            .any(|(_, found)| !matches!(found, CommandMatch::DeletedItems(_)));
+        match self.data_replacement.verdict(key, replaces) {
+            DataVerdict::Apply => {}
+            DataVerdict::ReplaceThenApply => {
+                self.replace_captured_data("the new game connection delivered data");
+            }
+            DataVerdict::Hold => {
+                tracing::debug!(
+                    commands = classified.len(),
+                    ?key,
+                    "keeping the previous connection's data; not applying these"
+                );
+                return;
+            }
+        }
+
+        let mut updated = self.app_state.app_state.updated.clone();
+        let mut has_new_data = false;
+        let now = instant_after(self.automation_cycle_started_at);
+
+        for (command_id, found) in classified {
+            let _span = tracing::info_span!("command", id = command_id).entered();
+            match found {
+                CommandMatch::Items(items) => {
                     tracing::info!("Found item packet with {} items", items.len());
                     self.player_data.process_items(&items);
                     updated.items_updated = Some(now);
                     has_new_data = true;
                 }
-                Some(CommandMatch::Properties(properties)) => {
+                CommandMatch::Properties(properties) => {
                     tracing::info!("Found properties packet: {:?}", properties);
                     self.player_data.process_properties(&properties);
                     // Deliberately stamps no timestamp: a property packet used
@@ -976,13 +1304,13 @@ impl Monitor {
                     // one item ever parsed.
                     has_new_data = true;
                 }
-                Some(CommandMatch::Avatars(avatars)) => {
+                CommandMatch::Avatars(avatars) => {
                     tracing::info!("Found avatar packet with {} avatars", avatars.len());
                     self.player_data.process_characters(&avatars);
                     updated.characters_updated = Some(now);
                     has_new_data = true;
                 }
-                Some(CommandMatch::Achievements(achievements)) => {
+                CommandMatch::Achievements(achievements) => {
                     tracing::info!(
                         "Found achievement packet with {} achievements",
                         achievements.len()
@@ -992,7 +1320,7 @@ impl Monitor {
                     updated.achievements_updated_time = Some(chrono::Local::now());
                     has_new_data = true;
                 }
-                Some(CommandMatch::DeletedItems(guids)) => {
+                CommandMatch::DeletedItems(guids) => {
                     // The matcher reports candidates -- its shape is shared with
                     // a couple of dozen other messages -- so the inventory
                     // intersection is the real test. Removing nothing means this
@@ -1014,6 +1342,7 @@ impl Monitor {
                         );
                     }
                 }
+                // `CommandMatch` is non-exhaustive.
                 _ => {}
             }
         }
@@ -1055,15 +1384,9 @@ impl Monitor {
     }
 
     /// Forget everything captured about the account.
-    fn reset_captured_data(&mut self, reason: &str) {
+    fn replace_captured_data(&mut self, reason: &str) {
         tracing::info!(reason, "clearing captured data");
         self.player_data.reset();
-        // Nothing has decoded for whatever comes next, so the status line drops
-        // back to what the process transitions can prove on their own.
-        if self.game_watch.note_data_cleared() {
-            let status = self.game_watch.status();
-            self.app_state.update_game_status(status);
-        }
         self.app_state.update_timestamps(DataUpdated::new());
         self.capture_timestamp_ms = None;
         // Without these the signature check can suppress the first export after
@@ -1281,6 +1604,20 @@ impl Monitor {
             }
             ctx.request_repaint();
         });
+    }
+}
+
+/// `Instant::now()`, but strictly after `floor`.
+///
+/// The automation gate only counts data captured strictly after the current
+/// cycle began, and a cycle can begin in the same call that then stamps the
+/// first data of a new connection; on a coarse clock the two reads can be
+/// equal, which would leave that data uncounted until it arrived again.
+fn instant_after(floor: Option<Instant>) -> Instant {
+    let now = Instant::now();
+    match floor {
+        Some(floor) if now <= floor => floor + Duration::from_nanos(1),
+        _ => now,
     }
 }
 
@@ -1639,15 +1976,17 @@ mod tests {
             &mut sniffer,
             &mut generation,
             handshake_frame(),
-            &tx
+            &tx,
+            &mut SnifferStats::default()
         ));
 
         assert!(matches!(rx.try_recv(), Ok(SnifferEvent::SessionReset)));
         assert!(matches!(
             rx.try_recv(),
-            Ok(SnifferEvent::Packet(GamePacket::Connection(
-                ConnectionPacket::HandshakeRequested
-            )))
+            Ok(SnifferEvent::Packet(
+                GamePacket::Connection(ConnectionPacket::HandshakeRequested),
+                _
+            ))
         ));
         assert!(rx.try_recv().is_err());
 
@@ -1656,9 +1995,10 @@ mod tests {
             &mut sniffer,
             &mut generation,
             segment_frame(7, &[0u8; 40]),
-            &tx
+            &tx,
+            &mut SnifferStats::default()
         ));
-        assert!(matches!(rx.try_recv(), Ok(SnifferEvent::Packet(_))));
+        assert!(matches!(rx.try_recv(), Ok(SnifferEvent::Packet(..))));
         assert!(
             rx.try_recv().is_err(),
             "one reset per session, not per packet"
@@ -1684,11 +2024,12 @@ mod tests {
                 &mut sniffer,
                 &mut generation,
                 connection_frame(code),
-                &tx
+                &tx,
+                &mut SnifferStats::default()
             ));
             assert!(matches!(
                 rx.try_recv(),
-                Ok(SnifferEvent::Packet(GamePacket::Connection(_)))
+                Ok(SnifferEvent::Packet(GamePacket::Connection(_), _))
             ));
         }
 
@@ -1708,11 +2049,200 @@ mod tests {
             &mut sniffer,
             &mut generation,
             segment_frame(7, &[0u8; 40]),
-            &tx
+            &tx,
+            &mut SnifferStats::default()
         ));
 
-        assert!(matches!(rx.try_recv(), Ok(SnifferEvent::Packet(_))));
+        assert!(matches!(rx.try_recv(), Ok(SnifferEvent::Packet(..))));
         assert!(rx.try_recv().is_err());
+    }
+
+    // -- capture watchdog --------------------------------------------------------
+
+    #[test]
+    fn a_capture_that_went_silent_on_a_running_game_is_restarted() {
+        let now = Instant::now();
+        let Some(long_ago) = now.checked_sub(CAPTURE_SILENCE_LIMIT) else {
+            return;
+        };
+        assert!(capture_stalled(true, true, Some(long_ago), now));
+    }
+
+    #[test]
+    fn the_watchdog_leaves_everything_else_alone() {
+        let now = Instant::now();
+        let Some(long_ago) = now.checked_sub(CAPTURE_SILENCE_LIMIT) else {
+            return;
+        };
+        let recent = now
+            .checked_sub(CAPTURE_SILENCE_LIMIT - Duration::from_secs(1))
+            .unwrap_or(now);
+
+        // Not silent long enough.
+        assert!(!capture_stalled(true, true, Some(recent), now));
+        // No game to hear from.
+        assert!(!capture_stalled(false, true, Some(long_ago), now));
+        // Capture is not up; the supervisor owns that case.
+        assert!(!capture_stalled(true, false, Some(long_ago), now));
+        // Nothing has arrived since this capture started -- a game sitting on
+        // the title screen, or the capture the watchdog itself just restarted.
+        // Restarting again would only open more blind windows.
+        assert!(!capture_stalled(true, true, None, now));
+    }
+
+    // -- the sniffer's stats line ----------------------------------------------
+
+    #[test]
+    fn an_idle_sniffer_reports_nothing() {
+        let mut stats = SnifferStats::default();
+        assert!(stats.report(0, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn a_report_covers_its_own_interval() {
+        let mut stats = SnifferStats::default();
+        let start = Instant::now();
+        for queued in [1, 5, 3] {
+            stats.note_frame(queued);
+        }
+        stats.note_commands(4, start);
+        stats.note_commands(0, start);
+
+        let line = stats.report(80, start).expect("frames arrived");
+        assert_eq!(line.frames, 3);
+        assert_eq!(line.duplicates, 80);
+        assert_eq!(line.max_queue, 5);
+        assert_eq!(line.commands_since_reset, 4);
+        assert_eq!(line.last_decode_age, Some(Duration::ZERO));
+
+        // The next interval counts afresh, except what spans intervals.
+        stats.note_frame(1);
+        let later = start + Duration::from_secs(60);
+        let line = stats.report(100, later).expect("a frame arrived");
+        assert_eq!(line.frames, 1);
+        assert_eq!(line.duplicates, 20, "a delta, not the running total");
+        assert_eq!(line.max_queue, 1);
+        assert_eq!(line.commands_since_reset, 4);
+        assert_eq!(line.last_decode_age, Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn capture_going_quiet_is_reported_once() {
+        let mut stats = SnifferStats::default();
+        let now = Instant::now();
+        stats.note_frame(1);
+        assert!(stats.report(0, now).is_some());
+
+        let quiet = stats.report(0, now).expect("the drop to zero is news");
+        assert_eq!(quiet.frames, 0);
+        assert!(stats.report(0, now).is_none(), "and then it stays quiet");
+    }
+
+    #[test]
+    fn a_reset_restarts_the_command_count() {
+        let mut stats = SnifferStats::default();
+        let now = Instant::now();
+        stats.note_frame(1);
+        stats.note_commands(7, now);
+        stats.note_reset();
+        stats.note_commands(2, now);
+        assert_eq!(stats.report(0, now).unwrap().commands_since_reset, 2);
+    }
+
+    // -- keeping the last good data across a reset -----------------------------
+
+    #[test]
+    fn data_keeps_flowing_in_when_no_reset_is_pending() {
+        let mut replacement = DataReplacement::default();
+        for key in [KeyState::None, KeyState::Dispatch, KeyState::Session] {
+            assert_eq!(replacement.verdict(key, true), DataVerdict::Apply);
+            assert_eq!(replacement.verdict(key, false), DataVerdict::Apply);
+        }
+    }
+
+    #[test]
+    fn a_reset_keeps_the_old_data_until_the_new_connection_delivers() {
+        // A reconnect whose key is never recovered must not cost the snapshot
+        // that was already captured: it stays exportable until real data from
+        // the new connection takes its place.
+        let mut replacement = DataReplacement::default();
+        assert!(replacement.connection_reset());
+
+        // Nothing decrypted under the session key: the old data stays.
+        assert_eq!(
+            replacement.verdict(KeyState::Dispatch, true),
+            DataVerdict::Hold
+        );
+        assert_eq!(replacement.verdict(KeyState::None, true), DataVerdict::Hold);
+
+        // The new connection's own data replaces it, once.
+        assert_eq!(
+            replacement.verdict(KeyState::Session, true),
+            DataVerdict::ReplaceThenApply
+        );
+        assert_eq!(
+            replacement.verdict(KeyState::Session, true),
+            DataVerdict::Apply
+        );
+    }
+
+    #[test]
+    fn a_delete_notify_does_not_replace_the_snapshot() {
+        // Its shape is shared with two dozen other messages, so it is held
+        // rather than allowed to throw the old snapshot away on its own.
+        let mut replacement = DataReplacement::default();
+        replacement.connection_reset();
+
+        assert_eq!(
+            replacement.verdict(KeyState::Session, false),
+            DataVerdict::Hold
+        );
+        assert_eq!(
+            replacement.verdict(KeyState::Session, true),
+            DataVerdict::ReplaceThenApply
+        );
+    }
+
+    #[test]
+    fn duplicate_resets_collapse_into_one() {
+        // A handshake used to arrive eight times (pktmon's copies) and each
+        // copy wiped the data and logged it.
+        let mut replacement = DataReplacement::default();
+        assert!(replacement.connection_reset(), "the first one is news");
+        for _ in 0..8 {
+            assert!(!replacement.connection_reset());
+        }
+        assert_eq!(
+            replacement.verdict(KeyState::Session, true),
+            DataVerdict::ReplaceThenApply
+        );
+        assert_eq!(
+            replacement.verdict(KeyState::Session, true),
+            DataVerdict::Apply
+        );
+        // And the next connection is news again.
+        assert!(replacement.connection_reset());
+    }
+
+    #[test]
+    fn a_failed_reconnect_leaves_the_snapshot_exportable() {
+        // End to end over the monitor's own pieces: a captured inventory, a
+        // reconnect, and only dispatch-key traffic after it.
+        let mut data = PlayerData::new(AnimeGameData::new());
+        let mut replacement = DataReplacement::default();
+        let mut item = auto_artifactarium::r#gen::protos::Item::new();
+        item.item_id = 104003;
+        item.guid = 7;
+        item.mut_material().count = 12;
+        data.process_items(std::slice::from_ref(&item));
+
+        replacement.connection_reset();
+        // What `handle_game_packet` does with a held verdict: nothing.
+        assert_eq!(
+            replacement.verdict(KeyState::Dispatch, true),
+            DataVerdict::Hold
+        );
+        assert!(!data.is_empty(), "the snapshot is still there to export");
     }
 
     #[test]
@@ -1749,6 +2279,15 @@ mod tests {
             "the oldest sessions should be gone"
         );
         assert!(dir.path().join("notes.txt").exists());
+    }
+
+    #[test]
+    fn data_stamped_right_after_a_cycle_starts_counts_for_it() {
+        let start = Instant::now() + Duration::from_secs(1);
+        assert!(instant_after(Some(start)) > start);
+        let past = Instant::now();
+        assert!(instant_after(Some(past)) >= past);
+        let _ = instant_after(None);
     }
 
     #[test]

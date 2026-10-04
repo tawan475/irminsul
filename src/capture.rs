@@ -1,3 +1,6 @@
+// Only pktmon reports copies, so off Windows only the tests build this.
+#[cfg(any(windows, test))]
+mod dedupe;
 #[cfg(any(feature = "pcap", not(windows)))]
 mod pcap_backend;
 #[cfg(windows)]
@@ -5,12 +8,17 @@ mod pktmon_backend;
 
 use std::fmt::{Debug, Display};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 
 use anyhow::Error;
 use async_trait::async_trait;
 use clap::ValueEnum;
 
 pub const PORT_RANGE: (u16, u16) = (22101, 22102);
+
+/// Duplicate copies of a datagram a capture backend dropped, for the stats
+/// line. Only pktmon reports copies; see `dedupe`.
+pub static DUPLICATES_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 #[allow(dead_code)]
