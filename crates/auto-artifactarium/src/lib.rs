@@ -122,6 +122,33 @@ const MAX_BRUTEFORCE_ATTEMPTS: u32 = 5;
 /// inside that pass's own window.
 const RETAINED_SEED_DEPTH: i32 = 1000;
 
+/// Time seeds kept from earlier connections for [`GameSniffer::time_anchors`].
+///
+/// One per game process is all that is ever useful (every reconnect inside a
+/// process draws from the same generator), so this only has to cover a few
+/// game restarts while irminsul keeps running. Bounded so a long-lived capture
+/// cannot grow it, and so the probe below stays a fixed cost.
+const MAX_TIME_ANCHORS: usize = 4;
+
+/// Client-seed draws tried against each time seed kept from an earlier
+/// connection.
+///
+/// On an in-game reconnect the client does not reseed its `System.Random`: it
+/// draws the next value from the generator it seeded at the first login (the
+/// reason upstream konkers retains that seed across handshakes). Each
+/// connection costs at least one draw, so this covers thousands of reconnects
+/// at one draw each, or dozens even if something else drew a hundred values
+/// in between. Upstream searched 5 deep.
+///
+/// Cost: one candidate is ~1.1 us (measured), so this is ~11 ms per retained
+/// seed per server seed. The probe runs inside the bruteforce budget (at most
+/// [`MAX_BRUTEFORCE_ATTEMPTS`] times per set of session seeds), so with
+/// [`MAX_TIME_ANCHORS`] seeds a connection whose key is not there pays well
+/// under a second in total -- against ~3.3 s for *each* full bruteforce run.
+/// Four magic bytes are checked per candidate, so 40,000 candidates leave a
+/// false-positive chance of about 1 in 100,000.
+const RECONNECT_SEED_DEPTH: i32 = 10_000;
+
 /// Entries a store notify needs before it is believed.
 ///
 /// Mirrors the floor already applied inside `matches_items_all_data_notify`; it
@@ -453,7 +480,22 @@ pub struct GameSniffer {
     recv_kcp: Option<KcpSniffer>,
     /// The send time that produced the live session key. Named for what it holds
     /// -- it is a timestamp, not a seed the client chose.
+    ///
+    /// Scoped to the current connection: it is cleared by a reset and by a new
+    /// token response, because [`Self::recover_session_key`] probes it *before*
+    /// the bruteforce budget is checked. Time seeds that must outlive the
+    /// connection live in [`Self::time_anchors`] instead.
     last_time_seed: Option<u64>,
+    /// Every time seed that has recovered a session key, newest first, at most
+    /// [`MAX_TIME_ANCHORS`] of them.
+    ///
+    /// Deliberately kept across resets and new token responses. The game
+    /// seeds its client-seed generator once, at the first login of the
+    /// process, and every in-game reconnect draws the next value from it --
+    /// while the new token response is stamped with the reconnect's own time,
+    /// possibly hours later. Searching around that new send time alone is what
+    /// left every reconnect undecryptable.
+    time_anchors: Vec<u64>,
     key: Option<Key>,
     initial_keys: HashMap<u16, Vec<u8>>,
     rsa_keys: Vec<RsaPrivateKey>,
@@ -579,9 +621,9 @@ impl GameSniffer {
         self.sent_kcp = None;
         self.key = None;
         self.session_seeds = None;
-        // Keeping this across connections is what made the first message of
-        // every reconnect burn a full failing bruteforce against the *previous*
-        // connection's anchor before it got anywhere.
+        // The live connection's anchor goes, because it is probed outside the
+        // bruteforce budget. The time seeds themselves stay in `time_anchors`:
+        // a reconnect's key is drawn from the same generator.
         self.last_time_seed = None;
         self.session_failures = 0;
         self.session_rederive_exhausted = false;
@@ -804,6 +846,24 @@ impl GameSniffer {
             return false;
         }
 
+        // Time seeds from earlier connections, before the search around this
+        // token response's send time. An in-game reconnect draws its client
+        // seed from the generator the first login seeded, so the send time the
+        // new response carries is the wrong anchor for it. Probing these first
+        // costs a bounded few milliseconds (see `RECONNECT_SEED_DEPTH`), runs
+        // inside the budget above, and leaves the bruteforce below unchanged
+        // for the case it was built for: a fresh game process.
+        let anchors = self.time_anchors.clone();
+        for anchor in anchors {
+            for &seed in &session.seeds {
+                if let Some(key) = guess(anchor as i64, seed, RECONNECT_SEED_DEPTH, data) {
+                    info!("recovered the session key from the time seed of an earlier connection");
+                    self.install_session_key(key, anchor);
+                    return true;
+                }
+            }
+        }
+
         for &seed in &session.seeds {
             if let Some((time_seed, key)) = bruteforce(session.sent_ms, seed, data.to_vec()) {
                 self.install_session_key(key, time_seed);
@@ -828,6 +888,9 @@ impl GameSniffer {
 
     fn install_session_key(&mut self, key: Vec<u8>, time_seed: u64) {
         self.last_time_seed = Some(time_seed);
+        self.time_anchors.retain(|&anchor| anchor != time_seed);
+        self.time_anchors.insert(0, time_seed);
+        self.time_anchors.truncate(MAX_TIME_ANCHORS);
         self.key = Some(Key::Session(key));
         self.session_failures = 0;
         self.session_rederive_exhausted = false;
@@ -897,7 +960,8 @@ impl GameSniffer {
                     sent_ms: header.sent_ms,
                 });
                 // A new token response means a new session key is coming, so the
-                // previous connection's anchor and search budget go with it.
+                // previous connection's live anchor and search budget go with it.
+                // `time_anchors` stays: that is where a reconnect's key is found.
                 self.last_time_seed = None;
                 self.bruteforce_attempts = 0;
             }
@@ -1861,9 +1925,10 @@ mod tests {
                 sniffer.bruteforce_attempts, 0,
                 "a run that recovered a key was not futile work"
             );
-            // Drop the anchor so the next round pays for the bruteforce again
-            // rather than taking the retained-seed fast path.
+            // Drop the anchors so the next round pays for the bruteforce again
+            // rather than taking either retained-seed path.
             sniffer.last_time_seed = None;
+            sniffer.time_anchors.clear();
         }
     }
 
@@ -1883,6 +1948,382 @@ mod tests {
 
         assert!(sniffer.recover_session_key(&message));
         assert_eq!(sniffer.last_time_seed, Some(sent_ms));
+    }
+
+    // -- end-to-end connections ------------------------------------------------
+    //
+    // Everything below drives real frames through `receive_packet`: a handshake,
+    // the token exchange under the dispatch key with a seed RSA-encrypted to the
+    // embedded client key, then traffic under the session key. Reconnects are a
+    // property of the whole state machine -- conversation binding, the deferred
+    // reset, seed installation and key recovery all take part -- so they are
+    // tested through it rather than by poking one method at a time.
+
+    /// The dispatch key the harness's game speaks for the login exchange.
+    fn dispatch_key() -> Vec<u8> {
+        new_key_from_seed(0xD15_0A7C)
+    }
+
+    /// A sniffer that knows [`dispatch_key`], the way irminsul's `keys/gi.json`
+    /// supplies the real ones.
+    ///
+    /// The version a key answers to is the first two bytes of the ciphertext XOR
+    /// the magic, and the plaintext starts with the magic, so it is simply the
+    /// key's own first two bytes.
+    fn connected_sniffer() -> GameSniffer {
+        let key = dispatch_key();
+        let version = u16::from_be_bytes([key[0], key[1]]);
+        GameSniffer::new().set_initial_keys(HashMap::from([(version, key)]))
+    }
+
+    /// PKCS#1 v1.5 padding wants random bytes, not secret ones; a fixed stream
+    /// keeps the fixture deterministic.
+    struct TestRng(u64);
+
+    impl rsa::rand_core::RngCore for TestRng {
+        fn next_u32(&mut self) -> u32 {
+            self.next_u64() as u32
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            // splitmix64
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            for byte in dest {
+                *byte = self.next_u64() as u8;
+            }
+        }
+
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+
+    impl rsa::rand_core::CryptoRng for TestRng {}
+
+    /// A `GetPlayerTokenRsp` payload carrying `seed` the way the server sends
+    /// it: RSA-encrypted to the client's key, then base64'd into a string field.
+    fn token_rsp_payload(sniffer: &GameSniffer, seed: u64) -> Vec<u8> {
+        let public = sniffer.rsa_keys[0].to_public_key();
+        let encrypted = public
+            .encrypt(
+                &mut TestRng(seed),
+                rsa::Pkcs1v15Encrypt,
+                &seed.to_be_bytes(),
+            )
+            .expect("an 8-byte seed fits the key");
+        field_bytes(11, BASE64_STANDARD.encode(encrypted).as_bytes())
+    }
+
+    /// The `draw`-th client seed the game's `System.Random` produces from
+    /// `time_seed` (0 is the first).
+    fn client_draw(time_seed: u64, draw: usize) -> u64 {
+        let mut generator = Random::seeded(time_seed as i32);
+        let mut value = 0;
+        for _ in 0..=draw {
+            value = generator.next_safe_uint64();
+        }
+        value
+    }
+
+    /// One segment at an explicit position in its conversation.
+    fn segment_frame_at(
+        direction: PacketDirection,
+        conv: u32,
+        sn: u32,
+        una: u32,
+        content: &[u8],
+    ) -> Vec<u8> {
+        let mut segment = game_segment(conv, content);
+        segment[16..20].copy_from_slice(&sn.to_le_bytes());
+        segment[20..24].copy_from_slice(&una.to_le_bytes());
+        match direction {
+            PacketDirection::Received => udp_frame(22102, 50000, &segment),
+            PacketDirection::Sent => udp_frame(50000, 22102, &segment),
+        }
+    }
+
+    /// One game connection on the wire, numbering its own segments.
+    struct Conn {
+        conv: u32,
+        sent_sn: u32,
+        recv_sn: u32,
+    }
+
+    impl Conn {
+        fn new(conv: u32) -> Self {
+            Self {
+                conv,
+                sent_sn: 0,
+                recv_sn: 0,
+            }
+        }
+
+        /// The next push in `direction`, carrying `plain` encrypted under `key`.
+        fn push(&mut self, direction: PacketDirection, key: &[u8], plain: &[u8]) -> Vec<u8> {
+            let mut data = plain.to_vec();
+            decrypt_command(key, &mut data);
+            let (sn, una) = match direction {
+                PacketDirection::Sent => {
+                    self.sent_sn += 1;
+                    (self.sent_sn - 1, self.recv_sn)
+                }
+                PacketDirection::Received => {
+                    self.recv_sn += 1;
+                    (self.recv_sn - 1, self.sent_sn)
+                }
+            };
+            segment_frame_at(direction, self.conv, sn, una, &data)
+        }
+
+        /// A server message under `key`, with its own command id.
+        fn server_message(&mut self, key: &[u8], command_id: u16) -> Vec<u8> {
+            self.push(
+                PacketDirection::Received,
+                key,
+                &command_bytes(command_id, &[], &field_varint(1, u64::from(command_id))),
+            )
+        }
+    }
+
+    /// Feed one frame and return the command ids it decoded to.
+    fn command_ids(sniffer: &mut GameSniffer, frame: Vec<u8>) -> Vec<u16> {
+        match sniffer.receive_packet(frame) {
+            Some(GamePacket::Commands(commands)) => {
+                commands.iter().map(|command| command.command_id).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The login exchange over `conn`: a handshake, the client's token request
+    /// and the server's token response under the dispatch key, then the first
+    /// server message under the session key derived from `combined`.
+    ///
+    /// The token response carries `client_seed ^ combined` and is stamped
+    /// `sent_ms`, which is all the sniffer gets to work from. Returns the
+    /// command ids the session message decoded to: `[SESSION_MESSAGE]` when the
+    /// key was recovered, nothing when it was not.
+    fn log_in(
+        sniffer: &mut GameSniffer,
+        conn: &mut Conn,
+        sent_ms: u64,
+        client_seed: u64,
+        combined: u64,
+    ) -> Vec<u16> {
+        let dispatch = dispatch_key();
+        sniffer.receive_packet(handshake_frame());
+
+        let request = command_bytes(TOKEN_REQ, &[], &field_varint(1, 1));
+        assert_eq!(
+            command_ids(
+                sniffer,
+                conn.push(PacketDirection::Sent, &dispatch, &request)
+            ),
+            vec![TOKEN_REQ],
+            "the token request decrypts under the dispatch key"
+        );
+
+        let response = command_bytes(
+            TOKEN_RSP,
+            &field_varint(6, sent_ms),
+            &token_rsp_payload(sniffer, client_seed ^ combined),
+        );
+        assert_eq!(
+            command_ids(
+                sniffer,
+                conn.push(PacketDirection::Received, &dispatch, &response)
+            ),
+            vec![TOKEN_RSP],
+            "the token response decrypts under the dispatch key"
+        );
+        assert_eq!(
+            sniffer.session_seeds.as_ref().map(|s| s.sent_ms),
+            Some(sent_ms),
+            "the token response installs its seeds"
+        );
+
+        command_ids(
+            sniffer,
+            conn.server_message(&new_key_from_seed(combined), SESSION_MESSAGE),
+        )
+    }
+
+    const TOKEN_REQ: u16 = 100;
+    const TOKEN_RSP: u16 = 101;
+    const SESSION_MESSAGE: u16 = 102;
+
+    /// A realistic login time, in the epoch milliseconds `PacketHead` carries.
+    const LOGIN_MS: u64 = 1_759_553_801_000;
+    const HOUR_MS: u64 = 3_600_000;
+
+    #[test]
+    fn a_first_login_recovers_the_session_key_from_the_send_time() {
+        // The baseline every reconnect test builds on: the client seeds its
+        // `System.Random` with the token response's send time and draws once.
+        let mut sniffer = connected_sniffer();
+        let mut conn = Conn::new(122_486);
+
+        let decoded = log_in(
+            &mut sniffer,
+            &mut conn,
+            LOGIN_MS,
+            client_draw(LOGIN_MS, 0),
+            0x1111_2222_3333_4444,
+        );
+
+        assert_eq!(decoded, vec![SESSION_MESSAGE]);
+        assert!(matches!(sniffer.key, Some(Key::Session(_))));
+        assert_eq!(sniffer.last_time_seed, Some(LOGIN_MS));
+    }
+
+    #[test]
+    fn a_reconnect_recovers_its_key_from_the_first_logins_time_seed() {
+        // What the log of 2026-10-04 shows, and what upstream konkers retains
+        // the client seed for: on an in-game reconnect the client does not
+        // reseed its `System.Random` -- it draws the *next* value from the one
+        // seeded at the first login. The new token response is stamped hours
+        // later, so a search around its send time finds nothing, however deep.
+        let mut sniffer = connected_sniffer();
+        let mut first = Conn::new(122_486);
+        assert_eq!(
+            log_in(
+                &mut sniffer,
+                &mut first,
+                LOGIN_MS,
+                client_draw(LOGIN_MS, 0),
+                0x1111_2222_3333_4444,
+            ),
+            vec![SESSION_MESSAGE]
+        );
+
+        let mut second = Conn::new(122_628);
+        let decoded = log_in(
+            &mut sniffer,
+            &mut second,
+            LOGIN_MS + 3 * HOUR_MS,
+            client_draw(LOGIN_MS, 1),
+            0x5555_6666_7777_8888,
+        );
+
+        assert_eq!(decoded, vec![SESSION_MESSAGE], "the reconnect must decode");
+        assert_eq!(
+            sniffer.bruteforce_attempts, 0,
+            "the retained time seed found it; no bruteforce run failed first"
+        );
+        assert_eq!(sniffer.session_generation(), 2);
+        assert_eq!(sniffer.last_time_seed, Some(LOGIN_MS));
+    }
+
+    #[test]
+    fn every_later_reconnect_draws_deeper_from_the_same_time_seed() {
+        // Three reconnects in one game process, the later ones several draws
+        // apart (anything else the client takes from that generator in between
+        // pushes the next seed further down it).
+        let mut sniffer = connected_sniffer();
+        let mut conv = 122_486;
+        for (hours, draw) in [(0u64, 0usize), (2, 1), (4, 5), (9, 40)] {
+            let mut conn = Conn::new(conv);
+            conv += 100;
+            let combined = 0xC0FF_EE00_0000_0000 | draw as u64;
+            let decoded = log_in(
+                &mut sniffer,
+                &mut conn,
+                LOGIN_MS + hours * HOUR_MS,
+                client_draw(LOGIN_MS, draw),
+                combined,
+            );
+            assert_eq!(decoded, vec![SESSION_MESSAGE], "draw {draw}");
+            assert_eq!(sniffer.bruteforce_attempts, 0, "draw {draw}");
+
+            // And the connection keeps decoding afterwards.
+            let key = new_key_from_seed(combined);
+            assert_eq!(
+                command_ids(&mut sniffer, conn.server_message(&key, 7)),
+                vec![7]
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_game_process_is_still_found_by_the_bruteforce() {
+        // Restarting the game reseeds the generator, so the retained time seed
+        // is useless for the next login. Probing it must cost only its own
+        // (bounded) search and then fall through to the search around the new
+        // send time, exactly as before.
+        let mut sniffer = connected_sniffer();
+        let mut first = Conn::new(122_486);
+        log_in(
+            &mut sniffer,
+            &mut first,
+            LOGIN_MS,
+            client_draw(LOGIN_MS, 0),
+            0x1111_2222_3333_4444,
+        );
+
+        let restarted = LOGIN_MS + 5 * HOUR_MS;
+        let mut second = Conn::new(130_000);
+        let decoded = log_in(
+            &mut sniffer,
+            &mut second,
+            restarted,
+            client_draw(restarted, 0),
+            0x9999_AAAA_BBBB_CCCC,
+        );
+
+        assert_eq!(decoded, vec![SESSION_MESSAGE]);
+        assert_eq!(sniffer.last_time_seed, Some(restarted));
+        assert_eq!(
+            sniffer.time_anchors,
+            vec![restarted, LOGIN_MS],
+            "the newest time seed is probed first next time"
+        );
+    }
+
+    #[test]
+    fn retained_time_seeds_are_bounded_and_deduplicated() {
+        let mut sniffer = GameSniffer::new();
+        for seed in [1u64, 2, 1, 3, 4, 5, 6] {
+            sniffer.install_session_key(new_key_from_seed(seed), seed);
+        }
+
+        assert_eq!(sniffer.time_anchors.len(), MAX_TIME_ANCHORS);
+        assert_eq!(sniffer.time_anchors[0], 6, "newest first");
+        let mut unique = sniffer.time_anchors.clone();
+        unique.dedup();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), sniffer.time_anchors.len(), "no duplicates");
+    }
+
+    #[test]
+    fn earlier_time_seeds_are_only_probed_inside_the_budget() {
+        // Unlike the live anchor, these are probed for every undecryptable
+        // message of a connection whose key is not found -- so they share the
+        // bruteforce budget, which is what keeps a dead connection from paying
+        // for them on every packet.
+        let sent_ms = 1_700_000_000_000u64;
+        let (server_seed, message) = recoverable_seeds(sent_ms, 44);
+
+        let mut sniffer = GameSniffer::new();
+        sniffer.session_seeds = Some(SessionSeeds {
+            seeds: vec![server_seed],
+            sent_ms: sent_ms + 3 * HOUR_MS,
+        });
+        sniffer.time_anchors = vec![sent_ms];
+        sniffer.bruteforce_attempts = MAX_BRUTEFORCE_ATTEMPTS;
+        assert!(!sniffer.recover_session_key(&message));
+
+        sniffer.bruteforce_attempts = 0;
+        assert!(sniffer.recover_session_key(&message));
+        assert_eq!(sniffer.bruteforce_attempts, 0);
     }
 
     #[test]
@@ -1930,8 +2371,7 @@ mod tests {
         // eat the first two messages of the new connection -- and the
         // dispatch-key-encrypted `GetPlayerTokenRsp` is among them.
         let mut sniffer = GameSniffer::new();
-        sniffer.key = Some(Key::Session(new_key_from_seed(11)));
-        sniffer.last_time_seed = Some(1);
+        sniffer.install_session_key(new_key_from_seed(11), 1);
 
         sniffer.receive_packet(handshake_frame());
         assert!(sniffer.pending_reset);
@@ -1941,7 +2381,11 @@ mod tests {
 
         assert!(sniffer.key.is_none(), "the dead session must be torn down");
         assert!(!sniffer.pending_reset);
+        // The live anchor is per connection (it is probed outside the budget);
+        // the time seed itself is kept, because the reconnect's key is drawn
+        // from the same generator.
         assert!(sniffer.last_time_seed.is_none());
+        assert_eq!(sniffer.time_anchors, vec![1]);
         assert_eq!(sniffer.session_generation(), 1);
         assert!(
             sniffer.recv_kcp.as_ref().map(|kcp| kcp.conv_id) == Some(7),
@@ -1978,8 +2422,7 @@ mod tests {
     #[test]
     fn a_deferred_reset_fires_once_the_session_key_is_also_dead() {
         let mut sniffer = GameSniffer::new();
-        sniffer.key = Some(Key::Session(new_key_from_seed(9)));
-        sniffer.last_time_seed = Some(1);
+        sniffer.install_session_key(new_key_from_seed(9), 1);
         sniffer.receive_packet(handshake_frame());
 
         for _ in 0..MAX_SESSION_FAILURES {
@@ -1989,13 +2432,18 @@ mod tests {
         assert!(sniffer.key.is_none(), "a corroborated handshake must reset");
         assert!(!sniffer.pending_reset);
         assert!(sniffer.last_time_seed.is_none());
+        assert_eq!(
+            sniffer.time_anchors,
+            vec![1],
+            "the time seed outlives the connection it was found on"
+        );
     }
 
     #[test]
     fn a_handshake_resets_when_no_session_key_is_live() {
         let mut sniffer = GameSniffer::new();
+        sniffer.install_session_key(new_key_from_seed(10), 1);
         sniffer.key = Some(Dispatch(new_key_from_seed(10)));
-        sniffer.last_time_seed = Some(1);
         sniffer.session_seeds = Some(SessionSeeds {
             seeds: vec![1],
             sent_ms: 2,
@@ -2005,10 +2453,13 @@ mod tests {
 
         assert!(sniffer.key.is_none());
         assert!(sniffer.session_seeds.is_none());
-        assert!(
-            sniffer.last_time_seed.is_none(),
-            "a stale anchor makes every reconnect burn a failing bruteforce"
-        );
+        // This used to assert that *every* anchor was dropped, on the grounds
+        // that a stale one made each reconnect burn a failing bruteforce. That
+        // was true while the anchor fed a full sweep; it now feeds a bounded
+        // probe inside the budget, and dropping it is what made in-game
+        // reconnects undecryptable. Only the live, per-connection anchor goes.
+        assert!(sniffer.last_time_seed.is_none());
+        assert_eq!(sniffer.time_anchors, vec![1]);
     }
 
     // -- property decoding -----------------------------------------------------
