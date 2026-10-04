@@ -1818,8 +1818,21 @@ async fn get_database(
     static DATABASE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/game_data.gz"));
     let reader = GzDecoder::new(DATABASE);
     let db = anime_game_data::AnimeGameData::new_from_reader(reader)?;
+    tracing::info!(
+        dump = embedded_game_data_sha().unwrap_or("unknown"),
+        "loaded the embedded game data"
+    );
 
     Ok(db)
+}
+
+/// The Dimbreath dump commit the embedded game data was built from.
+///
+/// `build.rs` reads it back out of the `game_data.gz` it embeds; `None` when it
+/// could not. A binary built before a game patch carries an older dump, and
+/// this is what says so next to the `unknown_*` gaps in its exports.
+pub fn embedded_game_data_sha() -> Option<&'static str> {
+    Some(env!("IRMINSUL_GAME_DATA_SHA")).filter(|sha| !sha.is_empty())
 }
 
 async fn capture_task(
@@ -1931,6 +1944,19 @@ mod tests {
                 .as_deref(),
             Some("http://localhost:5173/app/a/1")
         );
+    }
+
+    #[test]
+    fn the_embedded_game_data_names_its_dump_commit() {
+        // `build.rs` only emits something that looks like a commit, or nothing.
+        if let Some(sha) = embedded_game_data_sha() {
+            assert!((7..=64).contains(&sha.len()), "{sha}");
+            assert!(
+                sha.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "{sha}"
+            );
+        }
     }
 
     #[test]
