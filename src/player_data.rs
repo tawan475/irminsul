@@ -46,6 +46,31 @@ const CHARACTER_LEVEL_RANGE: RangeInclusive<u32> = 1..=1_000;
 /// plausibly comes with another ascension phase.
 const CHARACTER_ASCENSION_RANGE: RangeInclusive<u32> = 0..=100;
 
+/// The two placeholder avatars ConstValueExcelConfigData names
+/// `CONST_VALUE_TPS_AVATAR_CONFIG_ID_FEMALE` and `..._MALE`: both are called
+/// "Traveler", carry a crossbow and an empty skill depot, and are not playable.
+/// The tracker excludes the same two ids.
+const TPS_AVATAR_ID_FEMALE: u32 = 10000135;
+const TPS_AVATAR_ID_MALE: u32 = 10000134;
+
+/// Avatar ids that are never exported: the TPS placeholders.
+///
+/// `anime-game-data` reads them from ConstValueExcelConfigData, whose `value`
+/// column is obfuscated from 7.1 on (`CBOMLBFIPJM` at dump 792978e5), so both
+/// lookups fail and the exclusion used to do nothing at all. The ids have not
+/// moved -- that dump still lists 10000135 and 10000134 under those names -- so
+/// they stand in for whichever lookup fails.
+fn tps_avatar_ids(game_data: &AnimeGameData) -> [u32; 2] {
+    [
+        game_data
+            .get_tps_avatar_id_female()
+            .unwrap_or(TPS_AVATAR_ID_FEMALE),
+        game_data
+            .get_tps_avatar_id_male()
+            .unwrap_or(TPS_AVATAR_ID_MALE),
+    ]
+}
+
 /// Why, and how often, an export fell short of the captured data.
 ///
 /// The game data is baked into the binary at build time, so after a Genshin
@@ -500,13 +525,7 @@ impl PlayerData {
         report: &mut ExportReport,
     ) -> Vec<good::Character> {
         // TPS avatars are not normal characters and are excluded from export.
-        let tps_avatar_ids: Vec<u32> = [
-            self.game_data.get_tps_avatar_id_female(),
-            self.game_data.get_tps_avatar_id_male(),
-        ]
-        .into_iter()
-        .filter_map(Result::ok)
-        .collect();
+        let tps_avatar_ids = tps_avatar_ids(&self.game_data);
 
         self.characters
             .values()
@@ -952,35 +971,76 @@ mod tests {
         PlayerData::new(AnimeGameData::new())
     }
 
-    /// A `PlayerData` over a hand-built game-data database.
+    /// A hand-built game-data database: the inside of each map as a JSON
+    /// fragment, every one left out empty.
     ///
     /// `AnimeGameData` has no builder, but it deserializes its whole database
-    /// from JSON, which is enough to reproduce the two real-world shapes the
-    /// export report gets wrong: a skill id the database does not index, and
-    /// two item ids that share one display name.
+    /// from JSON, which is enough to reproduce the real-world shapes the export
+    /// gets wrong.
+    #[derive(Default)]
+    struct TestGameData {
+        affix_map: &'static str,
+        artifact_map: &'static str,
+        character_map: &'static str,
+        material_map: &'static str,
+        property_map: &'static str,
+        skill_type_map: &'static str,
+        weapon_map: &'static str,
+        /// `(female, male)`; `None` is the 7.1 dump, where both are `null`.
+        tps_avatar_ids: Option<(u32, u32)>,
+    }
+
+    impl TestGameData {
+        fn build(&self) -> AnimeGameData {
+            let (tps_female, tps_male) = match self.tps_avatar_ids {
+                Some((female, male)) => (female.to_string(), male.to_string()),
+                None => ("null".to_string(), "null".to_string()),
+            };
+            let json = format!(
+                r#"{{
+                    "version": 4,
+                    "git_hash": "test",
+                    "affix_map": {{{}}},
+                    "artifact_map": {{{}}},
+                    "character_map": {{{}}},
+                    "material_map": {{{}}},
+                    "property_map": {{{}}},
+                    "set_map": {{}},
+                    "skill_element_map": {{}},
+                    "skill_type_map": {{{}}},
+                    "tps_avatar_id_female": {tps_female},
+                    "tps_avatar_id_male": {tps_male},
+                    "weapon_map": {{{}}}
+                }}"#,
+                self.affix_map,
+                self.artifact_map,
+                self.character_map,
+                self.material_map,
+                self.property_map,
+                self.skill_type_map,
+                self.weapon_map,
+            );
+            AnimeGameData::new_from_reader(json.as_bytes()).unwrap()
+        }
+    }
+
+    /// A `PlayerData` over a hand-built game-data database: a skill id the
+    /// database does not index and two item ids that share one display name
+    /// are the two shapes the export report used to get wrong.
     fn player_data_with(
-        character_map: &str,
-        material_map: &str,
-        skill_type_map: &str,
+        character_map: &'static str,
+        material_map: &'static str,
+        skill_type_map: &'static str,
     ) -> PlayerData {
-        let json = format!(
-            r#"{{
-                "version": 4,
-                "git_hash": "test",
-                "affix_map": {{}},
-                "artifact_map": {{}},
-                "character_map": {{{character_map}}},
-                "material_map": {{{material_map}}},
-                "property_map": {{}},
-                "set_map": {{}},
-                "skill_element_map": {{}},
-                "skill_type_map": {{{skill_type_map}}},
-                "tps_avatar_id_female": null,
-                "tps_avatar_id_male": null,
-                "weapon_map": {{}}
-            }}"#
-        );
-        PlayerData::new(AnimeGameData::new_from_reader(json.as_bytes()).unwrap())
+        PlayerData::new(
+            TestGameData {
+                character_map,
+                material_map,
+                skill_type_map,
+                ..Default::default()
+            }
+            .build(),
+        )
     }
 
     /// Export settings that filter nothing out.
@@ -1308,6 +1368,45 @@ mod tests {
 
         assert!(report.is_empty(), "would toast: {}", report.summary());
         assert_eq!(report.degraded_summary(), "unknown_skill: 1");
+    }
+
+    #[test]
+    fn tps_placeholders_are_left_out_when_the_game_data_lacks_their_ids() {
+        // The 7.1 dump: both const lookups fail, and both placeholders are in
+        // the avatar table as "Traveler".
+        let mut data = player_data_with(
+            r#""10000046": "Hu Tao", "10000134": "Traveler", "10000135": "Traveler""#,
+            "",
+            "",
+        );
+        data.process_characters(&[
+            character(10000046, &[]),
+            character(10000134, &[]),
+            character(10000135, &[]),
+        ]);
+
+        let mut report = ExportReport::default();
+        let characters = data.export_genshin_optimizer_characters(&settings(), &mut report);
+
+        let keys: Vec<&str> = characters.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(keys, ["HuTao"]);
+        assert!(report.is_empty(), "{}", report.summary());
+    }
+
+    #[test]
+    fn tps_avatar_ids_come_from_the_game_data_when_it_has_them() {
+        let with_ids = TestGameData {
+            tps_avatar_ids: Some((10000999, 10000998)),
+            ..Default::default()
+        };
+        assert_eq!(tps_avatar_ids(&with_ids.build()), [10000999, 10000998]);
+
+        let without = TestGameData::default();
+        assert_eq!(
+            tps_avatar_ids(&without.build()),
+            [TPS_AVATAR_ID_FEMALE, TPS_AVATAR_ID_MALE]
+        );
+        assert_eq!(tps_avatar_ids(&AnimeGameData::new()), [10000135, 10000134]);
     }
 
     #[test]
