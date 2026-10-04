@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use kcp::{KCP_OVERHEAD, Kcp, get_conv};
-use tracing::{Level, error, info, instrument, span, trace, warn};
+use tracing::{Level, info, instrument, span, trace, warn};
 
 use crate::bytes_as_hex;
 
@@ -49,17 +49,48 @@ impl ForeignTally {
     }
 }
 
-impl KcpSniffer {
-    #[instrument(skip(segment))]
-    pub fn try_new(segment: &[u8]) -> Option<Self> {
-        validate_kcp_segment(segment).map(Self::new).or_else(|| {
-            error!("could not create new kcp instance");
-            None
-        })
-    }
+/// The fields of a datagram's first game KCP segment that decide which
+/// conversation it belongs to and where in that conversation it sits.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SegmentHead {
+    pub(crate) conv: u32,
+    sn: u32,
+    una: u32,
+}
 
+impl SegmentHead {
+    /// Whether this segment can come from the opening of its conversation.
+    ///
+    /// A conversation starts with `sn` and `una` at zero on both sides, and a
+    /// sniffer created for it starts expecting `sn` 0. One created from a
+    /// segment further in than its receive window can never deliver anything:
+    /// every push of that conversation lands outside the window, and the
+    /// segments that would advance it were sent before the sniffer existed.
+    /// Binding one is therefore never useful -- and when the segment is a
+    /// straggler of a connection that already ended, it is actively harmful,
+    /// because the sniffer then rejects the conversation that replaced it.
+    pub(crate) fn could_open_conversation(&self) -> bool {
+        self.sn < u32::from(RCV_WND) && self.una < u32::from(RCV_WND)
+    }
+}
+
+/// Parse the head of the first segment in a game KCP datagram, or `None` (with
+/// a warning) when the datagram is too short to be one.
+pub(crate) fn segment_head(datagram: &[u8]) -> Option<SegmentHead> {
+    let conv = validate_kcp_segment(datagram)?;
+    let field =
+        |offset: usize| u32::from_le_bytes(datagram[offset..offset + 4].try_into().unwrap());
+    // `validate_kcp_segment` guaranteed a full 32-byte header.
+    Some(SegmentHead {
+        conv,
+        sn: field(SN_OFFSET),
+        una: field(UNA_OFFSET),
+    })
+}
+
+impl KcpSniffer {
     #[instrument]
-    fn new(conv_id: u32) -> Self {
+    pub(crate) fn new(conv_id: u32) -> Self {
         info!("new connection, created new kcp instance");
 
         KcpSniffer {
@@ -126,10 +157,13 @@ impl KcpSniffer {
     }
 }
 
+/// Receive window of every sniffer, in segments.
+const RCV_WND: u16 = 1024;
+
 #[inline]
 fn new_kcp(conv_id: u32) -> Kcp<Vec<u8>> {
     let mut kcp = Kcp::new(conv_id, Vec::new());
-    kcp.set_wndsize(1024, 1024);
+    kcp.set_wndsize(1024, RCV_WND);
     kcp
 }
 
@@ -149,6 +183,7 @@ const CMD_OFFSET: usize = 8;
 const FRG_OFFSET: usize = 9;
 const TS_OFFSET: usize = 12;
 const SN_OFFSET: usize = 16;
+const UNA_OFFSET: usize = 20;
 
 /// `IKCP_CMD_ACK`, the only command whose `ts` the reassembler ever compares.
 const KCP_CMD_ACK: u8 = 82;
