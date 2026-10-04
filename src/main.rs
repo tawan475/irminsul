@@ -24,6 +24,8 @@ mod good;
 mod monitor;
 mod pcapng;
 mod player_data;
+mod recording;
+mod replay;
 mod update;
 mod wish;
 
@@ -160,13 +162,39 @@ struct Args {
     read_from_file: bool,
 
     #[arg(
+        long = "replay-export",
+        value_name = "OUT_JSON",
+        requires = "savefile_path",
+        conflicts_with_all = ["read_from_file", "capture_backend"],
+        help = "Decode the recording SAVEFILE_PATH without the app and write its export to OUT_JSON",
+        long_help = "Decode the recording SAVEFILE_PATH without starting the app, and write the \
+                     export it yields to OUT_JSON.\n\n\
+                     The recording is the irminsul-data/log/*.pcapng a debug build writes, or a \
+                     pcap or pcapng file from `-b pcap <template>` or Wireshark; no pcap support \
+                     is needed to read it. It is decoded the way live capture decodes: the \
+                     session key is recovered from the login in the recording, and a reconnect or \
+                     a second login replaces the earlier data once it delivers its own. The state \
+                     at the end is exported with the default export settings (pretty-printed, \
+                     gi_* extras included) and stamped with the time its data was captured.\n\n\
+                     Nothing is uploaded, no key is verified, no automation file is saved, no \
+                     update is checked for, no settings are read or written, nothing under \
+                     Irminsul's data directory is touched, and the single-instance lock is not \
+                     taken, so it can run beside a running Irminsul. It needs no administrator \
+                     rights, but on Windows the executable's manifest still asks for them before \
+                     any of this runs: set __COMPAT_LAYER=RunAsInvoker to start it unelevated.\n\n\
+                     The log goes to stdout and to OUT_JSON.log (RUST_LOG sets the level). Exits \
+                     with 1 when nothing could be decoded, saying why."
+    )]
+    replay_export: Option<PathBuf>,
+
+    #[arg(
         value_name = "SAVEFILE_PATH",
-        help = "Capture file to replay with --read-from-file, or a filename template to record to",
-        long_help = "Capture file to replay with --read-from-file, or a filename template to \
-                     record live traffic to.\n\n\
-                     With --read-from-file the path is used as given: it is the recording to \
-                     replay.\n\n\
-                     Without it the path is a template, not an output file. Irminsul captures on \
+        help = "Recording to replay (--read-from-file, --replay-export), or a filename template to record to",
+        long_help = "Recording to replay with --read-from-file or --replay-export, or a filename \
+                     template to record live traffic to.\n\n\
+                     With --read-from-file or --replay-export the path is used as given: it is \
+                     the recording to replay.\n\n\
+                     Without either the path is a template, not an output file. Irminsul captures on \
                      every eligible network interface at once, and each one is recorded to its \
                      own file named after the device, because one pcap dump file cannot be shared \
                      by several capture handles. `irminsul -b pcap session.pcap` therefore writes \
@@ -226,7 +254,29 @@ impl ReloadHandle {
     }
 }
 
+impl Args {
+    /// `(recording, export)` when this is a `--replay-export` run.
+    fn replay_request(&self) -> Option<(&Path, &Path)> {
+        let out = self.replay_export.as_deref()?;
+        // clap requires SAVEFILE_PATH with --replay-export.
+        Some((self.savefile_path.as_deref()?, out))
+    }
+}
+
 fn main() -> eframe::Result {
+    let args = Args::parse();
+
+    // A replay is a command-line tool, not the app, and it goes before
+    // anything the app does at startup: the single-instance lock (so it runs
+    // beside a live Irminsul), the log rotation in the data directory (which
+    // in a debug build would move the very recording being replayed), and the
+    // elevation check. See `replay.rs` for what else it never does.
+    if let Some((recording, out)) = args.replay_request() {
+        let code = replay::run(recording, out);
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        std::process::exit(code);
+    }
+
     let instance = single_instance::SingleInstance::new("irminsul_app_instance").unwrap();
     if !instance.is_single() {
         eprintln!("Another instance of Irminsul is already running.");
@@ -234,8 +284,6 @@ fn main() -> eframe::Result {
     }
 
     let (_guard, reload_handle) = tracing_init().unwrap();
-
-    let args = Args::parse();
 
     if !args.no_admin && !args.read_from_file {
         #[cfg(any(windows, unix))]
@@ -488,7 +536,53 @@ fn tracing_init() -> Result<(tracing_appender::non_blocking::WorkerGuard, Reload
 mod tests {
     use std::time::{Duration, SystemTime};
 
+    use clap::CommandFactory;
+
     use super::*;
+
+    fn parse(args: &[&str]) -> Result<Args, clap::Error> {
+        Args::try_parse_from(std::iter::once("irminsul").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn the_command_line_definition_is_valid() {
+        Args::command().debug_assert();
+    }
+
+    #[test]
+    fn replay_export_takes_the_export_path_and_the_recording() {
+        let expected = Some((Path::new("latest.pcapng"), Path::new("out.json")));
+        let args = parse(&["--replay-export", "out.json", "latest.pcapng"]).unwrap();
+        assert_eq!(args.replay_request(), expected);
+        let args = parse(&["latest.pcapng", "--replay-export=out.json"]).unwrap();
+        assert_eq!(args.replay_request(), expected);
+    }
+
+    #[test]
+    fn replay_export_needs_a_recording() {
+        assert!(parse(&["--replay-export", "out.json"]).is_err());
+    }
+
+    #[test]
+    fn replay_export_takes_no_capture_options() {
+        // It reads the recording itself; a backend or -r would mean the app.
+        assert!(parse(&["--replay-export", "o.json", "-r", "rec.pcapng"]).is_err());
+        assert!(parse(&["--replay-export", "o.json", "-b", "pcap", "rec.pcapng"]).is_err());
+    }
+
+    #[test]
+    fn the_app_modes_are_not_replays() {
+        // Each of these starts the app, never the headless replay.
+        for args in [
+            &[][..],
+            &["--no-admin"][..],
+            &["-r", "rec.pcapng"][..],
+            &["-b", "pcap", "template.pcap"][..],
+        ] {
+            let parsed = parse(args).unwrap();
+            assert_eq!(parsed.replay_request(), None, "{args:?}");
+        }
+    }
 
     /// A fixed instant to age the fixtures relative to, so mtime ordering does
     /// not depend on how fast the filesystem is.

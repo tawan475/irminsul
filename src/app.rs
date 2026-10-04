@@ -184,22 +184,7 @@ impl SavedAppState {
 impl Default for SavedAppState {
     fn default() -> Self {
         Self {
-            export_settings: ExportSettings {
-                include_characters: true,
-                include_artifacts: true,
-                include_weapons: true,
-                include_materials: true,
-                fake_initialize_4th_line: false,
-                min_character_level: 1,
-                min_character_ascension: 0,
-                min_character_constellation: 0,
-                min_artifact_level: 0,
-                min_artifact_rarity: 3,
-                min_weapon_level: 1,
-                min_weapon_refinement: 0,
-                min_weapon_ascension: 0,
-                min_weapon_rarity: 3,
-            },
+            export_settings: ExportSettings::default(),
             start_on_startup: false,
             save_result_to_file: false,
             save_result_folder: None,

@@ -437,6 +437,28 @@ pub struct ExportSettings {
     pub min_weapon_rarity: u32,
 }
 
+/// What a fresh install exports: every category, with the default minimums.
+impl Default for ExportSettings {
+    fn default() -> Self {
+        Self {
+            include_characters: true,
+            include_artifacts: true,
+            include_weapons: true,
+            include_materials: true,
+            fake_initialize_4th_line: false,
+            min_character_level: 1,
+            min_character_ascension: 0,
+            min_character_constellation: 0,
+            min_artifact_level: 0,
+            min_artifact_rarity: 3,
+            min_weapon_level: 1,
+            min_weapon_refinement: 0,
+            min_weapon_ascension: 0,
+            min_weapon_rarity: 3,
+        }
+    }
+}
+
 pub struct PlayerData {
     game_data: AnimeGameData,
     achievements: HashMap<u32, Achievement>,
@@ -824,11 +846,22 @@ impl PlayerData {
         &self,
         settings: &ExportSettings,
     ) -> Result<(String, ExportReport)> {
-        let mut report = ExportReport::default();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
+        let (good, report) = self.export_at(settings, now_ms);
+
+        let json = serde_json::to_string(&good)?;
+        tracing::trace!("{json}");
+        Ok((json, report))
+    }
+
+    /// The export as it would have been made at `now_ms` (epoch milliseconds):
+    /// its `timestamp`, and the "now" that achievement and character times
+    /// are checked against. `--replay-export` passes the recording's time.
+    pub fn export_at(&self, settings: &ExportSettings, now_ms: u64) -> (good::Good, ExportReport) {
+        let mut report = ExportReport::default();
         let good = self.build_good(settings, &mut report, now_ms);
 
         if report.has_degradations() {
@@ -837,10 +870,7 @@ impl PlayerData {
                 report.degraded_summary()
             );
         }
-
-        let json = serde_json::to_string(&good)?;
-        tracing::trace!("{json}");
-        Ok((json, report))
+        (good, report)
     }
 
     /// The export, stamped `now_ms` (epoch milliseconds).
