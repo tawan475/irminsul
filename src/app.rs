@@ -38,6 +38,7 @@ use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::game_watch::{GameStatus, MissedLaunch, Severity};
+use crate::good::GiPlayer;
 use crate::monitor::Monitor;
 use crate::player_data::ExportSettings;
 use crate::update::{InstallLock, UpdateAnswer, check_for_app_update};
@@ -183,22 +184,7 @@ impl SavedAppState {
 impl Default for SavedAppState {
     fn default() -> Self {
         Self {
-            export_settings: ExportSettings {
-                include_characters: true,
-                include_artifacts: true,
-                include_weapons: true,
-                include_materials: true,
-                fake_initialize_4th_line: false,
-                min_character_level: 1,
-                min_character_ascension: 0,
-                min_character_constellation: 0,
-                min_artifact_level: 0,
-                min_artifact_rarity: 3,
-                min_weapon_level: 1,
-                min_weapon_refinement: 0,
-                min_weapon_ascension: 0,
-                min_weapon_rarity: 3,
-            },
+            export_settings: ExportSettings::default(),
             start_on_startup: false,
             save_result_to_file: false,
             save_result_folder: None,
@@ -357,6 +343,74 @@ fn missing_export_data_toast(missing: &[&'static str]) -> String {
     )
 }
 
+/// The captured UID, when the tracker key verified to an account with another.
+///
+/// `None` whenever either side is unknown: the old backend may answer with no
+/// UID ("N/A"), an account need not have one set, and no UID is claimed for a
+/// capture whose guids disagree.
+fn uid_mismatch(account: &TrackerAccount, captured: Option<u32>) -> Option<u32> {
+    let captured = captured?;
+    let linked: u64 = account.uid.trim().parse().ok()?;
+    (linked != u64::from(captured)).then_some(captured)
+}
+
+/// What the UID warning says, in its toast and its tooltip.
+fn uid_mismatch_message(account: &TrackerAccount, captured: u32) -> String {
+    format!(
+        "This capture is UID {captured}, but the tracker key belongs to {} (UID {}). Uploads \
+         still go to that account: log in with it, or link the key of the account you are \
+         playing.",
+        account.name,
+        account.uid.trim()
+    )
+}
+
+/// The data panel's account line, e.g. `AR 60 · WL 8 · Resin 124 at login`.
+///
+/// `None` when none of the three was captured. "At login" because that is
+/// when the game sends them: nothing here follows play, and resin in
+/// particular keeps regenerating after the snapshot.
+fn player_summary(player: &GiPlayer) -> Option<String> {
+    let parts: Vec<String> = [
+        player.ar.map(|ar| format!("AR {ar}")),
+        player.wl.map(|wl| format!("WL {wl}")),
+        player.resin.map(|resin| format!("Resin {resin}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| format!("{} at login", parts.join(" · ")))
+}
+
+/// The tooltip on [`player_summary`]'s line: the caveat, then the rest of what
+/// `gi_player` holds.
+fn player_details(player: &GiPlayer) -> String {
+    let facts: Vec<String> = [
+        player.uid.map(|uid| format!("UID {uid}")),
+        player.ar_exp.map(|exp| format!("AR EXP {exp}")),
+        player
+            .wl_limit
+            .map(|limit| format!("World Level limit {limit}")),
+        player.story_keys.map(|keys| format!("Story Keys {keys}")),
+        // The game counts stamina in hundredths.
+        player
+            .max_stamina
+            .map(|stamina| format!("Max stamina {}", stamina / 100)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    let mut details = "A snapshot from login: the game sends these when you enter the world and \
+                       Irminsul does not follow them while you play (resin keeps regenerating)."
+        .to_string();
+    if !facts.is_empty() {
+        details.push_str("\n\n");
+        details.push_str(&facts.join("\n"));
+    }
+    details
+}
+
 pub struct IrminsulApp {
     ui_message_tx: mpsc::UnboundedSender<Message>,
     /// Answers to the update prompt only. Keeping these off `ui_message_tx` is
@@ -406,6 +460,13 @@ pub struct IrminsulApp {
     tracker_account: Option<TrackerAccount>,
     tracker_verify_rx: Option<oneshot::Receiver<Result<TrackerAccount>>>,
     tracker_upload_rx: Option<oneshot::Receiver<Result<(), String>>>,
+    /// The `(linked account UID, captured UID)` pair the mismatch toast was
+    /// last raised for, so it appears once per occurrence rather than per
+    /// frame. See `note_uid_mismatch`.
+    uid_mismatch_warned: Option<(String, u32)>,
+    /// The (linked UID, captured UID) pair last logged as agreeing, so the
+    /// "UIDs match" line is written once rather than every frame.
+    uid_match_logged: Option<(String, u32)>,
 
     /// The "Genshin is already running" modal.
     game_missed_modal_open: bool,
@@ -817,6 +878,8 @@ impl IrminsulApp {
             tracker_account: None,
             tracker_verify_rx,
             tracker_upload_rx: None,
+            uid_mismatch_warned: None,
+            uid_match_logged: None,
             tray_icon,
             state_rx,
             wish_url_rx,
@@ -1079,7 +1142,11 @@ impl eframe::App for IrminsulApp {
                     if settings_button.clicked() {
                         self.app_settings_open = true;
                     }
-                    ui.label(env!("CARGO_PKG_VERSION").to_string());
+                    ui.label(env!("CARGO_PKG_VERSION").to_string())
+                        .on_hover_text(format!(
+                            "Game data: Dimbreath dump {}, embedded when this build was made",
+                            crate::monitor::embedded_game_data_sha().unwrap_or("unknown")
+                        ));
                     egui::warn_if_debug_build(ui);
                 });
             });
@@ -1487,6 +1554,13 @@ impl IrminsulApp {
                 Self::data_state(ui, "Achievements", app_state.updated.achievements_updated);
             });
 
+        if let Some(player) = &app_state.player
+            && let Some(summary) = player_summary(player)
+        {
+            ui.label(RichText::new(summary).color(Color32::GRAY))
+                .on_hover_text(player_details(player));
+        }
+
         ui.add_space(4.0);
 
         let status_text = match app_state.updated.achievements_updated_time {
@@ -1852,6 +1926,52 @@ impl IrminsulApp {
         }
     }
 
+    /// Warn, once per occurrence, that the captured account is not the one the
+    /// tracker key belongs to.
+    ///
+    /// Only a warning: an upload still goes to the key's account, as it always
+    /// has, and the UID scheme this relies on is not yet proven on every
+    /// capture. Raised as soon as both UIDs are known, which is ahead of the
+    /// automation export's debounce; the tracker section keeps saying it for as
+    /// long as it is true.
+    fn note_uid_mismatch(&mut self, captured_uid: Option<u32>) {
+        let mismatch = self.tracker_account.as_ref().and_then(|account| {
+            uid_mismatch(account, captured_uid).map(|captured| (account.clone(), captured))
+        });
+        let Some((account, captured)) = mismatch else {
+            // Re-armed, so a later recurrence speaks up again.
+            self.uid_mismatch_warned = None;
+            // Say so when the two agree too: the UID is derived from guids by
+            // a scheme that is still being verified, and a match is the proof.
+            if let (Some(account), Some(captured)) = (&self.tracker_account, captured_uid) {
+                let pair = (account.uid.trim().to_string(), captured);
+                if self.uid_match_logged.as_ref() != Some(&pair) {
+                    tracing::info!(
+                        captured,
+                        linked = %pair.0,
+                        "the captured UID matches the tracker key's account"
+                    );
+                    self.uid_match_logged = Some(pair);
+                }
+            }
+            return;
+        };
+
+        let occurrence = (account.uid.clone(), captured);
+        if self.uid_mismatch_warned.as_ref() == Some(&occurrence) {
+            return;
+        }
+        tracing::warn!(
+            captured,
+            linked = %account.uid,
+            "the captured account is not the one the tracker key belongs to"
+        );
+        self.toasts
+            .warning(uid_mismatch_message(&account, captured))
+            .duration(Some(Duration::from_secs(15)));
+        self.uid_mismatch_warned = Some(occurrence);
+    }
+
     fn request_tracker_verify(&mut self) {
         let key = self.saved_state.tracker_import_key.clone();
         if key.is_empty() {
@@ -1947,6 +2067,9 @@ impl IrminsulApp {
             }
         }
 
+        let captured_uid = app_state.player.as_ref().and_then(|player| player.uid);
+        self.note_uid_mismatch(captured_uid);
+
         // Only while the key is verified: `tracker_account` is set by a
         // successful verify and cleared whenever one starts or fails.
         let dashboard_url = self
@@ -2029,6 +2152,18 @@ impl IrminsulApp {
                                 .color(Color32::GRAY),
                         );
                     });
+                    // Shown for as long as it is true; the toast in
+                    // `note_uid_mismatch` only announces it.
+                    if let Some(captured) = uid_mismatch(account, captured_uid) {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} Captured UID {captured} is not this account's",
+                                egui_material_icons::icons::ICON_WARNING
+                            ))
+                            .color(Color32::RED),
+                        )
+                        .on_hover_text(uid_mismatch_message(account, captured));
+                    }
                 } else if self.tracker_verify_rx.is_some() {
                     ui.label(RichText::new("Verifying...").color(Color32::YELLOW));
                 } else {
@@ -2345,6 +2480,21 @@ impl IrminsulApp {
 
             OptimizerExportTarget::TrackerManual => {
                 if can_upload_to_tracker(&self.saved_state) {
+                    // Said again at the click, then uploaded anyway: see
+                    // `note_uid_mismatch`.
+                    let captured_uid = self
+                        .state_rx
+                        .borrow()
+                        .player
+                        .as_ref()
+                        .and_then(|player| player.uid);
+                    if let Some(account) = &self.tracker_account
+                        && let Some(captured) = uid_mismatch(account, captured_uid)
+                    {
+                        self.toasts
+                            .warning(uid_mismatch_message(account, captured))
+                            .duration(Some(Duration::from_secs(15)));
+                    }
                     self.tracker_upload_json(json);
                 } else if !self.saved_state.tracker_import_key.is_empty() {
                     self.toasts
@@ -2886,5 +3036,93 @@ mod tests {
             None
         );
         assert_eq!(tracker_error_status("HTTP - no status"), None);
+    }
+
+    fn login_player() -> GiPlayer {
+        GiPlayer {
+            uid: Some(813_152_114),
+            ar: Some(60),
+            ar_exp: Some(0),
+            wl: Some(8),
+            wl_limit: Some(9),
+            resin: Some(124),
+            story_keys: Some(3),
+            max_stamina: Some(24_000),
+            game_data: Some("792978e5".to_string()),
+        }
+    }
+
+    #[test]
+    fn the_account_line_says_its_values_are_from_login() {
+        assert_eq!(
+            player_summary(&login_player()).as_deref(),
+            Some("AR 60 · WL 8 · Resin 124 at login")
+        );
+
+        // Only what was captured.
+        let partial = GiPlayer {
+            ar: Some(45),
+            ..Default::default()
+        };
+        assert_eq!(player_summary(&partial).as_deref(), Some("AR 45 at login"));
+
+        // A UID alone is no line.
+        let uid_only = GiPlayer {
+            uid: Some(813_152_114),
+            ..Default::default()
+        };
+        assert_eq!(player_summary(&uid_only), None);
+    }
+
+    #[test]
+    fn the_account_tooltip_carries_the_caveat_and_the_rest() {
+        let details = player_details(&login_player());
+        assert!(details.starts_with("A snapshot from login"), "{details}");
+        for fact in [
+            "UID 813152114",
+            "AR EXP 0",
+            "World Level limit 9",
+            "Story Keys 3",
+            "Max stamina 240",
+        ] {
+            assert!(details.contains(fact), "{fact} missing from {details}");
+        }
+    }
+
+    fn linked_account(uid: &str) -> TrackerAccount {
+        TrackerAccount {
+            name: "Main".to_string(),
+            uid: uid.to_string(),
+            server: "ASIA".to_string(),
+            dashboard_url: None,
+        }
+    }
+
+    #[test]
+    fn a_capture_of_another_account_is_a_uid_mismatch() {
+        let account = linked_account("813152114");
+        assert_eq!(uid_mismatch(&account, Some(800_000_001)), Some(800_000_001));
+        assert_eq!(uid_mismatch(&account, Some(813_152_114)), None);
+
+        let message = uid_mismatch_message(&account, 800_000_001);
+        assert!(message.contains("UID 800000001"), "{message}");
+        assert!(message.contains("Main (UID 813152114)"), "{message}");
+    }
+
+    #[test]
+    fn an_unknown_uid_on_either_side_is_no_mismatch() {
+        // Nothing captured yet, or the guids disagreed.
+        assert_eq!(uid_mismatch(&linked_account("813152114"), None), None);
+        // The old backend's answer without a UID, or an account without one.
+        assert_eq!(
+            uid_mismatch(&linked_account("N/A"), Some(800_000_001)),
+            None
+        );
+        assert_eq!(uid_mismatch(&linked_account(""), Some(800_000_001)), None);
+        // A numeric answer read back as a string, with stray whitespace.
+        assert_eq!(
+            uid_mismatch(&linked_account(" 800000001 "), Some(800_000_001)),
+            None
+        );
     }
 }

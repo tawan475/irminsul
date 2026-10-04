@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +68,117 @@ pub struct Good {
     pub gi_achievements: Option<Vec<u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<u64>,
+
+    // Irminsul's own additions. Not GOOD -- Genshin Optimizer owns that schema
+    // -- so they ride as top-level keys of their own, like `gi_achievements`,
+    // and come after every GOOD field: with all of them `None` the JSON is
+    // byte for byte what it was before they existed. The tracker's importers
+    // ignore top-level keys they do not know, so each can ship before the
+    // tracker reads it. Append only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gi_player: Option<GiPlayer>,
+    /// When each achievement in `gi_achievements` was finished, in unix
+    /// seconds, keyed by achievement id (a JSON object key, so a string). Only
+    /// achievements the game sent a plausible finish time for: a subset of
+    /// `gi_achievements`, never more.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gi_achievement_times: Option<BTreeMap<u32, u32>>,
+    /// Per-character values GOOD has no place for, keyed by the same GOOD key
+    /// the character has in `characters` (Traveler with its element suffix).
+    /// Only characters with at least one known value appear.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gi_characters: Option<BTreeMap<String, GiCharacter>>,
+}
+
+/// How `gi_player.uid` was read off the item guids (see
+/// `PlayerData::uid_check`; logged with every export, not exported): the top 32 bits of each non-zero item guid are
+/// counted, and the most common value is the UID when enough items agree.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UidCheck {
+    /// The UID reported in `gi_player.uid`, if any.
+    pub uid: Option<u32>,
+    /// Item guids whose top half is the most common one.
+    pub agreeing: usize,
+    /// Item guids counted (non-zero).
+    pub total: usize,
+    /// The most common item guid top halves, `[top, count]`, most first.
+    pub item_top_halves: Vec<(u64, usize)>,
+    /// The same for avatar guids, which don't vote (field unverified).
+    pub avatar_top_halves: Vec<(u64, usize)>,
+    /// Items whose guid top half is not the UID, grouped (most first, at most
+    /// 100 groups): what they are, to explain where they came from.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub strays: Vec<UidStray>,
+}
+
+/// Items of one kind and id whose guids carry one foreign top half.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UidStray {
+    /// The guid top half (another account's UID, if the scheme holds).
+    pub top: u64,
+    pub item_id: u32,
+    /// `material`, `weapon`, `artifact`, `furniture` or `other`.
+    pub kind: String,
+    /// From the game data, when it knows the item.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub count: usize,
+}
+
+/// One character's entry in `gi_characters`.
+///
+/// Each value is omitted, never null, when it was not captured or failed its
+/// plausibility check -- and for every character at once when most of them
+/// failed it, since that means the field is read from the wrong place in this
+/// game version.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GiCharacter {
+    /// Friendship level, 1..=10.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub friendship: Option<u32>,
+    /// When the character joined the account, in unix seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub obtained_at: Option<u32>,
+}
+
+/// Account values GOOD has no place for: `gi_player`.
+///
+/// The numbers are the property snapshot the game sends at login, not live
+/// values (resin keeps regenerating after it). Every field is omitted, never
+/// null, when it was not captured or failed its plausibility check, and the
+/// whole key is omitted when nothing about the account is known.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GiPlayer {
+    /// The account UID, from the item and avatar guids.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    /// Adventure Rank.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ar: Option<u32>,
+    /// Adventure EXP toward the next rank.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ar_exp: Option<u32>,
+    /// World Level.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wl: Option<u32>,
+    /// The highest World Level the account may choose.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wl_limit: Option<u32>,
+    /// Original Resin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resin: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub story_keys: Option<u32>,
+    /// Maximum stamina in the game's units: 24000 is the 240 the game shows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_stamina: Option<u32>,
+    /// The Dimbreath dump commit the export's GOOD keys were derived from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub game_data: Option<String>,
 }
 
 /// GOOD key for the Traveler before their element is appended.
@@ -226,6 +337,25 @@ mod tests {
             materials: HashMap::from([("ChilledMeat".to_string(), 12)]),
             gi_achievements: Some(vec![80001]),
             timestamp: Some(1_756_000_000_000),
+            gi_player: Some(GiPlayer {
+                uid: Some(813_152_114),
+                ar: Some(60),
+                ar_exp: Some(0),
+                wl: Some(8),
+                wl_limit: Some(9),
+                resin: Some(124),
+                story_keys: Some(3),
+                max_stamina: Some(24_000),
+                game_data: Some("792978e5503ecfba73dcb3562ed44a0d35a2abe2".to_string()),
+            }),
+            gi_achievement_times: Some(BTreeMap::from([(80001, 1_650_000_000)])),
+            gi_characters: Some(BTreeMap::from([(
+                "HuTao".to_string(),
+                GiCharacter {
+                    friendship: Some(10),
+                    obtained_at: Some(1_646_092_800),
+                },
+            )])),
         };
 
         let json = serde_json::to_value(&good).expect("Good must serialize");
@@ -250,7 +380,10 @@ mod tests {
                 "artifacts",
                 "characters",
                 "format",
+                "gi_achievement_times",
                 "gi_achievements",
+                "gi_characters",
+                "gi_player",
                 "materials",
                 "source",
                 "timestamp",
@@ -317,6 +450,37 @@ mod tests {
         // multipart `timestamp` field is absent.
         assert_eq!(json["timestamp"], serde_json::json!(1_756_000_000_000u64));
         assert_eq!(json["materials"]["ChilledMeat"], serde_json::json!(12));
+
+        // Irminsul's own account values. The UID is a JSON number; the
+        // tracker's account UID is a string of 9 or 10 digits.
+        assert_eq!(
+            keys(&json["gi_player"]),
+            [
+                "ar",
+                "arExp",
+                "gameData",
+                "maxStamina",
+                "resin",
+                "storyKeys",
+                "uid",
+                "wl",
+                "wlLimit",
+            ]
+        );
+        assert_eq!(json["gi_player"]["uid"], serde_json::json!(813_152_114));
+
+        // Achievement id (a JSON object key, so a string) -> unix seconds.
+        assert_eq!(
+            json["gi_achievement_times"],
+            serde_json::json!({ "80001": 1_650_000_000 })
+        );
+
+        // Keyed like `characters`; unix seconds for `obtainedAt`.
+        assert_eq!(keys(&json["gi_characters"]), ["HuTao"]);
+        assert_eq!(
+            keys(&json["gi_characters"]["HuTao"]),
+            ["friendship", "obtainedAt"]
+        );
     }
 
     #[test]
@@ -336,11 +500,35 @@ mod tests {
             materials: HashMap::new(),
             gi_achievements: None,
             timestamp: None,
+            gi_player: None,
+            gi_achievement_times: None,
+            gi_characters: None,
         };
 
         let json = serde_json::to_value(&good).expect("Good must serialize");
         let object = json.as_object().expect("expected a JSON object");
         assert!(!object.contains_key("gi_achievements"));
         assert!(!object.contains_key("timestamp"));
+        assert!(!object.contains_key("gi_player"));
+        assert!(!object.contains_key("gi_achievement_times"));
+        assert!(!object.contains_key("gi_characters"));
+    }
+
+    #[test]
+    fn unknown_account_values_are_omitted_rather_than_null() {
+        let player = GiPlayer {
+            ar: Some(60),
+            ..Default::default()
+        };
+        assert_eq!(serde_json::to_string(&player).unwrap(), r#"{"ar":60}"#);
+
+        let character = GiCharacter {
+            obtained_at: Some(1_646_092_800),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&character).unwrap(),
+            r#"{"obtainedAt":1646092800}"#
+        );
     }
 }
