@@ -1,13 +1,34 @@
-use etherparse::{SlicedPacket, TransportSlice, UdpHeader};
+use std::net::{IpAddr, SocketAddr};
+
+use etherparse::{NetSlice, SlicedPacket, TransportSlice, UdpHeader};
 use tracing::{debug, info, instrument, trace, warn};
 
 use crate::{ConnectionPacket, PacketDirection};
 
-#[instrument(skip_all)]
+#[cfg(test)]
 pub fn parse_connection_packet(port_filter: &[u16], bytes: Vec<u8>) -> Option<ConnectionPacket> {
-    let (udp, payload) = parse_udp(bytes)?;
-    let direction = validate_ports(port_filter, udp)?;
+    parse_frame(port_filter, bytes).map(|(packet, _)| packet)
+}
 
+/// Classify one captured frame, along with the game server's address and port
+/// when the IP layer gives them.
+#[instrument(skip_all)]
+pub fn parse_frame(
+    port_filter: &[u16],
+    bytes: Vec<u8>,
+) -> Option<(ConnectionPacket, Option<SocketAddr>)> {
+    let (udp, addresses, payload) = parse_udp(bytes)?;
+    let direction = validate_ports(port_filter, udp.clone())?;
+    // The server is whichever end owns the game port.
+    let server = addresses.map(|(source, destination)| match direction {
+        PacketDirection::Received => SocketAddr::new(source, udp.source_port),
+        PacketDirection::Sent => SocketAddr::new(destination, udp.destination_port),
+    });
+    let packet = classify(direction, payload)?;
+    Some((packet, server))
+}
+
+fn classify(direction: PacketDirection, payload: Vec<u8>) -> Option<ConnectionPacket> {
     if payload.len() <= 20 {
         // a connection-management packet always leads with a 4-byte code; anything
         // shorter is a runt datagram that happened to land on a game port
@@ -36,8 +57,13 @@ pub fn parse_connection_packet(port_filter: &[u16], bytes: Vec<u8>) -> Option<Co
     }
 }
 
+/// The IP source and destination of a frame.
+type Addresses = (IpAddr, IpAddr);
+
+/// The UDP header, the IP source and destination when present, and the
+/// payload of an Ethernet frame.
 #[instrument(skip_all, fields(len = data.len()))]
-pub fn parse_udp(data: Vec<u8>) -> Option<(UdpHeader, Vec<u8>)> {
+pub fn parse_udp(data: Vec<u8>) -> Option<(UdpHeader, Option<Addresses>, Vec<u8>)> {
     let packet = match SlicedPacket::from_ethernet(&data) {
         Ok(p) => p,
         Err(e) => {
@@ -59,7 +85,18 @@ pub fn parse_udp(data: Vec<u8>) -> Option<(UdpHeader, Vec<u8>)> {
 
     trace!("complete");
 
-    Some((udp.to_header(), udp.payload().to_vec()))
+    let addresses = packet.net.as_ref().map(|net| match net {
+        NetSlice::Ipv4(ip) => (
+            IpAddr::V4(ip.header().source_addr()),
+            IpAddr::V4(ip.header().destination_addr()),
+        ),
+        NetSlice::Ipv6(ip) => (
+            IpAddr::V6(ip.header().source_addr()),
+            IpAddr::V6(ip.header().destination_addr()),
+        ),
+    });
+
+    Some((udp.to_header(), addresses, udp.payload().to_vec()))
 }
 
 fn validate_ports(port_filter: &[u16], udp: UdpHeader) -> Option<PacketDirection> {
@@ -147,6 +184,16 @@ mod tests {
             sent,
             Some(ConnectionPacket::SegmentData(PacketDirection::Sent, ref d)) if *d == payload
         ));
+    }
+
+    #[test]
+    fn the_server_end_is_reported_for_both_directions() {
+        // `udp_frame` sends from 10.0.0.2 to 10.0.0.1.
+        let (_, server) = parse_frame(&PORTS, udp_frame(22102, 50000, &[0xAB; 40])).unwrap();
+        assert_eq!(server, Some("10.0.0.2:22102".parse().unwrap()));
+
+        let (_, server) = parse_frame(&PORTS, udp_frame(50000, 22101, &[0xAB; 40])).unwrap();
+        assert_eq!(server, Some("10.0.0.1:22101".parse().unwrap()));
     }
 
     #[test]
