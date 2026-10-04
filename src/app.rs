@@ -1562,7 +1562,7 @@ impl IrminsulApp {
         ui.set_width(520.0);
         ui.heading(match cause {
             Some(MissedLaunch::CaptureStopped) => "Genshin ran while capture was off",
-            _ => "Genshin is already running",
+            _ => "Genshin was already in the world",
         });
         ui.separator();
         ui.label(match cause {
@@ -1570,13 +1570,13 @@ impl IrminsulApp {
                 "Genshin was running while packet capture was stopped, so Irminsul missed the login handshake and has no key for this session. Nothing can be captured from it, however long you leave it running."
             }
             _ => {
-                "Genshin was already running when Irminsul started, so Irminsul never saw the login handshake and has no key for this session. Nothing can be captured from it, however long you leave it running."
+                "This game session logged in before Irminsul started: game traffic is arriving with no login in it, so Irminsul has no key for this session. Nothing can be captured from it, however long you leave it running. (Opening Irminsul while Genshin is on the title screen is fine; this only appears once you are in the world.)"
             }
         });
         ui.add_space(6.0);
         ui.label(
             RichText::new(
-                "Fix: close Genshin and start it again, leaving Irminsul running with capture on.",
+                "Fix: with Irminsul running, return to the title screen and enter the world again, or close Genshin and start it again.",
             )
             .strong(),
         );
