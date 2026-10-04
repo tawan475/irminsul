@@ -170,6 +170,18 @@ const MAX_RETIRED_CONVS: usize = 8;
 /// Memory is bounded by this many datagrams per lane.
 const REBIND_AFTER: usize = 32;
 
+/// Messages the live session key has to decrypt after a handshake request
+/// before the reset that request asked for is dropped as spoofed.
+///
+/// One used to be enough, and that broke real reconnects: after the client's
+/// handshake the server can still push a few messages on the old conversation,
+/// they decrypt under the old key, and once they had disarmed the reset the new
+/// conversation was rejected as a foreign one for the rest of the session. The
+/// new conversation's first segment follows the handshake within a round trip,
+/// so the old connection gets nowhere near this many messages in first, while
+/// a session that is really alive reaches it within a minute or so.
+const PENDING_RESET_DISARM_MESSAGES: u32 = 64;
+
 /// Entries a store notify needs before it is believed.
 ///
 /// Mirrors the floor already applied inside `matches_items_all_data_notify`; it
@@ -550,6 +562,9 @@ pub struct GameSniffer {
     /// that datagram is authenticated, so the reset it asks for waits for
     /// corroboration.
     pending_reset: bool,
+    /// Messages the live session key has decrypted since `pending_reset` was
+    /// set; see [`PENDING_RESET_DISARM_MESSAGES`].
+    pending_reset_proof: u32,
     /// Protocol version the last "no key for this version" complaint was about,
     /// so the complaint is made once per version and not once per message.
     unknown_key_version: Option<u16>,
@@ -590,9 +605,10 @@ impl GameSniffer {
     /// * a handshake request seen while no session key was live (nothing worth
     ///   protecting is installed at that point), or
     /// * a handshake request that was deferred because a session key *was* live,
-    ///   and has since been corroborated -- by a KCP segment on a different
-    ///   conversation, by a segment opening a conversation in a direction that
-    ///   had no sniffer, or by the live key going dead.
+    ///   and has since been corroborated -- by a KCP segment opening a new
+    ///   conversation (at the start of its sequence space, and not one a
+    ///   previous reset already ended), in either direction, or by the live key
+    ///   going dead.
     ///
     /// It never changes on a bare [`ConnectionPacket::HandshakeRequested`], which
     /// is unauthenticated: any local process can put a 20-byte datagram on a game
@@ -639,15 +655,17 @@ impl GameSniffer {
                 // a real client handshake). Wiping a live session key on that
                 // alone hands anyone a one-packet kill switch, so while a
                 // session key is live the reset waits for corroboration: a
-                // segment on a different KCP conversation, or the live key going
-                // dead. A spoofed handshake then costs one log line, because the
-                // next message that still decrypts clears the flag again.
+                // segment opening a new KCP conversation, or the live key going
+                // dead. A spoofed handshake then costs a log line or two, because
+                // a session that keeps decrypting clears the flag again (see
+                // `PENDING_RESET_DISARM_MESSAGES`).
                 if matches!(self.key, Some(Key::Session(_))) {
                     if !self.pending_reset {
                         warn!(
                             "handshake requested while a session key is live; deferring the reset \
                              until a new conversation or a dead key corroborates it"
                         );
+                        self.pending_reset_proof = 0;
                     }
                     self.pending_reset = true;
                 } else {
@@ -697,6 +715,7 @@ impl GameSniffer {
         self.session_rederive_exhausted = false;
         self.bruteforce_attempts = 0;
         self.pending_reset = false;
+        self.pending_reset_proof = 0;
     }
 
     /// Remember that `conv` belonged to a connection that has ended, so a
@@ -985,9 +1004,21 @@ impl GameSniffer {
             KeyState::SessionOk => {
                 self.session_failures = 0;
                 self.session_rederive_exhausted = false;
-                // The session this key belongs to is demonstrably still alive,
-                // so whatever asked for a reset was not this game.
-                self.pending_reset = false;
+                // Once the session this key belongs to has *kept* decrypting,
+                // whatever asked for a reset was not this game. Not on the
+                // first message: a real reconnect's old connection still
+                // delivers a few after the handshake.
+                if self.pending_reset {
+                    self.pending_reset_proof += 1;
+                    if self.pending_reset_proof >= PENDING_RESET_DISARM_MESSAGES {
+                        info!(
+                            messages = self.pending_reset_proof,
+                            "the session key kept decrypting after a handshake request; not \
+                             resetting"
+                        );
+                        self.pending_reset = false;
+                    }
+                }
                 true
             }
             KeyState::DispatchStale => {
@@ -2957,18 +2988,111 @@ mod tests {
     }
 
     #[test]
-    fn a_decodable_message_disarms_a_deferred_reset() {
+    fn sustained_decodable_traffic_disarms_a_deferred_reset() {
+        // A spoofed handshake must not leave the session one stray segment away
+        // from a reset forever, so a session that keeps decrypting clears it.
+        // One message used to be enough, but a real reconnect still delivers a
+        // few late messages of the old connection after its handshake -- and
+        // once they had disarmed the reset, the new conversation was rejected
+        // as foreign for good. It now takes a sustained run.
         let key = new_key_from_seed(8);
         let mut sniffer = GameSniffer::new();
         sniffer.key = Some(Key::Session(key.clone()));
         sniffer.receive_packet(handshake_frame());
         assert!(sniffer.pending_reset);
 
-        let mut message = command_bytes(1, &[], &field_varint(1, 1));
-        decrypt_command(&key, &mut message);
-        assert_eq!(sniffer.receive_commands(message).len(), 1);
+        for sent in 1..=PENDING_RESET_DISARM_MESSAGES {
+            let mut message = command_bytes(1, &[], &field_varint(1, 1));
+            decrypt_command(&key, &mut message);
+            assert_eq!(sniffer.receive_commands(message).len(), 1);
+            assert_eq!(
+                sniffer.pending_reset,
+                sent < PENDING_RESET_DISARM_MESSAGES,
+                "after {sent} messages"
+            );
+        }
+    }
 
+    #[test]
+    fn late_old_messages_after_a_handshake_do_not_strand_the_new_connection() {
+        // In a reconnect the server can still push a message or two on the old
+        // conversation after the client's handshake. They decrypt under the old
+        // key, and they used to disarm the deferred reset -- after which the
+        // new conversation was a foreign one on a proven lane, rejected for the
+        // rest of the session.
+        let mut sniffer = connected_sniffer();
+        let mut old = Conn::new(122_486);
+        let old_combined = 0x1111_2222_3333_4444;
+        log_in(
+            &mut sniffer,
+            &mut old,
+            LOGIN_MS,
+            client_draw(LOGIN_MS, 0),
+            old_combined,
+        );
+        let generation = sniffer.session_generation();
+
+        sniffer.receive_packet(handshake_frame());
+        let old_key = new_key_from_seed(old_combined);
+        for id in [201, 202] {
+            assert_eq!(
+                command_ids(&mut sniffer, old.server_message(&old_key, id)),
+                vec![id]
+            );
+        }
+
+        let mut new = Conn::new(122_628);
+        let new_combined = 0x5555_6666_7777_8888;
+        token_exchange(
+            &mut sniffer,
+            &mut new,
+            LOGIN_MS + HOUR_MS,
+            client_draw(LOGIN_MS, 1) ^ new_combined,
+        );
+        assert_eq!(sniffer.session_generation(), generation + 1);
+        assert_eq!(
+            command_ids(
+                &mut sniffer,
+                new.server_message(&new_key_from_seed(new_combined), SESSION_MESSAGE)
+            ),
+            vec![SESSION_MESSAGE]
+        );
+    }
+
+    #[test]
+    fn a_disarmed_spoofed_handshake_leaves_a_live_session_alone() {
+        let mut sniffer = connected_sniffer();
+        let mut conn = Conn::new(122_486);
+        let combined = 0x1111_2222_3333_4444;
+        log_in(
+            &mut sniffer,
+            &mut conn,
+            LOGIN_MS,
+            client_draw(LOGIN_MS, 0),
+            combined,
+        );
+        let generation = sniffer.session_generation();
+        let key = new_key_from_seed(combined);
+
+        sniffer.receive_packet(handshake_frame());
+        for id in 0..PENDING_RESET_DISARM_MESSAGES as u16 {
+            command_ids(&mut sniffer, conn.server_message(&key, id));
+        }
         assert!(!sniffer.pending_reset);
+
+        // A conversation opening afterwards is not this game reconnecting.
+        sniffer.receive_packet(segment_frame_at(
+            PacketDirection::Received,
+            9_999,
+            0,
+            0,
+            &[0u8; 40],
+        ));
+        assert_eq!(sniffer.session_generation(), generation);
+        assert_eq!(
+            command_ids(&mut sniffer, conn.server_message(&key, 500)),
+            vec![500]
+        );
     }
 
     #[test]
