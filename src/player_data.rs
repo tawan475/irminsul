@@ -847,11 +847,29 @@ impl PlayerData {
     ) -> Vec<(good::Character, &AvatarInfo)> {
         // TPS avatars are not normal characters and are excluded from export.
         let tps_avatar_ids = tps_avatar_ids(&self.game_data);
+        // Avatars left out without a warning of their own (wrong type,
+        // placeholder, below the export minimums) and Travelers whose element
+        // could not be read, so one log line accounts for the whole roster.
+        let mut left_out: Vec<String> = Vec::new();
+        let describe = |avatar_id: u32| match self.game_data.get_character(avatar_id) {
+            Ok(name) => format!("{avatar_id} {name}"),
+            Err(_) => avatar_id.to_string(),
+        };
 
-        self.characters
+        let exported: Vec<_> = self
+            .characters
             .values()
             .filter_map(|character| {
-                if character.avatar_type != 1 || tps_avatar_ids.contains(&character.avatar_id) {
+                if character.avatar_type != 1 {
+                    left_out.push(format!(
+                        "{} (avatar type {})",
+                        describe(character.avatar_id),
+                        character.avatar_type
+                    ));
+                    return None;
+                }
+                if tps_avatar_ids.contains(&character.avatar_id) {
+                    left_out.push(format!("{} (placeholder)", describe(character.avatar_id)));
                     return None;
                 }
 
@@ -943,6 +961,10 @@ impl PlayerData {
                     || ascension < settings.min_character_ascension
                     || constellation < settings.min_character_constellation
                 {
+                    left_out.push(format!(
+                        "{} (below the export minimums: level {level}, A{ascension}, C{constellation})",
+                        describe(character.avatar_id)
+                    ));
                     return None;
                 }
 
@@ -950,10 +972,14 @@ impl PlayerData {
                 // The GOOD format lets you optionally suffix the Traveler's
                 // name with their element (e.g. `TravelerCryo`).
                 let mut key = good::to_good_key(name);
-                if key == good::TRAVELER_KEY
-                    && let Some(element) = element
-                {
-                    key.push_str(element.as_ref());
+                if key == good::TRAVELER_KEY {
+                    match element {
+                        Some(element) => key.push_str(element.as_ref()),
+                        None => left_out.push(format!(
+                            "{} exported as plain Traveler (no burst element)",
+                            describe(character.avatar_id)
+                        )),
+                    }
                 }
 
                 Some((
@@ -967,7 +993,15 @@ impl PlayerData {
                     character,
                 ))
             })
-            .collect()
+            .collect();
+
+        tracing::info!(
+            captured = self.characters.len(),
+            exported = exported.len(),
+            left_out = ?left_out,
+            "character export"
+        );
+        exported
     }
 
     /// `gi_characters` for the characters the export holds: friendship and
