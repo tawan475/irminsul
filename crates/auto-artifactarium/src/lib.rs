@@ -565,6 +565,18 @@ impl GameSniffer {
         self.session_generation
     }
 
+    /// Whether the session key of the current connection has been given up on.
+    ///
+    /// `true` once every search this library is willing to run for the
+    /// current token response's seeds has failed, until a new token response
+    /// (a new login) or a reset brings new seeds. Nothing from the connection
+    /// decrypts in the meantime, so a caller can tell the user to log in again
+    /// instead of showing a capture that looks healthy and stays empty.
+    pub fn key_recovery_failed(&self) -> bool {
+        self.bruteforce_attempts >= MAX_BRUTEFORCE_ATTEMPTS
+            && !matches!(self.key, Some(Key::Session(_)))
+    }
+
     #[instrument(skip_all, fields(len = bytes.len()))]
     pub fn receive_packet(&mut self, bytes: Vec<u8>) -> Option<GamePacket> {
         let packet = parse_connection_packet(&PORTS, bytes)?;
@@ -883,6 +895,15 @@ impl GameSniffer {
             attempt = self.bruteforce_attempts,
             "could not recover the session key from the retained seeds"
         );
+        // Said once, at the moment it happens: past this point every message
+        // of the connection is dropped at debug level, and a log that just
+        // stops is indistinguishable from a game that went quiet.
+        if self.bruteforce_attempts == MAX_BRUTEFORCE_ATTEMPTS {
+            warn!(
+                attempts = self.bruteforce_attempts,
+                "session key not recovered; this connection's packets are ignored until the next                  login or reconnect"
+            );
+        }
         false
     }
 
@@ -2301,6 +2322,102 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), sniffer.time_anchors.len(), "no duplicates");
+    }
+
+    /// Runs `f` and returns every WARN event it logged on this thread, each as
+    /// its message followed by its other fields.
+    fn warnings(f: impl FnOnce()) -> Vec<String> {
+        use std::sync::{Arc, Mutex};
+
+        use tracing::field::{Field, Visit};
+        use tracing::span::{Attributes, Id, Record};
+        use tracing::{Event, Level, Metadata, Subscriber};
+
+        struct Capture(Arc<Mutex<Vec<String>>>);
+
+        struct Fields(String);
+
+        impl Visit for Fields {
+            fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+                if field.name() == "message" {
+                    self.0.insert_str(0, &format!("{value:?}"));
+                } else {
+                    let _ = write!(self.0, " {}={value:?}", field.name());
+                }
+            }
+        }
+
+        impl Subscriber for Capture {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                if *event.metadata().level() == Level::WARN {
+                    let mut fields = Fields(String::new());
+                    event.record(&mut fields);
+                    self.0.lock().unwrap().push(fields.0);
+                }
+            }
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(Capture(Arc::clone(&seen)), f);
+        seen.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn giving_up_on_a_connections_key_is_said_once_and_reported() {
+        // After the budget is spent every further message of the connection is
+        // dropped at debug level, which is how 1h44m of nothing decoding left
+        // no trace in the log. Say it once, and let the caller show it.
+        let mut sniffer = GameSniffer::new();
+        sniffer.session_seeds = Some(SessionSeeds {
+            seeds: vec![1],
+            sent_ms: 2,
+        });
+        // A cheap stand-in for the failed runs before the last one.
+        sniffer.bruteforce_attempts = MAX_BRUTEFORCE_ATTEMPTS - 1;
+        sniffer.key = Some(Dispatch(new_key_from_seed(3)));
+        assert!(!sniffer.key_recovery_failed());
+
+        let logged = warnings(|| {
+            for _ in 0..20 {
+                assert!(!sniffer.recover_session_key(&[0u8; 64]));
+            }
+        });
+
+        let gave_up = logged
+            .iter()
+            .filter(|line| line.contains("not recovered"))
+            .count();
+        assert_eq!(gave_up, 1, "{logged:#?}");
+        assert!(sniffer.key_recovery_failed());
+
+        // A new token response is a new chance.
+        sniffer.bruteforce_attempts = 0;
+        assert!(!sniffer.key_recovery_failed());
+    }
+
+    #[test]
+    fn a_reset_clears_the_given_up_report() {
+        let mut sniffer = GameSniffer::new();
+        sniffer.key = Some(Dispatch(new_key_from_seed(3)));
+        sniffer.session_seeds = Some(SessionSeeds {
+            seeds: vec![1],
+            sent_ms: 2,
+        });
+        sniffer.bruteforce_attempts = MAX_BRUTEFORCE_ATTEMPTS;
+        assert!(sniffer.key_recovery_failed());
+
+        sniffer.receive_packet(handshake_frame());
+        assert!(!sniffer.key_recovery_failed());
     }
 
     #[test]
