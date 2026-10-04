@@ -93,6 +93,79 @@ fn plausible_time(secs: u64, now_secs: u64) -> bool {
     (EARLIEST_PLAUSIBLE_TIME..=now_secs.saturating_add(CLOCK_SLACK_SECS)).contains(&secs)
 }
 
+/// A real friendship level. Characters start at 1. The Traveler has no
+/// friendship in game and is expected to fail this, which is one reason a field
+/// is only distrusted when most characters fail it.
+const FRIENDSHIP_RANGE: RangeInclusive<u32> = 1..=10;
+
+/// How one `gi_characters` field fared across an export's characters.
+#[derive(Debug, Default)]
+struct FieldTally {
+    plausible: usize,
+    /// `(character key, raw value)` for each value that failed its check.
+    implausible: Vec<(String, u32)>,
+}
+
+impl FieldTally {
+    /// Count one character's value; it is kept only when `plausible`.
+    fn check(&mut self, key: &str, raw: u32, plausible: bool) -> Option<u32> {
+        if plausible {
+            self.plausible += 1;
+            Some(raw)
+        } else {
+            self.implausible.push((key.to_string(), raw));
+            None
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.plausible + self.implausible.len()
+    }
+
+    /// Whether the field reads right in this game version: unless most
+    /// characters failed it.
+    fn trusted(&self) -> bool {
+        self.implausible.len() * 2 <= self.total()
+    }
+
+    /// e.g. `friendship 96/97 plausible (implausible: TravelerAnemo 0)`.
+    fn describe(&self, name: &str) -> String {
+        let mut text = format!("{name} {}/{} plausible", self.plausible, self.total());
+        if !self.implausible.is_empty() {
+            let samples: Vec<String> = self
+                .implausible
+                .iter()
+                .take(3)
+                .map(|(key, raw)| format!("{key} {raw}"))
+                .collect();
+            text.push_str(&format!(" (implausible: {}", samples.join(", ")));
+            if self.implausible.len() > samples.len() {
+                text.push_str(", ...");
+            }
+            text.push(')');
+        }
+        if !self.trusted() {
+            text.push_str(", so omitted");
+        }
+        text
+    }
+}
+
+/// e.g. `HuTao friendship 10 obtained 2022-03-01`, for the log.
+fn describe_character_extras(key: &str, extra: &good::GiCharacter) -> String {
+    let mut text = key.to_string();
+    if let Some(level) = extra.friendship {
+        text.push_str(&format!(" friendship {level}"));
+    }
+    if let Some(obtained) = extra
+        .obtained_at
+        .and_then(|secs| chrono::DateTime::from_timestamp(i64::from(secs), 0))
+    {
+        text.push_str(&format!(" obtained {}", obtained.format("%Y-%m-%d")));
+    }
+    text
+}
+
 /// A player property `gi_player` reports: its client `PROP_*` id, and the range
 /// a real value falls in.
 ///
@@ -721,10 +794,17 @@ impl PlayerData {
             // Omitted when empty, for the same reason as `gi_achievements`.
             gi_achievement_times: Some(self.export_achievement_times(now_ms / 1000))
                 .filter(|times| !times.is_empty()),
+            // Filled in with the characters below.
+            gi_characters: None,
         };
 
         if settings.include_characters {
-            good.characters = self.export_genshin_optimizer_characters(settings, report);
+            let exported = self.exported_characters(settings, report);
+            good.gi_characters = self.export_character_extras(&exported, now_ms / 1000);
+            good.characters = exported
+                .into_iter()
+                .map(|(character, _)| character)
+                .collect();
         }
 
         if settings.include_artifacts {
@@ -747,11 +827,24 @@ impl PlayerData {
         good
     }
 
+    #[cfg(test)]
     pub fn export_genshin_optimizer_characters(
         &self,
         settings: &ExportSettings,
         report: &mut ExportReport,
     ) -> Vec<good::Character> {
+        self.exported_characters(settings, report)
+            .into_iter()
+            .map(|(character, _)| character)
+            .collect()
+    }
+
+    /// The GOOD characters, each with the captured avatar it was built from.
+    fn exported_characters(
+        &self,
+        settings: &ExportSettings,
+        report: &mut ExportReport,
+    ) -> Vec<(good::Character, &AvatarInfo)> {
         // TPS avatars are not normal characters and are excluded from export.
         let tps_avatar_ids = tps_avatar_ids(&self.game_data);
 
@@ -863,15 +956,89 @@ impl PlayerData {
                     key.push_str(element.as_ref());
                 }
 
-                Some(good::Character {
-                    key,
-                    level,
-                    constellation,
-                    ascension,
-                    talent: good::TalentLevel { auto, skill, burst },
-                })
+                Some((
+                    good::Character {
+                        key,
+                        level,
+                        constellation,
+                        ascension,
+                        talent: good::TalentLevel { auto, skill, burst },
+                    },
+                    character,
+                ))
             })
             .collect()
+    }
+
+    /// `gi_characters` for the characters the export holds: friendship and
+    /// when each was obtained.
+    ///
+    /// Both come from `AvatarInfo` fields (`fetter_info.exp_level`, field 12 ->
+    /// 2, and `born_time`, field 23) whose numbers are carried over from
+    /// Grasscutter's 3.x protos and are not verified on 7.1 traffic, so each
+    /// value is plausibility-checked, and a field most characters fail is taken
+    /// to be read from the wrong place and left out for everyone. One INFO line
+    /// per export says how each field fared, so a real login shows whether the
+    /// numbers hold.
+    fn export_character_extras(
+        &self,
+        exported: &[(good::Character, &AvatarInfo)],
+        now_secs: u64,
+    ) -> Option<BTreeMap<String, good::GiCharacter>> {
+        if exported.is_empty() {
+            return None;
+        }
+
+        let mut friendship = FieldTally::default();
+        let mut obtained_at = FieldTally::default();
+        let mut extras: BTreeMap<String, good::GiCharacter> = BTreeMap::new();
+        for (character, avatar) in exported {
+            let level = avatar
+                .fetter_info
+                .as_ref()
+                .map_or(0, |fetter| fetter.exp_level);
+            let born = avatar.born_time;
+            extras.insert(
+                character.key.clone(),
+                good::GiCharacter {
+                    friendship: friendship.check(
+                        &character.key,
+                        level,
+                        FRIENDSHIP_RANGE.contains(&level),
+                    ),
+                    obtained_at: obtained_at.check(
+                        &character.key,
+                        born,
+                        plausible_time(u64::from(born), now_secs),
+                    ),
+                },
+            );
+        }
+
+        let keep_friendship = friendship.trusted();
+        let keep_obtained_at = obtained_at.trusted();
+        for extra in extras.values_mut() {
+            if !keep_friendship {
+                extra.friendship = None;
+            }
+            if !keep_obtained_at {
+                extra.obtained_at = None;
+            }
+        }
+        extras.retain(|_, extra| *extra != good::GiCharacter::default());
+
+        let sample = extras
+            .iter()
+            .next()
+            .map(|(key, extra)| describe_character_extras(key, extra))
+            .unwrap_or_else(|| "none".to_string());
+        tracing::info!(
+            "character extras: {}, {}; sample {sample}",
+            friendship.describe("friendship"),
+            obtained_at.describe("obtainedAt"),
+        );
+
+        (!extras.is_empty()).then_some(extras)
     }
 
     pub fn round(property: Property, value: f32) -> f32 {
@@ -1212,6 +1379,7 @@ mod tests {
         character_map: &'static str,
         material_map: &'static str,
         property_map: &'static str,
+        skill_element_map: &'static str,
         skill_type_map: &'static str,
         weapon_map: &'static str,
         /// `(female, male)`; `None` is the 7.1 dump, where both are `null`.
@@ -1234,7 +1402,7 @@ mod tests {
                     "material_map": {{{}}},
                     "property_map": {{{}}},
                     "set_map": {{}},
-                    "skill_element_map": {{}},
+                    "skill_element_map": {{{}}},
                     "skill_type_map": {{{}}},
                     "tps_avatar_id_female": {tps_female},
                     "tps_avatar_id_male": {tps_male},
@@ -1245,6 +1413,7 @@ mod tests {
                 self.character_map,
                 self.material_map,
                 self.property_map,
+                self.skill_element_map,
                 self.skill_type_map,
                 self.weapon_map,
             );
@@ -1975,6 +2144,10 @@ mod tests {
         let mut hu_tao = character(10000046, &[(10461, 10), (10462, 9), (10465, 8)]);
         hu_tao.guid = guid(4);
         hu_tao.equip_guid_list = vec![guid(1), guid(2)];
+        if extras {
+            hu_tao.fetter_info.mut_or_insert_default().exp_level = 10;
+            hu_tao.born_time = 1_646_092_800; // 2022-03-01
+        }
         data.process_characters(&[hu_tao]);
 
         data.process_achievements(&[Achievement {
@@ -2025,7 +2198,8 @@ mod tests {
         r#","gi_player":{"uid":800123456,"ar":60,"arExp":0,"wl":8,"wlLimit":9,"#,
         r#""storyKeys":3,"maxStamina":24000,"#,
         r#""gameData":"792978e5503ecfba73dcb3562ed44a0d35a2abe2"},"#,
-        r#""gi_achievement_times":{"80014":1650000000}}"#,
+        r#""gi_achievement_times":{"80014":1650000000},"#,
+        r#""gi_characters":{"HuTao":{"friendship":10,"obtainedAt":1646092800}}}"#,
     );
 
     #[test]
@@ -2050,10 +2224,12 @@ mod tests {
         let mut good = data.build_good(&settings(), &mut report, GOLDEN_TIMESTAMP_MS);
         assert!(good.gi_player.is_some());
         assert!(good.gi_achievement_times.is_some());
+        assert!(good.gi_characters.is_some());
         let with = serde_json::to_string(&good).unwrap();
 
         good.gi_player = None;
         good.gi_achievement_times = None;
+        good.gi_characters = None;
         let without = serde_json::to_string(&good).unwrap();
 
         let good_part = without.strip_suffix('}').unwrap();
@@ -2133,5 +2309,187 @@ mod tests {
         let good = data.build_good(&settings(), &mut report, NOW_SECS * 1000);
         assert_eq!(good.gi_achievements, Some(vec![80001]));
         assert_eq!(good.gi_achievement_times, None);
+    }
+
+    // -- gi_characters ---------------------------------------------------------------
+
+    /// A level 90 character with a friendship level and an obtained time as
+    /// the 3.x field numbers carry them; 0 leaves a field unset.
+    fn befriended(avatar_id: u32, friendship: u32, born_time: u32) -> AvatarInfo {
+        let mut avatar = character(avatar_id, &[]);
+        if friendship != 0 {
+            avatar.fetter_info.mut_or_insert_default().exp_level = friendship;
+        }
+        avatar.born_time = born_time;
+        avatar
+    }
+
+    fn roster_data() -> PlayerData {
+        player_data_with(
+            r#""10000002": "Kamisato Ayaka", "10000003": "Jean", "10000006": "Lisa",
+               "10000046": "Hu Tao""#,
+            "",
+            "",
+        )
+    }
+
+    fn character_extras(data: &PlayerData) -> Option<BTreeMap<String, good::GiCharacter>> {
+        let mut report = ExportReport::default();
+        data.build_good(&settings(), &mut report, NOW_SECS * 1000)
+            .gi_characters
+    }
+
+    fn extra(friendship: Option<u32>, obtained_at: Option<u32>) -> good::GiCharacter {
+        good::GiCharacter {
+            friendship,
+            obtained_at,
+        }
+    }
+
+    #[test]
+    fn friendship_and_obtained_dates_are_exported_by_good_key() {
+        let mut data = roster_data();
+        data.process_characters(&[
+            befriended(10000046, 10, 1_646_092_800),
+            befriended(10000003, 7, 1_601_510_400),
+        ]);
+
+        assert_eq!(
+            character_extras(&data),
+            Some(BTreeMap::from([
+                ("HuTao".to_string(), extra(Some(10), Some(1_646_092_800))),
+                ("Jean".to_string(), extra(Some(7), Some(1_601_510_400))),
+            ]))
+        );
+    }
+
+    #[test]
+    fn an_implausible_value_is_left_out_of_its_character_only() {
+        let mut data = roster_data();
+        data.process_characters(&[
+            befriended(10000046, 10, 1_646_092_800),
+            befriended(10000003, 11, 1_601_510_400), // friendship above 10
+            befriended(10000006, 4, 1_500_000_000),  // obtained before launch
+            befriended(10000002, 0, 0),              // nothing recorded
+        ]);
+
+        assert_eq!(
+            character_extras(&data),
+            Some(BTreeMap::from([
+                ("HuTao".to_string(), extra(Some(10), Some(1_646_092_800))),
+                ("Jean".to_string(), extra(None, Some(1_601_510_400))),
+                ("Lisa".to_string(), extra(Some(4), None)),
+            ]))
+        );
+    }
+
+    #[test]
+    fn a_field_most_characters_fail_is_left_out_for_everyone() {
+        // The obtained times look like small counters: the field number is
+        // wrong for this version, so even the one value in range is dropped.
+        let mut data = roster_data();
+        data.process_characters(&[
+            befriended(10000046, 10, 1_646_092_800),
+            befriended(10000003, 7, 3),
+            befriended(10000006, 4, 12),
+        ]);
+
+        assert_eq!(
+            character_extras(&data),
+            Some(BTreeMap::from([
+                ("HuTao".to_string(), extra(Some(10), None)),
+                ("Jean".to_string(), extra(Some(7), None)),
+                ("Lisa".to_string(), extra(Some(4), None)),
+            ]))
+        );
+    }
+
+    #[test]
+    fn half_the_roster_failing_does_not_distrust_a_field() {
+        // A new account: the Traveler has no friendship level, and neither
+        // does one other character yet.
+        let mut data = roster_data();
+        data.process_characters(&[
+            befriended(10000046, 2, 1_646_092_800),
+            befriended(10000003, 0, 1_601_510_400),
+        ]);
+
+        let extras = character_extras(&data).expect("both fields are trusted");
+        assert_eq!(extras["HuTao"], extra(Some(2), Some(1_646_092_800)));
+        assert_eq!(extras["Jean"], extra(None, Some(1_601_510_400)));
+    }
+
+    #[test]
+    fn no_trusted_values_means_no_key() {
+        let mut data = roster_data();
+        data.process_characters(&[befriended(10000046, 0, 0), befriended(10000003, 0, 0)]);
+        assert_eq!(character_extras(&data), None);
+    }
+
+    #[test]
+    fn character_extras_follow_the_characters_the_export_holds() {
+        let mut data = PlayerData::new(
+            TestGameData {
+                character_map: r#""10000046": "Hu Tao", "10000005": "Traveler""#,
+                skill_type_map: r#""10067": "Burst""#,
+                skill_element_map: r#""10067": "Anemo""#,
+                ..Default::default()
+            }
+            .build(),
+        );
+
+        let mut traveler = befriended(10000005, 0, 1_601_510_400);
+        traveler.skill_level_map.insert(10067, 1);
+        let mut low_level = befriended(10000046, 10, 1_646_092_800);
+        low_level.prop_map.insert(4001, prop_val(20));
+        data.process_characters(&[traveler, low_level]);
+
+        let mut settings = settings();
+        settings.min_character_level = 50;
+        let mut report = ExportReport::default();
+        let good = data.build_good(&settings, &mut report, NOW_SECS * 1000);
+
+        // Hu Tao is below the level filter, so in neither list; the Traveler
+        // carries the element suffix in both.
+        let keys: Vec<&str> = good.characters.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(keys, ["TravelerAnemo"]);
+        assert_eq!(
+            good.gi_characters,
+            Some(BTreeMap::from([(
+                "TravelerAnemo".to_string(),
+                extra(None, Some(1_601_510_400))
+            )]))
+        );
+
+        // Characters left out of the export altogether take their extras along.
+        settings.include_characters = false;
+        let good = data.build_good(&settings, &mut report, NOW_SECS * 1000);
+        assert_eq!(good.gi_characters, None);
+    }
+
+    #[test]
+    fn the_extras_log_line_says_how_each_field_fared() {
+        let mut friendship = FieldTally::default();
+        friendship.check("HuTao", 10, true);
+        friendship.check("TravelerAnemo", 0, false);
+        friendship.check("Jean", 7, true);
+        assert_eq!(
+            friendship.describe("friendship"),
+            "friendship 2/3 plausible (implausible: TravelerAnemo 0)"
+        );
+
+        let mut obtained = FieldTally::default();
+        for (key, raw) in [("A", 1), ("B", 2), ("C", 3), ("D", 4)] {
+            obtained.check(key, raw, false);
+        }
+        assert_eq!(
+            obtained.describe("obtainedAt"),
+            "obtainedAt 0/4 plausible (implausible: A 1, B 2, C 3, ...), so omitted"
+        );
+
+        assert_eq!(
+            describe_character_extras("HuTao", &extra(Some(10), Some(1_646_092_800))),
+            "HuTao friendship 10 obtained 2022-03-01"
+        );
     }
 }

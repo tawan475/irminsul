@@ -83,6 +83,28 @@ pub struct Good {
     /// `gi_achievements`, never more.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gi_achievement_times: Option<BTreeMap<u32, u32>>,
+    /// Per-character values GOOD has no place for, keyed by the same GOOD key
+    /// the character has in `characters` (Traveler with its element suffix).
+    /// Only characters with at least one known value appear.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gi_characters: Option<BTreeMap<String, GiCharacter>>,
+}
+
+/// One character's entry in `gi_characters`.
+///
+/// Each value is omitted, never null, when it was not captured or failed its
+/// plausibility check -- and for every character at once when most of them
+/// failed it, since that means the field is read from the wrong place in this
+/// game version.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GiCharacter {
+    /// Friendship level, 1..=10.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub friendship: Option<u32>,
+    /// When the character joined the account, in unix seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub obtained_at: Option<u32>,
 }
 
 /// Account values GOOD has no place for: `gi_player`.
@@ -290,6 +312,13 @@ mod tests {
                 game_data: Some("792978e5503ecfba73dcb3562ed44a0d35a2abe2".to_string()),
             }),
             gi_achievement_times: Some(BTreeMap::from([(80001, 1_650_000_000)])),
+            gi_characters: Some(BTreeMap::from([(
+                "HuTao".to_string(),
+                GiCharacter {
+                    friendship: Some(10),
+                    obtained_at: Some(1_646_092_800),
+                },
+            )])),
         };
 
         let json = serde_json::to_value(&good).expect("Good must serialize");
@@ -316,6 +345,7 @@ mod tests {
                 "format",
                 "gi_achievement_times",
                 "gi_achievements",
+                "gi_characters",
                 "gi_player",
                 "materials",
                 "source",
@@ -407,6 +437,13 @@ mod tests {
             json["gi_achievement_times"],
             serde_json::json!({ "80001": 1_650_000_000 })
         );
+
+        // Keyed like `characters`; unix seconds for `obtainedAt`.
+        assert_eq!(keys(&json["gi_characters"]), ["HuTao"]);
+        assert_eq!(
+            keys(&json["gi_characters"]["HuTao"]),
+            ["friendship", "obtainedAt"]
+        );
     }
 
     #[test]
@@ -428,6 +465,7 @@ mod tests {
             timestamp: None,
             gi_player: None,
             gi_achievement_times: None,
+            gi_characters: None,
         };
 
         let json = serde_json::to_value(&good).expect("Good must serialize");
@@ -436,6 +474,7 @@ mod tests {
         assert!(!object.contains_key("timestamp"));
         assert!(!object.contains_key("gi_player"));
         assert!(!object.contains_key("gi_achievement_times"));
+        assert!(!object.contains_key("gi_characters"));
     }
 
     #[test]
@@ -445,5 +484,14 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(serde_json::to_string(&player).unwrap(), r#"{"ar":60}"#);
+
+        let character = GiCharacter {
+            obtained_at: Some(1_646_092_800),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&character).unwrap(),
+            r#"{"obtainedAt":1646092800}"#
+        );
     }
 }
