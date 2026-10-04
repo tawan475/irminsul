@@ -2,7 +2,7 @@ use std::io;
 use std::time::Instant;
 
 use kcp::{KCP_OVERHEAD, Kcp, get_conv};
-use tracing::{Level, debug, instrument, span, trace, warn};
+use tracing::{Level, debug, info, instrument, span, trace, warn};
 
 use crate::bytes_as_hex;
 
@@ -16,6 +16,50 @@ pub(crate) struct KcpSniffer {
     kcp: Kcp<io::Sink>,
     time_start: Instant,
     foreign: ForeignTally,
+    progress: Progress,
+}
+
+/// Whether the conversation is getting anywhere, for diagnosing a stall.
+#[derive(Default)]
+struct Progress {
+    /// Highest push sequence number seen.
+    highest_push: Option<u32>,
+    /// Datagrams that raised `highest_push` since something was last delivered.
+    new_without_delivery: u32,
+    /// The current stall has been reported.
+    reported: bool,
+}
+
+impl Progress {
+    /// Account for one datagram whose newest push was `newest`, and which did
+    /// or did not complete a message.
+    fn note(&mut self, conv: u32, newest: Option<u32>, delivered: bool) {
+        let advanced = newest.is_some_and(|sn| self.highest_push.is_none_or(|high| sn > high));
+        if advanced {
+            self.highest_push = newest;
+        }
+
+        if delivered {
+            if self.reported {
+                info!(conv, "kcp conversation is delivering again");
+            }
+            self.new_without_delivery = 0;
+            self.reported = false;
+            return;
+        }
+
+        if advanced {
+            self.new_without_delivery = self.new_without_delivery.saturating_add(1);
+            if self.new_without_delivery >= STALL_WARN_AFTER && !self.reported {
+                self.reported = true;
+                warn!(
+                    conv,
+                    segments = self.new_without_delivery,
+                    "kcp conversation keeps receiving new segments without delivering any; a                      segment it needs was probably missed by the capture, and a passive listener                      cannot ask for it again"
+                );
+            }
+        }
+    }
 }
 
 /// Segments rejected for belonging to another conversation, for logging.
@@ -105,6 +149,7 @@ impl KcpSniffer {
             kcp: new_kcp(conv_id),
             time_start: Instant::now(),
             foreign: ForeignTally::default(),
+            progress: Progress::default(),
         }
     }
 
@@ -124,6 +169,7 @@ impl KcpSniffer {
         // game uses special format which adds 4 bytes at index 4,
         // reprocess to discard bytes 4..8 of every segment
         let segments = reformat_kcp_segments(segments);
+        let newest = highest_push_sn(&segments);
 
         match self.kcp.input(&segments) {
             Ok(size) => trace!(size, "input successful"),
@@ -151,6 +197,7 @@ impl KcpSniffer {
             warn!(%e, "could not update kcp state");
         }
 
+        self.progress.note(self.conv_id, newest, !recv.is_empty());
         recv
     }
 
@@ -243,6 +290,48 @@ const FOREIGN_FIRST_WARNINGS: usize = 8;
 /// of them in 31 s in the 2026-10-04 log, pktmon's eight copies included --
 /// and a WARN per segment buries everything else the log could have said.
 const FOREIGN_SUMMARY_EVERY: u64 = 1000;
+
+/// Datagrams carrying new pushes, with nothing delivered, before a
+/// conversation is reported as stalled behind a missing segment.
+///
+/// Well above the largest message the reassembler can hold back legitimately
+/// (a message is at most 255 fragments, see `MAX_FRAGMENT_INDEX`), and below
+/// the receive window, after which the reassembler drops pushes anyway.
+const STALL_WARN_AFTER: u32 = 512;
+
+/// `IKCP_CMD_PUSH`, the command that carries data.
+const KCP_CMD_PUSH: u8 = 81;
+
+/// The highest push sequence number in standard KCP segments produced by
+/// [`reformat_kcp_segments`].
+///
+/// That function only emits segments whose header and content fit, so this
+/// walk cannot run off the end; the bounds are still checked rather than
+/// assumed.
+fn highest_push_sn(standard: &[u8]) -> Option<u32> {
+    let mut highest: Option<u32> = None;
+    let mut i = 0usize;
+    while standard.len().saturating_sub(i) >= KCP_OVERHEAD {
+        let field = |offset: usize| {
+            u32::from_le_bytes(standard[i + offset..i + offset + 4].try_into().unwrap())
+        };
+        // Standard layout: conv(4) cmd(1) frg(1) wnd(2) ts(4) sn(4) una(4) len(4).
+        let cmd = standard[i + 4];
+        let sn = field(12);
+        let len = field(20) as usize;
+        if cmd == KCP_CMD_PUSH {
+            highest = Some(highest.map_or(sn, |high| high.max(sn)));
+        }
+        match i
+            .checked_add(KCP_OVERHEAD)
+            .and_then(|end| end.checked_add(len))
+        {
+            Some(next) if next <= standard.len() => i = next,
+            _ => break,
+        }
+    }
+    highest
+}
 
 fn validate_kcp_segment(payload: &[u8]) -> Option<u32> {
     if payload.len() < GAME_KCP_OVERHEAD {
@@ -663,6 +752,41 @@ mod tests {
                 "sn {sn}"
             );
         }
+    }
+
+    #[test]
+    fn a_conversation_stuck_behind_a_lost_segment_is_reported_once() {
+        // sn 0 never arrives: everything after it waits in the reassembler
+        // forever, and from outside that looks exactly like a quiet game.
+        let mut sniffer = KcpSniffer::new(7);
+        let logged = crate::test_support::warnings(|| {
+            for sn in 1..=STALL_WARN_AFTER * 2 {
+                assert!(
+                    sniffer
+                        .receive_segments(&game_segment(7, sn, &[1, 2, 3]))
+                        .is_empty()
+                );
+                // pktmon's duplicates are not new segments.
+                sniffer.receive_segments(&game_segment(7, sn, &[1, 2, 3]));
+            }
+        });
+        let stalls: Vec<&String> = logged
+            .iter()
+            .filter(|line| line.contains("without delivering"))
+            .collect();
+        assert_eq!(stalls.len(), 1, "{logged:#?}");
+
+        // A conversation that delivers is fine, however fragmented.
+        let mut sniffer = KcpSniffer::new(8);
+        let logged = crate::test_support::warnings(|| {
+            for sn in 0..STALL_WARN_AFTER * 2 {
+                assert_eq!(
+                    sniffer.receive_segments(&game_segment(8, sn, &[9])).len(),
+                    1
+                );
+            }
+        });
+        assert!(logged.is_empty(), "{logged:#?}");
     }
 
     /// One hostile segment does not cost the good segments sharing its datagram.
