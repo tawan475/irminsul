@@ -725,7 +725,60 @@ impl PlayerData {
             total,
             item_top_halves: most_first(&item_tops),
             avatar_top_halves: most_first(&avatar_tops),
+            strays: best.map_or_else(Vec::new, |(top, _)| self.uid_strays(top)),
         }
+    }
+
+    /// The captured items whose guid top half is not `uid`, grouped by top
+    /// half, kind and id, most first (at most 100 groups).
+    fn uid_strays(&self, uid: u64) -> Vec<good::UidStray> {
+        let mut groups: BTreeMap<(u64, &'static str, u32), usize> = BTreeMap::new();
+        for ((item_id, guid), item) in &self.items {
+            if *guid == 0 || guid >> 32 == uid {
+                continue;
+            }
+            let kind = if item.has_material() {
+                "material"
+            } else if item.has_equip() && item.equip().has_weapon() {
+                "weapon"
+            } else if item.has_equip() && item.equip().has_reliquary() {
+                "artifact"
+            } else if item.has_furniture() {
+                "furniture"
+            } else {
+                "other"
+            };
+            *groups.entry((guid >> 32, kind, *item_id)).or_default() += 1;
+        }
+        let mut strays: Vec<good::UidStray> = groups
+            .into_iter()
+            .map(|((top, kind, item_id), count)| {
+                let name = match kind {
+                    "material" => self.game_data.get_material(item_id).ok().cloned(),
+                    "weapon" => self
+                        .game_data
+                        .get_weapon(item_id)
+                        .ok()
+                        .map(|w| w.name.clone()),
+                    "artifact" => self
+                        .game_data
+                        .get_artifact(item_id)
+                        .ok()
+                        .map(|a| format!("{} {:?}", a.set, a.slot)),
+                    _ => None,
+                };
+                good::UidStray {
+                    top,
+                    item_id,
+                    kind: kind.to_string(),
+                    name,
+                    count,
+                }
+            })
+            .collect();
+        strays.sort_by_key(|stray| std::cmp::Reverse(stray.count));
+        strays.truncate(100);
+        strays
     }
 
     /// `gi_player` for the captured data, plus every property value that was
@@ -813,6 +866,18 @@ impl PlayerData {
                 total = uid_check.total,
                 items = ?uid_check.item_top_halves,
                 avatars = ?uid_check.avatar_top_halves,
+                strays = ?uid_check
+                    .strays
+                    .iter()
+                    .map(|s| format!(
+                        "{}x {} {} {} (top {})",
+                        s.count,
+                        s.kind,
+                        s.item_id,
+                        s.name.as_deref().unwrap_or("?"),
+                        s.top
+                    ))
+                    .collect::<Vec<_>>(),
                 "account UID read from the item guids"
             ),
             None => tracing::info!(
