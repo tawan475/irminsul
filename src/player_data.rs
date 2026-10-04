@@ -292,8 +292,8 @@ impl PlayerData {
     /// Forget everything captured about the account, keeping the game data.
     ///
     /// Reached from the UI's "Clear data" control via `Message::ClearData`, and
-    /// from the handshake-latched reset that stops a second account's inventory
-    /// being merged into the first one's. Still the only way to drop captured
+    /// when a new game connection delivers its first data, which stops a second
+    /// account's inventory being merged into the first one's. Still the only way to drop captured
     /// state the game never announces a change for: destroyed items are tracked
     /// by [`remove_items`](Self::remove_items), but a stack whose count merely
     /// falls is only corrected by the next full inventory notify, which the
@@ -304,6 +304,15 @@ impl PlayerData {
         self.items.clear();
         self.properties.clear();
         self.character_equip_guid_map.clear();
+    }
+
+    /// Whether nothing at all has been captured.
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.achievements.is_empty()
+            && self.characters.is_empty()
+            && self.items.is_empty()
+            && self.properties.is_empty()
     }
 
     pub fn process_achievements(&mut self, achievements: &[Achievement]) {

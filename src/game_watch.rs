@@ -113,12 +113,12 @@ pub enum GameStatus {
     /// Game commands are decrypting. The only state here backed by packets
     /// rather than by process bookkeeping.
     ///
-    /// It proves the login was inside the capture window -- nothing decrypts
-    /// without either the baked-in dispatch key, which only matches the login
-    /// exchange, or a session key derived from it. It does not by itself prove
-    /// the *session* key was recovered: the first login messages decrypt under
-    /// the dispatch key alone, and the seed search that follows can still fail.
-    /// The per-category ticks above the line are what confirm real data.
+    /// Set only by commands that decrypted under the *session* key, so it
+    /// proves the key for the current connection was recovered. Login messages
+    /// decrypted under the baked-in dispatch key do not count: every connection
+    /// gets that far, including one whose session key is then never found (see
+    /// [`GameStatus::KeyLost`]). The per-category ticks above the line are what
+    /// confirm which data actually arrived.
     Decoding,
     /// The game is running but the capture backend is not up.
     ///
@@ -130,6 +130,10 @@ pub enum GameStatus {
     CaptureOff,
     /// The game is running and Irminsul cannot have seen it start.
     LaunchMissed(MissedLaunch),
+    /// A connection's login was seen, but its session key was not recovered,
+    /// so nothing from it decrypts. Reached when the search gave up, or when
+    /// no session-key data followed the login within [`KEY_RECOVERY_GRACE`].
+    KeyLost,
 }
 
 impl GameStatus {
@@ -146,6 +150,7 @@ impl GameStatus {
             GameStatus::LaunchMissed(MissedLaunch::CaptureStopped) => {
                 "Game: capture was off — restart Genshin to capture"
             }
+            GameStatus::KeyLost => "Game: key not recovered — relog to capture",
         }
     }
 
@@ -199,6 +204,13 @@ impl GameStatus {
                  Already in the world? Nothing more can be captured from this session. With \
                  capture running, close Genshin and start it again."
             }
+            GameStatus::KeyLost => {
+                "The game connected (or reconnected) and Irminsul saw it, but could not recover \
+                 the key for this connection, so nothing new is being decrypted.\n\n\
+                 The data captured before is kept and can still be exported.\n\n\
+                 To capture again, with Irminsul running: return to the login screen and enter \
+                 the world again, or restart Genshin."
+            }
         }
     }
 
@@ -206,7 +218,7 @@ impl GameStatus {
         match self {
             GameStatus::NotRunning | GameStatus::CaptureOff => Severity::Neutral,
             GameStatus::LaunchCaptured | GameStatus::Decoding => Severity::Good,
-            GameStatus::LaunchMissed(_) => Severity::Problem,
+            GameStatus::LaunchMissed(_) | GameStatus::KeyLost => Severity::Problem,
         }
     }
 }
@@ -225,6 +237,15 @@ use std::time::{Duration, Instant};
 /// Long enough to ride out a loading screen without flicker, short enough that
 /// closing the game clears the claim while the user is still looking at it.
 const DECODING_TTL: Duration = Duration::from_secs(10);
+
+/// How long a connection's login traffic may go without session-key data
+/// before the key is reported as not recovered.
+///
+/// A normal login recovers the key within a second or two of the token
+/// exchange, and a search that gives up says so directly (see
+/// [`GameWatch::note_key_recovery_failed`]), so this only has to catch what
+/// slips past both while staying clear of a slow but working login.
+pub const KEY_RECOVERY_GRACE: Duration = Duration::from_secs(30);
 
 /// The transition logic. See the module docs.
 #[derive(Debug, Default)]
@@ -259,6 +280,15 @@ pub struct GameWatch {
     /// Remembered rather than recomputed so that stopping capture can stay
     /// visually quiet while still surfacing the truth when capture resumes.
     holed_cause: Option<MissedLaunch>,
+    /// When the current connection's login traffic (dispatch-key commands)
+    /// was first seen with no session-key data since.
+    ///
+    /// The evidence for [`GameStatus::KeyLost`]: a login that was watched and
+    /// then led nowhere. Cleared by session-key data, a reset, or the process
+    /// going away.
+    awaiting_key_since: Option<Instant>,
+    /// The sniffer gave up recovering the current connection's session key.
+    key_recovery_failed: bool,
     /// Has the scan ever actually found the game?
     ///
     /// Until it has, an absence proves nothing. The process names here are a
@@ -274,9 +304,26 @@ impl GameWatch {
     pub fn status(&self) -> GameStatus {
         if self.is_decoding() {
             GameStatus::Decoding
+        } else if self.key_lost()
+            && matches!(
+                self.process_status,
+                GameStatus::LaunchCaptured | GameStatus::LaunchMissed(_)
+            )
+        {
+            // Only over a running game with capture up: "not running" and
+            // "capture starting" are the more basic truths when they apply.
+            GameStatus::KeyLost
         } else {
             self.process_status
         }
+    }
+
+    /// Was a login seen whose session key has not arrived, and is not coming?
+    fn key_lost(&self) -> bool {
+        self.key_recovery_failed
+            || self
+                .awaiting_key_since
+                .is_some_and(|at| at.elapsed() >= KEY_RECOVERY_GRACE)
     }
 
     /// Has game data decoded recently enough to still say so?
@@ -298,6 +345,11 @@ impl GameWatch {
     /// How long ago game data last decoded, if ever.
     pub fn decoded_age(&self) -> Option<Duration> {
         self.decoded_at.map(|at| at.elapsed())
+    }
+
+    /// Did the last scan find the game running?
+    pub fn game_running(&self) -> bool {
+        self.previous == Some(true)
     }
 
     /// Has the process list been looked at even once?
@@ -350,6 +402,11 @@ impl GameWatch {
         let launched = running && matches!(previous, Some(false));
         if !capturing || launched {
             self.decoded_at = None;
+        }
+        if !running || launched {
+            // Whatever connection the key was missing for is gone with it.
+            self.awaiting_key_since = None;
+            self.key_recovery_failed = false;
         }
 
         if !running {
@@ -423,6 +480,8 @@ impl GameWatch {
         let before = self.status();
         self.decoded_at = Some(Instant::now());
         self.decoded_since_poll = true;
+        self.awaiting_key_since = None;
+        self.key_recovery_failed = false;
 
         // Packets outrank the process scan. Something decoded, so the login
         // exchange for *this* session was inside the capture window, whatever
@@ -445,6 +504,42 @@ impl GameWatch {
     pub fn note_data_cleared(&mut self) -> bool {
         let before = self.status();
         self.decoded_at = None;
+        self.status() != before
+    }
+
+    /// Login traffic decoded -- commands under the dispatch key -- with no
+    /// session key yet. Starts the [`KEY_RECOVERY_GRACE`] clock for this
+    /// connection, unless it is already running.
+    ///
+    /// Deliberately *not* evidence for [`GameStatus::Decoding`]: the dispatch
+    /// key decrypts the login exchange of any connection, including one whose
+    /// session key is then never recovered.
+    ///
+    /// Returns whether the user-visible status changed.
+    pub fn note_login_traffic(&mut self) -> bool {
+        let before = self.status();
+        self.awaiting_key_since.get_or_insert_with(Instant::now);
+        self.status() != before
+    }
+
+    /// The sniffer gave up recovering the current connection's session key.
+    ///
+    /// Returns whether the user-visible status changed.
+    pub fn note_key_recovery_failed(&mut self) -> bool {
+        let before = self.status();
+        self.key_recovery_failed = true;
+        self.status() != before
+    }
+
+    /// The game connection restarted: the previous connection's decrypting
+    /// claim and key verdict end, and the new one is judged on its own.
+    ///
+    /// Returns whether the user-visible status changed.
+    pub fn note_session_reset(&mut self) -> bool {
+        let before = self.status();
+        self.decoded_at = None;
+        self.awaiting_key_since = None;
+        self.key_recovery_failed = false;
         self.status() != before
     }
 }
@@ -962,6 +1057,116 @@ mod tests {
         // developer may well have Genshin open while running the tests.
     }
 
+    // -- key recovery ------------------------------------------------------------
+
+    /// A watch on a game it saw launch with capture running.
+    fn launched() -> GameWatch {
+        let mut watch = watching_before_launch(CAPTURING);
+        assert_eq!(watch.observe(true, CAPTURING), GameStatus::LaunchCaptured);
+        watch
+    }
+
+    /// Pretend `at` happened `ago` in the past, if the clock allows it.
+    fn backdate(at: &mut Option<Instant>, ago: Duration) -> bool {
+        match Instant::now().checked_sub(ago) {
+            Some(past) => {
+                *at = Some(past);
+                true
+            }
+            None => false,
+        }
+    }
+
+    #[test]
+    fn login_traffic_alone_does_not_claim_decrypting() {
+        // 05:11 on 2026-10-04: the reconnect's dispatch-key messages decoded,
+        // the line went green "data decrypting", and nothing else decoded for
+        // an hour and three quarters.
+        let mut watch = launched();
+        assert!(!watch.note_login_traffic());
+        assert_eq!(watch.status(), GameStatus::LaunchCaptured);
+    }
+
+    #[test]
+    fn a_login_whose_key_never_arrives_is_flagged() {
+        let mut watch = launched();
+        watch.note_login_traffic();
+        assert_eq!(watch.status(), GameStatus::LaunchCaptured, "still in grace");
+
+        if backdate(
+            &mut watch.awaiting_key_since,
+            KEY_RECOVERY_GRACE + Duration::from_secs(1),
+        ) {
+            assert_eq!(watch.status(), GameStatus::KeyLost);
+            assert_eq!(watch.status().severity(), Severity::Problem);
+            // The poll keeps it up: it is not a process verdict.
+            assert_eq!(watch.observe(true, CAPTURING), GameStatus::KeyLost);
+        }
+    }
+
+    #[test]
+    fn a_key_search_given_up_on_is_flagged_at_once() {
+        let mut watch = launched();
+        watch.note_login_traffic();
+        assert!(watch.note_key_recovery_failed());
+        assert_eq!(watch.status(), GameStatus::KeyLost);
+        assert!(!watch.note_key_recovery_failed(), "no churn on repeats");
+    }
+
+    #[test]
+    fn a_normal_login_never_shows_the_problem() {
+        let mut watch = launched();
+        watch.note_login_traffic();
+        assert!(watch.note_decoded_data());
+        assert_eq!(watch.status(), GameStatus::Decoding);
+
+        // Long after, with the claim expired, it is green, not red.
+        if backdate(
+            &mut watch.decoded_at,
+            DECODING_TTL + KEY_RECOVERY_GRACE + Duration::from_secs(1),
+        ) {
+            assert_eq!(watch.status(), GameStatus::LaunchCaptured);
+        }
+    }
+
+    #[test]
+    fn session_data_clears_the_problem() {
+        let mut watch = launched();
+        watch.note_login_traffic();
+        watch.note_key_recovery_failed();
+        assert!(watch.note_decoded_data());
+        assert_eq!(watch.status(), GameStatus::Decoding);
+    }
+
+    #[test]
+    fn a_new_connection_is_judged_afresh() {
+        let mut watch = launched();
+        watch.note_login_traffic();
+        watch.note_key_recovery_failed();
+        assert_eq!(watch.status(), GameStatus::KeyLost);
+
+        assert!(watch.note_session_reset());
+        assert_eq!(watch.status(), GameStatus::LaunchCaptured);
+
+        // And a reset ends the previous connection's decrypting claim.
+        watch.note_decoded_data();
+        watch.note_session_reset();
+        assert_eq!(watch.status(), GameStatus::LaunchCaptured);
+    }
+
+    #[test]
+    fn closing_the_game_or_stopping_capture_outranks_the_problem() {
+        let mut watch = launched();
+        watch.note_login_traffic();
+        watch.note_key_recovery_failed();
+
+        assert_eq!(watch.observe(true, STOPPED), GameStatus::CaptureOff);
+        assert_eq!(watch.observe(true, CAPTURING), GameStatus::KeyLost);
+        assert_eq!(watch.observe(false, CAPTURING), GameStatus::NotRunning);
+        // A relaunch starts clean.
+        assert_eq!(watch.observe(true, CAPTURING), GameStatus::LaunchCaptured);
+    }
+
     #[test]
     fn every_state_has_its_own_line_and_explanation() {
         let states = [
@@ -970,6 +1175,7 @@ mod tests {
             GameStatus::Decoding,
             GameStatus::LaunchMissed(MissedLaunch::AlreadyRunning),
             GameStatus::LaunchMissed(MissedLaunch::CaptureStopped),
+            GameStatus::KeyLost,
         ];
         for (i, state) in states.iter().enumerate() {
             assert!(state.label().starts_with("Game: "), "{state:?}");
@@ -979,6 +1185,9 @@ mod tests {
                 assert_ne!(state.tooltip(), other.tooltip());
             }
         }
+        assert!(GameStatus::KeyLost.label().contains("relog"));
+        assert!(GameStatus::KeyLost.tooltip().contains("kept"));
+
         // The two unrecoverable states must name the fix, since that is the
         // entire point of the line.
         for cause in [MissedLaunch::AlreadyRunning, MissedLaunch::CaptureStopped] {

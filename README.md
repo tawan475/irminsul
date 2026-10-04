@@ -15,6 +15,15 @@ Irminsul utilizes packet capture instead of the common optical character recogni
 
 To use the `pcap` capture backend, make sure to install a Pcap library (Npcap/WinPcap on Windows, libpcap on Linux). The released Linux binary has libpcap linked into it, so this only applies there when building Irminsul yourself.
 
+## Repository layout
+
+This repository is a Cargo workspace:
+
+- the root package is Irminsul itself;
+- [`crates/auto-artifactarium`](crates/auto-artifactarium) is the library that decrypts the game's traffic and parses its packets. It used to be a separate repository and was merged in with its history; Irminsul depends on it by path.
+
+`python check.py` runs the same checks as CI for both.
+
 ## Command line options
 
 Irminsul accepts a handful of command line options for advanced use cases:

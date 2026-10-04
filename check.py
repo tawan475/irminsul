@@ -29,6 +29,12 @@ FEATURE_SETS = {
     "Darwin": ["pcap"],
 }
 
+# The packet-parsing library in crates/auto-artifactarium. It has no capture
+# backend of its own, so it is checked once per host with every feature on --
+# `cli` is the only thing that builds its src/main.rs -- rather than once per
+# irminsul feature set. Mirrors the `library` job in .github/workflows/rust.yml.
+LIBRARY = "auto-artifactarium"
+
 def run_command(cmd, step_name, env=None):
     print(f"\n[{step_name}] Running: {' '.join(cmd)}")
     try:
@@ -105,8 +111,8 @@ def main():
     system = platform.system()
     feature_sets = FEATURE_SETS.get(system, [""])
 
-    # 1. Cargo Fmt
-    run_command(["cargo", "fmt", "--check"], "Format Check")
+    # 1. Cargo Fmt (every workspace member)
+    run_command(["cargo", "fmt", "--all", "--check"], "Format Check")
 
     if args.all:
         print("\n🌍 Running cross-platform checks (Windows, macOS, Linux)...")
@@ -155,17 +161,34 @@ def main():
         print(f"\n🔧 Checking features: {label}")
         features = feature_args(feature_set)
 
-        # 2. Cargo Clippy
-        clippy_cmd = ["cargo", "clippy", "--no-default-features"] + features + ["--", "-Dwarnings"]
+        # 2. Cargo Clippy: every target (tests included) of every workspace
+        # member. `--features` only applies to members that define it.
+        clippy_cmd = ["cargo", "clippy", "--workspace", "--all-targets", "--no-default-features"] + features + ["--", "-Dwarnings"]
         run_command(clippy_cmd, f"Clippy Lints [{label}]", env=env)
 
-        # 3. Cargo Test
+        # 3. Cargo Test (irminsul; the library's tests run below)
         test_cmd = ["cargo", "test", "--no-default-features"] + features
         run_command(test_cmd, f"Unit Tests [{label}]", env=env)
 
         # 4. Cargo Build
         build_cmd = ["cargo", "build", "--no-default-features"] + features
         run_command(build_cmd, f"Build Verification [{label}]", env=env)
+
+    # 5. The library, once per host.
+    print(f"\n🔧 Checking library: {LIBRARY}")
+    lib = ["-p", LIBRARY]
+    run_command(["cargo", "clippy"] + lib + ["--all-targets", "--all-features", "--", "-Dwarnings"],
+                f"Clippy Lints [{LIBRARY}, all features]")
+    run_command(["cargo", "test"] + lib + ["--all-features"], f"Unit Tests [{LIBRARY}, all features]")
+    # Default features are what irminsul builds; this proves the CLI-only
+    # dependencies (clap, anyhow) stay out of the library.
+    run_command(["cargo", "build"] + lib, f"Build Verification [{LIBRARY}, default features]")
+    run_command(["cargo", "build"] + lib + ["--all-features"], f"Build Verification [{LIBRARY}, all features]")
+    # Rustdoc warnings (e.g. a public doc linking to a private item) fail this.
+    doc_env = os.environ.copy()
+    doc_env["RUSTDOCFLAGS"] = "-Dwarnings"
+    run_command(["cargo", "doc"] + lib + ["--no-deps", "--all-features"],
+                f"Docs [{LIBRARY}, RUSTDOCFLAGS=-Dwarnings]", env=doc_env)
 
     print("\n🎉 All checks passed! You are ready to push.")
 
