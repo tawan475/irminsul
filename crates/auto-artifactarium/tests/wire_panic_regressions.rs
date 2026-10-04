@@ -53,6 +53,27 @@ fn sniffer_with_zero_key() -> GameSniffer {
     GameSniffer::new().set_initial_keys([(0u16, vec![0u8; 4096])].into_iter().collect())
 }
 
+/// Feed `segment` to a fresh sniffer *and* to one whose lane is already bound
+/// to conversation 7, as it would be mid-session.
+///
+/// A fresh lane only opens for a segment at the start of its sequence space,
+/// so on its own a fresh sniffer would turn most hostile `sn`/`una` values away
+/// before they reach the reassembler -- which is exactly where the `kcp` crate's
+/// overflows live. The bound sniffer is what keeps them reachable.
+fn feed_fresh_and_bound(segment: &[u8]) {
+    let mut fresh = sniffer_with_zero_key();
+    let _ = fresh.receive_packet(game_frame(segment));
+
+    let mut bound = sniffer_with_zero_key();
+    let opener = push_segment(7, 0, 0, &well_formed_command());
+    assert_eq!(
+        commands(&mut bound, game_frame(&opener)).len(),
+        1,
+        "the opener binds the lane and decodes"
+    );
+    let _ = bound.receive_packet(game_frame(segment));
+}
+
 /// Feed one frame and report the commands it produced.
 ///
 /// The assertion that matters here is the implicit one: this function returns.
@@ -261,8 +282,7 @@ fn a_corrupted_segment_header_never_aborts() {
         for value in [0x00u8, 0x01, 0x7F, 0x80, 0xFF] {
             let mut corrupt = full.clone();
             corrupt[offset] = value;
-            let mut sniffer = sniffer_with_zero_key();
-            let _ = sniffer.receive_packet(game_frame(&corrupt));
+            feed_fresh_and_bound(&corrupt);
         }
     }
 }
@@ -309,9 +329,7 @@ fn hostile_header_field_combinations_never_abort() {
     // 81 push, 82 ack, 83 window ask, 84 window tell, plus two undefined ones.
     for cmd in [81u8, 82, 83, 84, 0, 255] {
         for frg in [0u8, 1, 127, 128, 254, 255] {
-            let mut sniffer = sniffer_with_zero_key();
-            let seg = segment(cmd, frg, 1024, 0, 0, 0, &content);
-            let _ = sniffer.receive_packet(game_frame(&seg));
+            feed_fresh_and_bound(&segment(cmd, frg, 1024, 0, 0, 0, &content));
         }
         for value in HOSTILE {
             for seg in [
@@ -319,14 +337,11 @@ fn hostile_header_field_combinations_never_abort() {
                 segment(cmd, 0, 1024, 0, value, 0, &content), // sn
                 segment(cmd, 0, 1024, 0, 0, value, &content), // una
             ] {
-                let mut sniffer = sniffer_with_zero_key();
-                let _ = sniffer.receive_packet(game_frame(&seg));
+                feed_fresh_and_bound(&seg);
             }
         }
         for wnd in [0u16, 1, 1024, u16::MAX] {
-            let mut sniffer = sniffer_with_zero_key();
-            let seg = segment(cmd, 0, wnd, 0, 0, 0, &content);
-            let _ = sniffer.receive_packet(game_frame(&seg));
+            feed_fresh_and_bound(&segment(cmd, 0, wnd, 0, 0, 0, &content));
         }
     }
 }
@@ -351,8 +366,7 @@ fn a_hostile_segment_does_not_take_its_neighbours_down() {
     ] {
         let mut datagram = first;
         datagram.extend_from_slice(&second);
-        let mut sniffer = sniffer_with_zero_key();
-        let _ = sniffer.receive_packet(game_frame(&datagram));
+        feed_fresh_and_bound(&datagram);
     }
 }
 
@@ -398,7 +412,6 @@ fn random_header_corruption_never_aborts() {
             let offset = 8 + (next() as usize % 16);
             datagram[offset] = next() as u8;
         }
-        let mut sniffer = sniffer_with_zero_key();
-        let _ = sniffer.receive_packet(game_frame(&datagram));
+        feed_fresh_and_bound(&datagram);
     }
 }

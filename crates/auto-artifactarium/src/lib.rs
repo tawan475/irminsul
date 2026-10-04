@@ -68,7 +68,7 @@ use crate::Key::Dispatch;
 use crate::connection::parse_connection_packet;
 use crate::crypto::{bruteforce, decrypt_command, guess, lookup_initial_key};
 use crate::r#gen::protos::{AvatarInfo, Item, PacketHead, PropValue, Unk, prop_value};
-use crate::kcp::KcpSniffer;
+use crate::kcp::{KcpSniffer, SegmentHead, segment_head};
 pub use crate::unk_util::{
     Achievement, AchievementMatchError, matches_achievement_all_data_notify,
     matches_avatars_all_data_notify, matches_get_player_token_rsp, matches_items_all_data_notify,
@@ -150,6 +150,15 @@ const MAX_TIME_ANCHORS: usize = 4;
 /// Four magic bytes are checked per candidate, so 40,000 candidates leave a
 /// false-positive chance of about 1 in 100,000.
 const RECONNECT_SEED_DEPTH: i32 = 10_000;
+
+/// Conversations of ended connections remembered by
+/// [`GameSniffer::retire_conversation`].
+///
+/// A straggler only matters for the few seconds after its connection ends, and
+/// each reset retires at most one conversation (both directions share it), so
+/// this covers several reconnects in quick succession while staying a fixed,
+/// tiny cost to search.
+const MAX_RETIRED_CONVS: usize = 8;
 
 /// Entries a store notify needs before it is believed.
 ///
@@ -456,11 +465,6 @@ fn protocol_version(data: &[u8]) -> Option<u16> {
         .map(|bytes| u16::from_be_bytes(*bytes) ^ 0x4567)
 }
 
-/// Conversation id of a raw game KCP segment.
-fn segment_conv_id(kcp_seg: &[u8]) -> Option<u32> {
-    (kcp_seg.len() >= 4).then(|| ::kcp::get_conv(kcp_seg))
-}
-
 /// What the currently installed key can do with the message in hand.
 enum KeyState {
     /// No key at all yet.
@@ -516,6 +520,9 @@ pub struct GameSniffer {
     /// Protocol version the last "no key for this version" complaint was about,
     /// so the complaint is made once per version and not once per message.
     unknown_key_version: Option<u16>,
+    /// Conversations of connections that have ended, oldest first, at most
+    /// [`MAX_RETIRED_CONVS`]. A lane is never opened for one of them.
+    retired_convs: Vec<u32>,
     /// Times `reset_session` has run. Published by
     /// [`GameSniffer::session_generation`] so a consumer can latch on a reset
     /// this library actually concluded, rather than on a raw handshake datagram
@@ -579,6 +586,14 @@ impl GameSniffer {
             && !matches!(self.key, Some(Key::Session(_)))
     }
 
+    pub fn bound_conversation(&self, direction: PacketDirection) -> Option<u32> {
+        match direction {
+            PacketDirection::Sent => self.sent_kcp.as_ref(),
+            PacketDirection::Received => self.recv_kcp.as_ref(),
+        }
+        .map(|kcp| kcp.conv_id)
+    }
+
     #[instrument(skip_all, fields(len = bytes.len()))]
     pub fn receive_packet(&mut self, bytes: Vec<u8>) -> Option<GamePacket> {
         let packet = parse_connection_packet(&PORTS, bytes)?;
@@ -631,8 +646,13 @@ impl GameSniffer {
     fn reset_session(&mut self, reason: &str) {
         info!(reason, "resetting session state");
         self.session_generation = self.session_generation.saturating_add(1);
-        self.recv_kcp = None;
-        self.sent_kcp = None;
+        // The ended connection's conversation may still have segments in
+        // flight; none of them may open a lane for the next one.
+        for direction in [PacketDirection::Sent, PacketDirection::Received] {
+            if let Some(conv) = self.lane(direction).take().map(|kcp| kcp.conv_id) {
+                self.retire_conversation(conv);
+            }
+        }
         self.key = None;
         self.session_seeds = None;
         // The live connection's anchor goes, because it is probed outside the
@@ -645,67 +665,102 @@ impl GameSniffer {
         self.pending_reset = false;
     }
 
+    /// Remember that `conv` belonged to a connection that has ended, so a
+    /// straggler of it can never be mistaken for the start of the next one.
+    fn retire_conversation(&mut self, conv: u32) {
+        if !self.retired_convs.contains(&conv) {
+            self.retired_convs.push(conv);
+        }
+        if self.retired_convs.len() > MAX_RETIRED_CONVS {
+            self.retired_convs.remove(0);
+        }
+    }
+
+    fn lane(&mut self, direction: PacketDirection) -> &mut Option<KcpSniffer> {
+        match direction {
+            PacketDirection::Sent => &mut self.sent_kcp,
+            PacketDirection::Received => &mut self.recv_kcp,
+        }
+    }
+
+    fn is_bound_anywhere(&self, conv: u32) -> bool {
+        self.bound_conversation(PacketDirection::Sent) == Some(conv)
+            || self.bound_conversation(PacketDirection::Received) == Some(conv)
+    }
+
+    /// Whether `head` can be the first segment of a connection that replaces
+    /// the current one: at the start of its sequence space, and a
+    /// conversation that is neither the current one nor one that ended.
+    fn could_start_connection(&self, head: &SegmentHead) -> bool {
+        head.could_open_conversation()
+            && !self.retired_convs.contains(&head.conv)
+            && !self.is_bound_anywhere(head.conv)
+    }
+
     fn receive_kcp_segment(
         &mut self,
         direction: PacketDirection,
         kcp_seg: &[u8],
     ) -> Option<Vec<GameCommand>> {
-        let current_conv = match direction {
-            PacketDirection::Sent => self.sent_kcp.as_ref(),
-            PacketDirection::Received => self.recv_kcp.as_ref(),
-        }
-        .map(|kcp| kcp.conv_id);
+        let current_conv = self.bound_conversation(direction);
 
-        // A new conversation id is the corroboration a deferred reset was
-        // waiting for: the game really did reconnect.
+        // A datagram that is not even a game KCP header cannot bind, confirm
+        // or feed anything.
+        let Some(head) = segment_head(kcp_seg) else {
+            return current_conv.map(|_| Vec::new());
+        };
+
+        // A new conversation is the corroboration a deferred reset was waiting
+        // for: the game really did reconnect. "New" is checked, not assumed: a
+        // straggler of an ended connection, or a segment from the middle of
+        // some conversation, does not start one.
         if self.pending_reset
-            && let (Some(current), Some(incoming)) = (current_conv, segment_conv_id(kcp_seg))
-            && current != incoming
+            && current_conv.is_some_and(|current| current != head.conv)
+            && self.could_start_connection(&head)
         {
             self.reset_session("handshake request confirmed by a new kcp conversation");
         }
 
-        let segments = {
-            let has_sniffer = match direction {
-                PacketDirection::Sent => self.sent_kcp.is_some(),
-                PacketDirection::Received => self.recv_kcp.is_some(),
-            };
-
-            if !has_sniffer {
-                // No sniffer in this direction means no conv id to compare, so
-                // the branch above cannot have fired: a genuine reconnect whose
-                // first segment lands in a direction the previous connection
-                // never used (capture started mid-session, or an earlier
-                // `try_new` failed) would otherwise wait for the key to die,
-                // silently eating the first two messages -- one of which is the
-                // `GetPlayerTokenRsp` the whole session depends on.
-                //
-                // The segment is turned into a sniffer *first*, so a datagram
-                // that is not even a valid KCP segment cannot corroborate
-                // anything; once it is one, a conversation is opening here, and
-                // an attacker cannot open a conversation the real game is not
-                // using either.
-                let fresh = KcpSniffer::try_new(kcp_seg)?;
-                if self.pending_reset {
-                    self.reset_session(
-                        "handshake request confirmed by a new kcp conversation in a direction \
-                         with no sniffer",
-                    );
-                }
-                match direction {
-                    PacketDirection::Sent => self.sent_kcp = Some(fresh),
-                    PacketDirection::Received => self.recv_kcp = Some(fresh),
-                }
+        if self.lane(direction).is_none() {
+            // A conversation of a connection that already ended. The late
+            // segment that bound one at 06:59 on 2026-10-04 left its lane
+            // rejecting the live conversation until irminsul was closed.
+            if self.retired_convs.contains(&head.conv) {
+                debug!(
+                    conv = head.conv,
+                    ?direction,
+                    "ignoring a segment of a conversation that has ended"
+                );
+                return Some(Vec::new());
+            }
+            // Capture began mid-conversation, or this is a straggler of one
+            // that predates it: a sniffer bound here could never deliver.
+            if !head.could_open_conversation() {
+                debug!(
+                    conv = head.conv,
+                    ?direction,
+                    "ignoring a segment from the middle of a conversation this lane never saw open"
+                );
+                return Some(Vec::new());
             }
 
-            let kcp = match direction {
-                PacketDirection::Sent => &mut self.sent_kcp,
-                PacketDirection::Received => &mut self.recv_kcp,
-            };
+            // No sniffer in this direction means no conv id to compare, so the
+            // corroboration above cannot have fired: a genuine reconnect whose
+            // first segment lands in a direction the previous connection never
+            // used (capture started mid-session) would otherwise wait for the
+            // key to die, silently eating the first two messages -- one of
+            // which is the `GetPlayerTokenRsp` the whole session depends on.
+            // The other direction's own conversation is not a new one, though.
+            if self.pending_reset && !self.is_bound_anywhere(head.conv) {
+                self.reset_session(
+                    "handshake request confirmed by a new kcp conversation in a direction with \
+                     no sniffer",
+                );
+            }
+            *self.lane(direction) = Some(KcpSniffer::new(head.conv));
+        }
 
-            kcp.as_mut()?.receive_segments(kcp_seg)
-        };
-
+        let segments = self.lane(direction).as_mut()?.receive_segments(kcp_seg);
         Some(
             segments
                 .into_iter()
@@ -2142,9 +2197,18 @@ mod tests {
         client_seed: u64,
         combined: u64,
     ) -> Vec<u16> {
-        let dispatch = dispatch_key();
         sniffer.receive_packet(handshake_frame());
+        token_exchange(sniffer, conn, sent_ms, client_seed ^ combined);
+        command_ids(
+            sniffer,
+            conn.server_message(&new_key_from_seed(combined), SESSION_MESSAGE),
+        )
+    }
 
+    /// The client's token request and the server's token response, both under
+    /// the dispatch key; the response carries `seed` and is stamped `sent_ms`.
+    fn token_exchange(sniffer: &mut GameSniffer, conn: &mut Conn, sent_ms: u64, seed: u64) {
+        let dispatch = dispatch_key();
         let request = command_bytes(TOKEN_REQ, &[], &field_varint(1, 1));
         assert_eq!(
             command_ids(
@@ -2158,7 +2222,7 @@ mod tests {
         let response = command_bytes(
             TOKEN_RSP,
             &field_varint(6, sent_ms),
-            &token_rsp_payload(sniffer, client_seed ^ combined),
+            &token_rsp_payload(sniffer, seed),
         );
         assert_eq!(
             command_ids(
@@ -2173,11 +2237,15 @@ mod tests {
             Some(sent_ms),
             "the token response installs its seeds"
         );
+    }
 
-        command_ids(
-            sniffer,
-            conn.server_message(&new_key_from_seed(combined), SESSION_MESSAGE),
-        )
+    /// Feed `frame` the way pktmon delivers it: eight identical copies.
+    fn eight_times(sniffer: &mut GameSniffer, frame: Vec<u8>) -> Vec<u16> {
+        let mut ids = Vec::new();
+        for _ in 0..8 {
+            ids.extend(command_ids(sniffer, frame.clone()));
+        }
+        ids
     }
 
     const TOKEN_REQ: u16 = 100;
@@ -2325,6 +2393,181 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), sniffer.time_anchors.len(), "no duplicates");
+    }
+
+    // -- conversation binding ----------------------------------------------------
+
+    /// A connection whose login stalled before any session key: the state the
+    /// 06:55 reconnect of 2026-10-04 was left in when the next one came.
+    fn stalled_login(sniffer: &mut GameSniffer, conv: u32) -> Conn {
+        let mut conn = Conn::new(conv);
+        sniffer.receive_packet(handshake_frame());
+        token_exchange(sniffer, &mut conn, LOGIN_MS, 0x0BAD_5EED);
+        assert!(matches!(sniffer.key, Some(Dispatch(_))));
+        conn
+    }
+
+    /// The new connection's token exchange, as pktmon delivers it, with the
+    /// command ids each side decoded to.
+    fn new_connection_logs_in(sniffer: &mut GameSniffer, conn: &mut Conn) -> (Vec<u16>, Vec<u16>) {
+        let dispatch = dispatch_key();
+        let request = command_bytes(TOKEN_REQ, &[], &field_varint(1, 1));
+        let sent = eight_times(
+            sniffer,
+            conn.push(PacketDirection::Sent, &dispatch, &request),
+        );
+        let response = command_bytes(TOKEN_RSP, &field_varint(6, LOGIN_MS), &[]);
+        let received = eight_times(
+            sniffer,
+            conn.push(PacketDirection::Received, &dispatch, &response),
+        );
+        (sent, received)
+    }
+
+    #[test]
+    fn a_late_segment_of_the_old_conversation_cannot_capture_a_lane() {
+        // 06:59:37: with no session key live the handshake reset at once; a
+        // late 32-byte segment of the old conversation 123542 then arrived
+        // before the new one, bound the received direction, and the new
+        // conversation 123582 was rejected 10,384 times until irminsul closed.
+        let mut sniffer = connected_sniffer();
+        let old = stalled_login(&mut sniffer, 123_542);
+        let generation = sniffer.session_generation();
+
+        for _ in 0..9 {
+            sniffer.receive_packet(handshake_frame());
+        }
+        assert!(sniffer.session_generation() > generation);
+
+        // The late segment: no content, far into the old conversation.
+        eight_times(
+            &mut sniffer,
+            segment_frame_at(PacketDirection::Received, old.conv, 4096, 3000, &[]),
+        );
+        assert_eq!(sniffer.bound_conversation(PacketDirection::Received), None);
+
+        let mut new = Conn::new(123_582);
+        let (sent, received) = new_connection_logs_in(&mut sniffer, &mut new);
+        assert_eq!(sent, vec![TOKEN_REQ]);
+        assert_eq!(received, vec![TOKEN_RSP], "the server side must decode");
+        assert_eq!(
+            sniffer.bound_conversation(PacketDirection::Received),
+            Some(123_582)
+        );
+    }
+
+    #[test]
+    fn a_young_old_conversation_is_still_kept_off_a_fresh_lane() {
+        // The same race when the old conversation was only seconds old, so its
+        // late segment still sits at the start of the sequence space: only the
+        // record of which conversations a reset retired tells it apart.
+        let mut sniffer = connected_sniffer();
+        let old = stalled_login(&mut sniffer, 123_542);
+        sniffer.receive_packet(handshake_frame());
+
+        eight_times(
+            &mut sniffer,
+            segment_frame_at(PacketDirection::Received, old.conv, 2, 1, &[]),
+        );
+        assert_eq!(sniffer.bound_conversation(PacketDirection::Received), None);
+
+        let mut new = Conn::new(123_582);
+        let (sent, received) = new_connection_logs_in(&mut sniffer, &mut new);
+        assert_eq!(sent, vec![TOKEN_REQ]);
+        assert_eq!(received, vec![TOKEN_RSP]);
+    }
+
+    #[test]
+    fn a_retired_conversation_does_not_confirm_a_deferred_reset() {
+        // A handshake while a session key is live waits for a *new*
+        // conversation. A straggler from the connection before last is not one.
+        let mut sniffer = connected_sniffer();
+        let mut first = Conn::new(122_486);
+        log_in(
+            &mut sniffer,
+            &mut first,
+            LOGIN_MS,
+            client_draw(LOGIN_MS, 0),
+            0x1111,
+        );
+        let mut second = Conn::new(122_628);
+        log_in(
+            &mut sniffer,
+            &mut second,
+            LOGIN_MS + HOUR_MS,
+            client_draw(LOGIN_MS, 1),
+            0x2222,
+        );
+        let generation = sniffer.session_generation();
+
+        sniffer.receive_packet(handshake_frame());
+        sniffer.receive_packet(segment_frame_at(
+            PacketDirection::Received,
+            first.conv,
+            0,
+            0,
+            &[0u8; 40],
+        ));
+
+        assert_eq!(sniffer.session_generation(), generation);
+        assert!(matches!(sniffer.key, Some(Key::Session(_))));
+    }
+
+    #[test]
+    fn a_mid_stream_segment_does_not_confirm_a_deferred_reset() {
+        // A new connection starts at the bottom of its sequence space. Anything
+        // further in belongs to a conversation that was already running.
+        let mut sniffer = connected_sniffer();
+        let mut conn = Conn::new(122_486);
+        log_in(
+            &mut sniffer,
+            &mut conn,
+            LOGIN_MS,
+            client_draw(LOGIN_MS, 0),
+            0x1111,
+        );
+        let generation = sniffer.session_generation();
+
+        sniffer.receive_packet(handshake_frame());
+        sniffer.receive_packet(segment_frame_at(
+            PacketDirection::Received,
+            999_999,
+            50_000,
+            40_000,
+            &[0u8; 40],
+        ));
+
+        assert_eq!(sniffer.session_generation(), generation);
+        assert_eq!(
+            sniffer.bound_conversation(PacketDirection::Received),
+            Some(conn.conv)
+        );
+    }
+
+    #[test]
+    fn the_same_conversation_in_the_other_direction_is_not_a_new_one() {
+        // Capture began mid-session, so only one direction was bound. That
+        // conversation's first segment in the other direction is not a
+        // reconnect, whatever a handshake datagram claimed.
+        let mut sniffer = connected_sniffer();
+        let key = new_key_from_seed(0x5E55);
+        sniffer.key = Some(Key::Session(key.clone()));
+        let mut conn = Conn::new(4242);
+        assert_eq!(
+            command_ids(&mut sniffer, conn.server_message(&key, 1)),
+            vec![1]
+        );
+
+        sniffer.receive_packet(handshake_frame());
+        let request = command_bytes(2, &[], &field_varint(1, 1));
+        assert_eq!(
+            command_ids(
+                &mut sniffer,
+                conn.push(PacketDirection::Sent, &key, &request)
+            ),
+            vec![2]
+        );
+        assert_eq!(sniffer.session_generation(), 0);
     }
 
     #[test]
