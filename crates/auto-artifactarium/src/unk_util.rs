@@ -32,11 +32,7 @@ use protobuf::Message;
 use protobuf::UnknownValueRef::*;
 use rsa::{Pkcs1v15Encrypt, RsaPrivateKey};
 
-use crate::r#gen::protos::AvatarDataNotify;
-use crate::r#gen::protos::AvatarInfo;
-use crate::r#gen::protos::Item;
-use crate::r#gen::protos::PacketWithItems;
-use crate::r#gen::protos::Unk;
+use crate::r#gen::protos::{AvatarDataNotify, AvatarInfo, Item, PacketWithItems, Unk};
 
 /// Upper bound on the number of truncation points tried when looking for the
 /// end of the base64 seed field in a `GetPlayerTokenRsp`. Only a corrupt or

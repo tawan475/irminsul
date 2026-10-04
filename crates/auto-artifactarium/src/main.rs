@@ -1,8 +1,6 @@
-use std::{
-    fs,
-    io::{BufReader, Read},
-    path::PathBuf,
-};
+use std::fs;
+use std::io::{BufReader, Read};
+use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
 use auto_artifactarium::{matches_avatars_all_data_notify, matches_items_all_data_notify};

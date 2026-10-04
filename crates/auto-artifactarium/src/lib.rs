@@ -60,7 +60,8 @@ use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use protobuf::Message;
 use protobuf::UnknownValueRef::{Fixed32, Fixed64, LengthDelimited, Varint};
-use rsa::{RsaPrivateKey, pkcs1::DecodeRsaPrivateKey};
+use rsa::RsaPrivateKey;
+use rsa::pkcs1::DecodeRsaPrivateKey;
 use tracing::{debug, info, info_span, instrument, trace, warn};
 
 use crate::Key::Dispatch;
