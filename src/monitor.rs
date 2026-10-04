@@ -116,8 +116,11 @@ impl AppStateManager {
         let _ = self.state_tx.send(self.app_state.clone());
     }
 
-    pub fn update_timestamps(&mut self, updated: DataUpdated) {
+    /// Publish what the captured data now holds: when each class last arrived,
+    /// and what it says about the account.
+    pub fn update_captured(&mut self, updated: DataUpdated, player: Option<crate::good::GiPlayer>) {
         self.app_state.updated = updated;
+        self.app_state.player = player;
         let _ = self.state_tx.send(self.app_state.clone());
     }
 
@@ -698,7 +701,7 @@ impl Monitor {
     ) -> Result<Self> {
         let mut app_state = AppStateManager::new(state_tx.borrow().clone(), state_tx.clone());
         let game_data = get_database(&mut app_state, &mut ui_message_rx).await?;
-        let player_data = PlayerData::new(game_data);
+        let player_data = PlayerData::new(game_data).with_game_data_sha(embedded_game_data_sha());
         let keys = load_keys()?;
         let sniffer = GameSniffer::new().set_initial_keys(keys);
         let (packet_tx, packet_rx) = mpsc::unbounded_channel();
@@ -1351,7 +1354,8 @@ impl Monitor {
 
         if has_new_data {
             self.capture_timestamp_ms = Some(Local::now().timestamp_millis());
-            self.app_state.update_timestamps(updated);
+            let player = self.player_data.gi_player();
+            self.app_state.update_captured(updated, player);
             self.check_automation_trigger();
         }
     }
@@ -1396,7 +1400,7 @@ impl Monitor {
     fn replace_captured_data(&mut self, reason: &str) {
         tracing::info!(reason, "clearing captured data");
         self.player_data.reset();
-        self.app_state.update_timestamps(DataUpdated::new());
+        self.app_state.update_captured(DataUpdated::new(), None);
         self.capture_timestamp_ms = None;
         // Without these the signature check can suppress the first export after
         // an account switch, because it still matches the previous account's.
