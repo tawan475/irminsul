@@ -591,6 +591,33 @@ const CAPTURE_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(3
 /// capture device) settles into a slow poll instead of hammering the OS.
 const CAPTURE_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long a capture that has been delivering frames may then deliver none,
+/// while the game runs, before it is restarted.
+///
+/// A connected game talks continuously -- heartbeats every few seconds even
+/// when idle -- so a minute of nothing is a capture that has stopped seeing
+/// traffic without reporting an error.
+const CAPTURE_SILENCE_LIMIT: Duration = Duration::from_secs(60);
+
+/// Whether a capture that is up has gone silent on a running game.
+///
+/// `last_frame` is when the current capture last delivered a frame, `None` if
+/// it has delivered none since it started. Only a capture that *was*
+/// delivering counts: a game on its title screen sends nothing, and restarting
+/// a capture that never heard anything would only open more blind windows --
+/// including right after this watchdog's own restart, which therefore happens
+/// at most once per silence.
+fn capture_stalled(
+    game_running: bool,
+    capturing: bool,
+    last_frame: Option<Instant>,
+    now: Instant,
+) -> bool {
+    game_running
+        && capturing
+        && last_frame.is_some_and(|at| now.saturating_duration_since(at) >= CAPTURE_SILENCE_LIMIT)
+}
+
 /// How long to let a killed game process actually exit before re-deriving the
 /// game status. See `Message::KillGame`.
 const KILL_GAME_SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
@@ -621,6 +648,9 @@ pub struct Monitor {
     capture_retry_at: Option<Instant>,
     /// Consecutive capture failures, for the backoff.
     capture_failures: u32,
+    /// When the current capture last delivered a frame; `None` until it has.
+    /// See [`capture_stalled`].
+    last_frame_at: Option<Instant>,
     game_watch: GameWatch,
     game_detector: SystemProcessDetector,
     game_poll: tokio::time::Interval,
@@ -724,6 +754,7 @@ impl Monitor {
             capture_source,
             capture_retry_at: None,
             capture_failures: 0,
+            last_frame_at: None,
             game_watch: GameWatch::default(),
             game_detector: SystemProcessDetector::new(),
             game_poll,
@@ -789,6 +820,7 @@ impl Monitor {
                 _ = self.game_poll.tick() => {
                     self.poll_game_status();
                     self.supervise_capture().await;
+                    self.watch_capture_silence().await;
                 }
                 capture_result = join_capture(&mut self.capture_handle) => {
                     self.handle_capture_exit(capture_result);
@@ -895,6 +927,7 @@ impl Monitor {
         ));
         self.capture_cancel_token = Some(cancel_token);
         self.capture_handle = Some(capture_handle);
+        self.last_frame_at = None;
         self.automation_cycle_started_at = Some(Instant::now());
         // Not `true`: everything that can fail -- no elevation, no such device,
         // an ETW session already owned by a previous process -- fails inside the
@@ -928,6 +961,30 @@ impl Monitor {
             .min(CAPTURE_RETRY_MAX);
         self.capture_failures = attempt;
         self.capture_retry_at = Some(Instant::now() + backoff);
+    }
+
+    /// Restart a capture that stopped delivering frames while the game runs.
+    ///
+    /// The supervisor above only sees a backend that failed or ended. One that
+    /// stays up and silently stops delivering -- its packet stream still open,
+    /// nothing in it -- looks healthy to everything else in this app.
+    async fn watch_capture_silence(&mut self) {
+        let now = Instant::now();
+        if !capture_stalled(
+            self.game_watch.game_running(),
+            self.app_state.app_state.capturing,
+            self.last_frame_at,
+            now,
+        ) {
+            return;
+        }
+        tracing::warn!(
+            silent_secs = self
+                .last_frame_at
+                .map(|at| now.saturating_duration_since(at).as_secs()),
+            "no packets captured for a minute while the game is running; restarting capture"
+        );
+        self.start_capture().await;
     }
 
     /// Cancel the capture task *and wait for it to finish*.
@@ -972,7 +1029,10 @@ impl Monitor {
             CaptureEvent::Started => {
                 tracing::debug!("ignoring a start report from a capture that already stopped");
             }
-            CaptureEvent::Packet(packet) => self.handle_packet(packet),
+            CaptureEvent::Packet(packet) => {
+                self.last_frame_at = Some(Instant::now());
+                self.handle_packet(packet);
+            }
             CaptureEvent::Failed(e) => {
                 tracing::error!("Capture task encountered an error: {e}");
                 let _ = self
@@ -1995,6 +2055,39 @@ mod tests {
 
         assert!(matches!(rx.try_recv(), Ok(SnifferEvent::Packet(..))));
         assert!(rx.try_recv().is_err());
+    }
+
+    // -- capture watchdog --------------------------------------------------------
+
+    #[test]
+    fn a_capture_that_went_silent_on_a_running_game_is_restarted() {
+        let now = Instant::now();
+        let Some(long_ago) = now.checked_sub(CAPTURE_SILENCE_LIMIT) else {
+            return;
+        };
+        assert!(capture_stalled(true, true, Some(long_ago), now));
+    }
+
+    #[test]
+    fn the_watchdog_leaves_everything_else_alone() {
+        let now = Instant::now();
+        let Some(long_ago) = now.checked_sub(CAPTURE_SILENCE_LIMIT) else {
+            return;
+        };
+        let recent = now
+            .checked_sub(CAPTURE_SILENCE_LIMIT - Duration::from_secs(1))
+            .unwrap_or(now);
+
+        // Not silent long enough.
+        assert!(!capture_stalled(true, true, Some(recent), now));
+        // No game to hear from.
+        assert!(!capture_stalled(false, true, Some(long_ago), now));
+        // Capture is not up; the supervisor owns that case.
+        assert!(!capture_stalled(true, false, Some(long_ago), now));
+        // Nothing has arrived since this capture started -- a game sitting on
+        // the title screen, or the capture the watchdog itself just restarted.
+        // Restarting again would only open more blind windows.
+        assert!(!capture_stalled(true, true, None, now));
     }
 
     // -- the sniffer's stats line ----------------------------------------------

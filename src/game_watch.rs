@@ -347,6 +347,11 @@ impl GameWatch {
         self.decoded_at.map(|at| at.elapsed())
     }
 
+    /// Did the last scan find the game running?
+    pub fn game_running(&self) -> bool {
+        self.previous == Some(true)
+    }
+
     /// Has the process list been looked at even once?
     ///
     /// Used to fire the startup toast on the first poll only.
