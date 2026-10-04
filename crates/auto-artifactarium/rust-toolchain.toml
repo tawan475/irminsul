@@ -1,0 +1,15 @@
+# Pinned so a local run and CI use the same compiler.
+#
+# This crate deliberately had no pin: it needs nothing nightly, so CI ran on the
+# runner's default stable. The cost showed up immediately -- the runner moved to
+# 1.98 while a contributor was on 1.96, 1.98 added the
+# `chunks_exact_to_as_chunks` lint, and CI failed `-D warnings` on code that was
+# clean locally with no way to reproduce it. `-D warnings` on a floating
+# toolchain means an unrelated release can turn CI red on a day nobody touched
+# the code.
+#
+# Bump this deliberately, and run the checks locally when you do: rustup honours
+# this file, so a bump changes what `cargo clippy` uses here as well as in CI.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]
