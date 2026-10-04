@@ -12,13 +12,18 @@ rust-version = "1.88"
 all-features = true
 targets = ["x86_64-unknown-linux-gnu"]
 
+# The packet-parsing library lives in this repository as a workspace member.
+# The root package stays the only default member, so a bare `cargo build`,
+# `cargo test` or `cargo clippy` here still means irminsul alone; check.py and
+# CI select the library with `-p auto-artifactarium`.
+[workspace]
+members = ["crates/auto-artifactarium"]
+
 # `build.rs` writes the game data blob that `src/monitor.rs` embeds, so these
 # three crates are used by both the build script and the binary and must not
 # drift apart: flate2 in particular writes the gz on one side and reads it on
 # the other. Declaring them once here and inheriting with `workspace = true`
 # makes that impossible to get wrong.
-[workspace]
-
 [workspace.dependencies]
 anime-game-data = { git = "https://github.com/konkers/anime-game-data", rev = "dfc03cdb5e27807a876b8d4dff17b3f67a320f5c" }
 flate2 = "1.1.9"
@@ -38,7 +43,8 @@ tokio = { workspace = true }
 anyhow = "1.0.99"
 async-trait = "0.1.89"
 async-watcher = "0.3.0"
-auto-artifactarium = { git = "https://github.com/tawan475/auto-artifactarium", rev = "7f36b1407d17be3ad3522a34224916eb6f970099" }
+# Default features only: the library's `cli` feature is for its own binary.
+auto-artifactarium = { path = "crates/auto-artifactarium" }
 base64 = "0.22.1"
 chrono = "0.4.42"
 clap = { version = "4.5.47", features = ["derive"] }
@@ -145,10 +151,13 @@ opt-level = 2
 [profile.dev.package."*"]
 opt-level = 2
 
+# `"*"` matches only packages outside the workspace, so it stopped covering
+# auto-artifactarium when the library became a member. Keep debug builds
+# compiling it as they did while it was a git dependency: its session-key
+# bruteforce (up to 3000 x 1000 candidate seeds) is CPU-bound.
+[profile.dev.package.auto-artifactarium]
+opt-level = 2
+
 # Uncomment for local debugging
 # [patch."https://github.com/konkers/anime-game-data"]
 # anime-game-data = { path = "../anime-game-data" }
-
-# Uncomment for local debugging
-# [patch."https://github.com/tawan475/auto-artifactarium"]
-# auto-artifactarium = { path = "../auto-artifactarium" }
