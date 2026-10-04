@@ -50,6 +50,10 @@ const CHARACTER_ASCENSION_RANGE: RangeInclusive<u32> = 0..=100;
 /// `CONST_VALUE_TPS_AVATAR_CONFIG_ID_FEMALE` and `..._MALE`: both are called
 /// "Traveler", carry a crossbow and an empty skill depot, and are not playable.
 /// The tracker excludes the same two ids.
+/// Share of item guids that must agree on a top half for it to be taken as
+/// the account UID.
+const UID_MAJORITY: f64 = 0.9;
+
 /// `AvatarInfo.avatar_type` of an owned character (0 none, 2 trial, 3 mirror).
 const AVATAR_TYPE_FORMAL: u32 = 1;
 
@@ -672,40 +676,56 @@ impl PlayerData {
         }
     }
 
-    /// The account UID, read off the captured guids.
+    /// The account UID, read off the captured item guids.
     ///
-    /// The game mints every item and avatar guid as `(uid << 32) + counter`
-    /// (Grasscutter's `Player::getNextGuid`; auto-artifactarium's delete matcher
-    /// relies on the same scheme), so the top half of each guid is the UID.
-    /// Guids whose top half is zero carry none -- virtual items all use guid 0
-    /// -- and are skipped. Two guids that disagree mean the scheme does not hold
-    /// for this capture, and then no UID is claimed at all.
+    /// The game mints item guids as `(uid << 32) + counter` (Grasscutter's
+    /// `Player::getNextGuid`; auto-artifactarium's delete matcher only accepts
+    /// guid lists of that shape, and deletes match on live servers), so the
+    /// top half of an item guid is the UID. Virtual items carry guid 0 and are
+    /// skipped. The UID is the top half nearly every item agrees on
+    /// ([`UID_MAJORITY`]); a few strays (an item from some other source) don't
+    /// spoil it, a real split claims nothing. Avatar guids don't vote: their
+    /// field is unverified on 7.1, and a capture of 7.1 found no UID while
+    /// they did vote. One INFO line shows the top halves either way.
     fn account_uid(&self) -> Option<u32> {
-        let item_guids = self.items.keys().map(|(_, guid)| *guid);
-        let avatar_guids = self.characters.values().map(|avatar| avatar.guid);
-
-        let mut uid = None;
-        for guid in item_guids.chain(avatar_guids) {
-            let Ok(top) = u32::try_from(guid >> 32) else {
-                continue;
-            };
-            if top == 0 {
-                continue;
-            }
-            match uid {
-                None => uid = Some(top),
-                Some(seen) if seen == top => {}
-                Some(seen) => {
-                    tracing::debug!(
-                        seen,
-                        other = top,
-                        "captured guids name two different UIDs; not reporting one"
-                    );
-                    return None;
-                }
+        let mut item_tops: BTreeMap<u64, usize> = BTreeMap::new();
+        for (_, guid) in self.items.keys() {
+            if *guid != 0 {
+                *item_tops.entry(guid >> 32).or_default() += 1;
             }
         }
-        uid
+        let mut avatar_tops: BTreeMap<u64, usize> = BTreeMap::new();
+        for avatar in self.characters.values() {
+            *avatar_tops.entry(avatar.guid >> 32).or_default() += 1;
+        }
+        let top_counts = |tops: &BTreeMap<u64, usize>| {
+            let mut list: Vec<_> = tops.iter().map(|(top, n)| (*top, *n)).collect();
+            list.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+            list.truncate(5);
+            list
+        };
+        tracing::info!(
+            items = ?top_counts(&item_tops),
+            avatars = ?top_counts(&avatar_tops),
+            "guid top halves (account UID check)"
+        );
+
+        let total: usize = item_tops.values().sum();
+        let (top, count) = item_tops
+            .iter()
+            .filter(|(top, _)| **top != 0)
+            .max_by_key(|(_, n)| **n)
+            .map(|(top, n)| (*top, *n))?;
+        if (count as f64) < (total as f64) * UID_MAJORITY {
+            tracing::debug!(
+                top,
+                count,
+                total,
+                "no top half is a clear majority; not reporting a UID"
+            );
+            return None;
+        }
+        u32::try_from(top).ok()
     }
 
     /// `gi_player` for the captured data, plus every property value that was
@@ -2137,23 +2157,31 @@ mod tests {
     }
 
     #[test]
-    fn the_uid_comes_from_items_and_avatars_alike() {
+    fn the_uid_is_the_top_half_nearly_every_item_agrees_on() {
         let mut data = player_data();
+        // Virtual items carry guid 0 and say nothing either way.
+        data.process_items(&[material_item(201, 0, 1_600)]);
+        assert_eq!(data.account_uid(), None);
+
+        let items: Vec<_> = (1..=20)
+            .map(|n| material_item(104_000 + n, minted_guid(800_000_001, u64::from(n)), 3))
+            .collect();
+        data.process_items(&items);
+        assert_eq!(data.account_uid(), Some(800_000_001));
+
+        // Avatar guids don't vote, even when they disagree.
         let mut hu_tao = avatar(10000046, &[]);
-        hu_tao.guid = minted_guid(800_000_001, 2);
+        hu_tao.guid = minted_guid(123_456_789, 2);
         data.process_characters(&[hu_tao]);
         assert_eq!(data.account_uid(), Some(800_000_001));
 
-        // Virtual items carry guid 0 and say nothing either way.
-        data.process_items(&[
-            material_item(201, 0, 1_600),
-            material_item(104003, minted_guid(800_000_001, 9), 3),
-        ]);
+        // One stray item among 21 doesn't spoil it (95% agree).
+        data.process_items(&[material_item(105_000, minted_guid(800_000_002, 1), 1)]);
         assert_eq!(data.account_uid(), Some(800_000_001));
     }
 
     #[test]
-    fn guids_that_disagree_claim_no_uid() {
+    fn guids_that_split_claim_no_uid() {
         let mut data = player_data();
         data.process_items(&[
             material_item(104003, minted_guid(800_000_001, 1), 3),
