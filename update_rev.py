@@ -3,11 +3,17 @@
 default-branch HEAD of its repository -- and prove the result still builds
 before leaving the new pin in place.
 
+Only `git = "..."` dependencies are pinned. Path dependencies -- such as
+`auto-artifactarium`, which lives in this repository under
+`crates/auto-artifactarium` -- have no revision and are left alone. Run it on
+the workspace root manifest (the default): the Cargo.lock it restores on
+failure is the one next to the manifest it is given.
+
 Adopting an upstream revision unverified is how a broken dependency ends up in
 a release. This script used to rewrite each `rev = "..."` from `git ls-remote`
 and then print "Successfully updated" without compiling a single line, so the
-sanctioned way to adopt a new `auto-artifactarium` was "take default-branch
-HEAD, sight unseen". Two guards now bracket the rewrite:
+sanctioned way to adopt a new pinned revision was "take default-branch HEAD,
+sight unseen". Two guards now bracket the rewrite:
 
 1. It refuses to run while the manifest has an active `[patch.*]` section.
    A patch redirects the crate to a local path (or another source), so cargo
