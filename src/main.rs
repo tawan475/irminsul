@@ -70,7 +70,7 @@ pub enum Message {
     VerifyTrackerKey(
         String,
         String,
-        oneshot::Sender<Result<(String, String, String)>>,
+        oneshot::Sender<Result<monitor::TrackerAccount>>,
     ),
     UploadToTracker(String, String, String, oneshot::Sender<Result<(), String>>),
     /// Terminate the running game, from the "game already running" modal.
