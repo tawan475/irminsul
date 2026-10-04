@@ -250,9 +250,9 @@ fn main() -> eframe::Result {
 
     let capture_backend = args.capture_backend;
 
-    // Taller than the background's 1600x1000 at half size: the panels grew
-    // past 500 px. `app.rs` paints the background to cover, not stretched.
-    let window_size = [800., 580.];
+    // The background's 1600x1000 at half size, plus 20 px of height: the
+    // panels had grown past 500 px.
+    let window_size = [800., 520.];
 
     // Set by the UI once a self-update has been installed. The relaunch has to
     // happen out here, after `run_native` returns and `instance` is dropped:
