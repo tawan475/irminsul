@@ -197,6 +197,17 @@ const MIN_REAL_ITEMS: usize = 10;
 /// different shape -- and would trade a known limitation for false positives.
 const MIN_PROPERTIES: usize = 5;
 
+/// The block of player property ids (the client's `PROP_*` enum).
+///
+/// Every player property is a five-digit id from 10001
+/// (`PROP_LAST_CHANGE_AVATAR_TIME`) upwards: 10013 is the Adventure Rank, 10015
+/// Primogems, 10016 Mora, and the newest ones a 7.1 login carries reach 10100.
+/// Avatar properties (1001 EXP, 1002 ascension, 4001 level) sit outside it, and
+/// so do the 20xxx ids of the identity map 7.1 also sends at login. Left
+/// deliberately wide, like [`PLAYER_AVATAR_IDS`], so new properties cannot age
+/// it out; a property notify only has to have *most* of its keys in here.
+const PLAYER_PROPERTY_IDS: std::ops::RangeInclusive<u32> = 10_000..=10_999;
+
 /// Ceiling used when ranking raw values recovered from an unrecognised
 /// `PropValue` layout, so a float bit pattern can never outrank a real counter.
 /// The largest real player property is Mora, capped at 9,999,999,999.
@@ -1752,6 +1763,13 @@ fn drifted_prop_value(prop: &PropValue) -> Option<u64> {
 /// resin gets spent), dropped any value that happened to equal its own property
 /// id, and mistook a float's bit pattern for a huge integer. `PropValue` is
 /// declared in `protos.proto`, so it is parsed rather than guessed.
+///
+/// The `map<uint32, PropValue>` shape is not unique to this packet. A 7.1
+/// login also sends a 14-entry map of ids 20046..=20392 whose every value is
+/// its own key (command 24819 that day), and it used to be accepted -- and
+/// logged as "discovered PlayerPropertyNotify" -- ahead of the real one. So a
+/// map is only believed when most of its keys are player property ids (the
+/// 10xxx block of the client's `PROP_*` enum) and it is not an identity map.
 pub fn matches_player_property_packet(game_command: &GameCommand) -> Option<HashMap<u32, u64>> {
     let msg = Unk::parse_from_bytes(&game_command.proto_data).ok()?;
 
@@ -1800,6 +1818,38 @@ pub fn matches_player_property_packet(game_command: &GameCommand) -> Option<Hash
     // different command id with a different shape, so lowering this floor buys
     // false positives and no live tracking.
     if properties.len() < MIN_PROPERTIES {
+        return None;
+    }
+
+    // A list of ids wearing the map's shape: no counter in it is anything but
+    // its own key. One such value is ordinary (a property can hold its own
+    // id); a whole page of them is not a property map.
+    if properties
+        .iter()
+        .all(|(key, value)| u64::from(*key) == *value)
+    {
+        trace!(
+            command_id = game_command.command_id,
+            count = properties.len(),
+            "every value equals its own key; an id list, not player properties"
+        );
+        return None;
+    }
+
+    // Strictly more than half, so a few properties newer than the block (or a
+    // stray foreign entry) cannot reject a real notify, while a map of some
+    // other id space cannot pass for one.
+    let player_ids = properties
+        .keys()
+        .filter(|key| PLAYER_PROPERTY_IDS.contains(key))
+        .count();
+    if player_ids * 2 <= properties.len() {
+        trace!(
+            command_id = game_command.command_id,
+            player_ids,
+            count = properties.len(),
+            "most keys are not player property ids"
+        );
         return None;
     }
 
@@ -3250,35 +3300,221 @@ mod tests {
 
     // -- property decoding -----------------------------------------------------
 
+    /// The ids and (currency values aside) the values of the player property
+    /// notify a real 7.1 login carried, command 3272 on 2026-10-04: 53 entries,
+    /// every key in the 10xxx block.
+    const LOGIN_PROPERTIES: [(u32, i64); 53] = [
+        (10001, 44974),
+        (10004, 1),
+        (10005, 100),
+        (10006, 1),
+        (10007, 0),
+        (10008, 0),
+        (10009, 1),
+        (10010, 24000),
+        (10011, 22320),
+        (10012, 0),
+        (10013, 60),
+        (10014, 0),
+        (10015, 1600),
+        (10016, 12_345_678),
+        (10017, 1),
+        (10019, 8),
+        (10020, 160),
+        (10022, 0),
+        (10023, 0),
+        (10025, 0),
+        (10026, 0),
+        (10027, 3),
+        (10035, 0),
+        (10036, 0),
+        (10037, 0),
+        (10038, 0),
+        (10039, 9),
+        (10040, 1_790_953_954),
+        (10041, 8),
+        (10042, 2400),
+        (10043, 0),
+        (10044, 0),
+        (10048, 1),
+        (10049, 12000),
+        (10050, 12000),
+        (10051, 1),
+        (10052, 1),
+        (10053, 9),
+        (10054, 10000),
+        (10055, 1880),
+        (10058, 4220),
+        (10060, 2),
+        (10063, 0),
+        (10064, 0),
+        (10069, 1820),
+        (10070, 0),
+        (10073, 53),
+        (10074, 1),
+        (10075, 625),
+        (10078, 0),
+        (10079, 0),
+        (10080, 40000),
+        (10081, 38400),
+    ];
+
+    /// The keys of the identity map the same login sent first, command 24819:
+    /// 14 entries, each value equal to its key.
+    const LOGIN_ID_LIST: [u32; 14] = [
+        20046, 20050, 20059, 20060, 20062, 20063, 20064, 20092, 20384, 20385, 20386, 20388, 20391,
+        20392,
+    ];
+
+    /// A `PropValue` as the server encodes it: `type` always, `val` only when
+    /// it is not zero (proto3 omits zeros).
+    fn wire_prop(key: u32, value: i64) -> Vec<u8> {
+        if value == 0 {
+            field_varint(1, u64::from(key))
+        } else {
+            prop_val(key, value)
+        }
+    }
+
+    #[test]
+    fn the_login_property_snapshot_still_matches() {
+        let entries: Vec<(u32, Vec<u8>)> = LOGIN_PROPERTIES
+            .iter()
+            .map(|&(key, value)| (key, wire_prop(key, value)))
+            .collect();
+        let command = command(property_packet(&entries));
+
+        let properties = matches_player_property_packet(&command).expect("should match");
+        assert_eq!(properties.len(), LOGIN_PROPERTIES.len());
+        for (key, value) in LOGIN_PROPERTIES {
+            assert_eq!(
+                properties.get(&key),
+                Some(&(value as u64)),
+                "property {key}"
+            );
+        }
+        // The five currencies irminsul exports, and the account values beside
+        // them.
+        assert_eq!(properties[&10015], 1600);
+        assert_eq!(properties[&10016], 12_345_678);
+        assert_eq!(properties[&10020], 160);
+        assert_eq!(properties[&10025], 0);
+        assert_eq!(properties[&10042], 2400);
+        assert_eq!(properties[&10013], 60);
+        assert!(matches!(
+            classify_command(&command),
+            Some(CommandMatch::Properties(_))
+        ));
+    }
+
+    /// The false positive: an id list in the shape of a property map, sent at
+    /// every 7.1 login. It used to be logged as the discovered property notify
+    /// and folded into the player's properties.
+    #[test]
+    fn a_list_of_ids_in_the_shape_of_a_property_map_is_rejected() {
+        // However the value is encoded, it reads back as its own key.
+        let encodings: [fn(u32) -> Vec<u8>; 3] = [
+            |key| prop_val(key, i64::from(key)),
+            |key| {
+                let mut out = field_varint(1, u64::from(key));
+                out.extend(field_varint(2, u64::from(key)));
+                out
+            },
+            // Drifted: no `type`, the id in a field this build does not know.
+            |key| field_varint(9, u64::from(key)),
+        ];
+        for encode in encodings {
+            let entries: Vec<(u32, Vec<u8>)> = LOGIN_ID_LIST
+                .iter()
+                .map(|&key| (key, encode(key)))
+                .collect();
+            let command = command(property_packet(&entries));
+
+            assert!(matches_player_property_packet(&command).is_none());
+            assert!(!matches!(
+                classify_command(&command),
+                Some(CommandMatch::Properties(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn an_identity_map_is_rejected_inside_the_player_block_too() {
+        let entries: Vec<(u32, Vec<u8>)> = (10_001..=10_014u32)
+            .map(|key| (key, prop_val(key, i64::from(key))))
+            .collect();
+        assert!(matches_player_property_packet(&command(property_packet(&entries))).is_none());
+    }
+
+    #[test]
+    fn a_map_of_other_ids_is_not_player_properties() {
+        // Real-looking counters, but keyed outside the player property block.
+        let entries: Vec<(u32, Vec<u8>)> = LOGIN_ID_LIST
+            .iter()
+            .map(|&key| (key, prop_val(key, 1)))
+            .collect();
+        assert!(matches_player_property_packet(&command(property_packet(&entries))).is_none());
+
+        // Avatar property ids are not player properties either.
+        let avatar: Vec<(u32, Vec<u8>)> = [1001u32, 1002, 1003, 1004, 4001]
+            .iter()
+            .map(|&key| (key, prop_val(key, 90)))
+            .collect();
+        assert!(matches_player_property_packet(&command(property_packet(&avatar))).is_none());
+    }
+
+    #[test]
+    fn a_few_foreign_ids_do_not_reject_a_property_notify() {
+        // Strictly more than half is enough: properties newer than the block,
+        // or a stray entry, must not cost the whole snapshot.
+        let mut entries: Vec<(u32, Vec<u8>)> = [10013u32, 10015, 10016]
+            .iter()
+            .map(|&key| (key, prop_val(key, 7)))
+            .collect();
+        entries.extend([20046u32, 20050].iter().map(|&key| (key, prop_val(key, 7))));
+        assert_eq!(
+            matches_player_property_packet(&command(property_packet(&entries)))
+                .expect("3 of 5 keys are player properties")
+                .len(),
+            5
+        );
+
+        entries.push((20059, prop_val(20059, 7)));
+        assert!(
+            matches_player_property_packet(&command(property_packet(&entries))).is_none(),
+            "3 of 6 is not a majority"
+        );
+    }
+
     #[test]
     fn property_values_are_read_from_the_declared_fields() {
         let ival = {
-            let mut out = field_varint(1, 1001);
+            let mut out = field_varint(1, 10015);
             out.extend(field_varint(2, 4242));
             out
         };
         // `fval = 1.0`. Read as a raw integer this is 1065353216, which used to
         // win every comparison it took part in.
         let fval = {
-            let mut out = field_varint(1, 1002);
+            let mut out = field_varint(1, 10019);
             out.extend(field_fixed32(3, 1.0f32.to_bits()));
             out
         };
 
         let packet = property_packet(&[
-            (1001, ival),
-            (1002, fval),
-            (1003, prop_val(1003, 7)),
-            (1004, prop_val(1004, 9_999_999_999)),
-            (1005, prop_val(1005, 5)),
+            (10015, ival),
+            (10019, fval),
+            (10013, prop_val(10013, 7)),
+            (10016, prop_val(10016, 9_999_999_999)),
+            (10020, prop_val(10020, 5)),
         ]);
         let properties = matches_player_property_packet(&command(packet)).expect("should match");
 
-        assert_eq!(properties.get(&1001), Some(&4242));
-        assert_eq!(properties.get(&1002), Some(&1));
-        assert_eq!(properties.get(&1003), Some(&7));
+        assert_eq!(properties.get(&10015), Some(&4242));
+        assert_eq!(properties.get(&10019), Some(&1));
+        assert_eq!(properties.get(&10013), Some(&7));
         assert_eq!(
-            properties.get(&1004),
+            properties.get(&10016),
             Some(&9_999_999_999),
             "Mora is capped above u32::MAX"
         );
@@ -3287,50 +3523,55 @@ mod tests {
     #[test]
     fn a_property_worth_zero_is_recorded_rather_than_dropped() {
         // Spent resin is the everyday case: proto3 omits the zero entirely.
-        let empty = field_varint(1, 1); // `type` only
+        let empty = field_varint(1, 10020); // `type` only
         let packet = property_packet(&[
-            (1, empty),
-            (2, prop_val(2, 0)),
-            (3, prop_val(3, 3)),
-            (4, prop_val(4, 4)),
-            (5, prop_val(5, 5)),
+            (10020, empty),
+            (10025, prop_val(10025, 0)),
+            (10013, prop_val(10013, 60)),
+            (10019, prop_val(10019, 8)),
+            (10015, prop_val(10015, 234)),
         ]);
         let properties = matches_player_property_packet(&command(packet)).expect("should match");
 
-        assert_eq!(properties.get(&1), Some(&0));
-        assert_eq!(properties.get(&2), Some(&0));
+        assert_eq!(properties.get(&10020), Some(&0));
+        assert_eq!(properties.get(&10025), Some(&0));
         assert_eq!(properties.len(), 5);
     }
 
     #[test]
     fn a_value_equal_to_its_own_property_id_survives() {
-        let entries: Vec<(u32, Vec<u8>)> =
-            (1..=5u32).map(|i| (i, prop_val(i, i64::from(i)))).collect();
-        let properties =
-            matches_player_property_packet(&command(property_packet(&entries))).expect("match");
+        // One such value is an ordinary property (Realm Currency can hold
+        // 10042); only a map made of nothing else is an id list.
+        let packet = property_packet(&[
+            (10013, prop_val(10013, 60)),
+            (10019, prop_val(10019, 8)),
+            (10020, prop_val(10020, 160)),
+            (10015, prop_val(10015, 234)),
+            (10042, prop_val(10042, 10042)),
+        ]);
+        let properties = matches_player_property_packet(&command(packet)).expect("match");
 
-        for i in 1..=5u32 {
-            assert_eq!(properties.get(&i), Some(&u64::from(i)));
-        }
+        assert_eq!(properties.get(&10042), Some(&10042));
+        assert_eq!(properties.len(), 5);
     }
 
     #[test]
     fn a_drifted_prop_value_reads_fixed32_as_a_float() {
         // Every field number moved, so nothing the build knows is set and the
         // fallback walk has to do the reading.
-        let drifted: Vec<(u32, Vec<u8>)> = (1..=5u32)
+        let drifted: Vec<(u32, Vec<u8>)> = (10_010..=10_014u32)
             .map(|i| (i, field_fixed32(9, 120.0f32.to_bits())))
             .collect();
         let properties =
             matches_player_property_packet(&command(property_packet(&drifted))).expect("match");
 
-        assert_eq!(properties.get(&1), Some(&120));
+        assert_eq!(properties.get(&10_010), Some(&120));
     }
 
     #[test]
     fn a_property_map_is_not_mistaken_for_an_inventory() {
-        let entries: Vec<(u32, Vec<u8>)> = (1..=40u32)
-            .map(|i| (i, prop_val(i, i64::from(i) * 100)))
+        let entries: Vec<(u32, Vec<u8>)> = (10_001..=10_040u32)
+            .map(|i| (i, prop_val(i, i64::from(i % 100) * 100)))
             .collect();
         let command = command(property_packet(&entries));
 
@@ -3347,8 +3588,8 @@ mod tests {
         // The exact collision the audit called out: the item matcher runs first
         // in the caller's chain, so a prop map landing on field 5 would swallow
         // the properties entirely.
-        let entries: Vec<Vec<u8>> = (1..=40u32)
-            .map(|i| field_bytes(ITEM_LIST_TAG, &prop_entry(i, &prop_val(i, i64::from(i)))))
+        let entries: Vec<Vec<u8>> = (10_001..=10_040u32)
+            .map(|i| field_bytes(ITEM_LIST_TAG, &prop_entry(i, &prop_val(i, 1))))
             .collect();
         let command = command(entries.concat());
 
