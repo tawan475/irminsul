@@ -856,11 +856,11 @@ impl PlayerData {
                 .filter(|times| !times.is_empty()),
             // Filled in with the characters below.
             gi_characters: None,
-            gi_debug: (uid_check.total > 0 || !uid_check.avatar_top_halves.is_empty()).then(|| {
+            gi_debug: (uid_check.total > 0 || !uid_check.avatar_top_halves.is_empty()).then_some(
                 good::GiDebug {
                     uid_check: Some(uid_check),
-                }
-            }),
+                },
+            ),
         };
 
         if settings.include_characters {
