@@ -50,6 +50,9 @@ const CHARACTER_ASCENSION_RANGE: RangeInclusive<u32> = 0..=100;
 /// `CONST_VALUE_TPS_AVATAR_CONFIG_ID_FEMALE` and `..._MALE`: both are called
 /// "Traveler", carry a crossbow and an empty skill depot, and are not playable.
 /// The tracker excludes the same two ids.
+/// `AvatarInfo.avatar_type` of an owned character (0 none, 2 trial, 3 mirror).
+const AVATAR_TYPE_FORMAL: u32 = 1;
+
 const TPS_AVATAR_ID_FEMALE: u32 = 10000135;
 const TPS_AVATAR_ID_MALE: u32 = 10000134;
 
@@ -526,6 +529,25 @@ impl PlayerData {
             .retain(|_, avatar_id| !updated.contains(avatar_id));
 
         for avatar in avatars {
+            // The roster can list a character twice: the owned (formal, type
+            // 1) avatar and a mirror copy (type 3) under the same avatar id.
+            // Seen on 7.1 for Varka, Vesna and the Traveler (108 entries, 104
+            // ids). Characters are keyed by avatar id, so whichever came last
+            // won, and a mirror replacing the owned avatar dropped the
+            // character from the export. The owned one always wins.
+            if avatar.avatar_type != AVATAR_TYPE_FORMAL
+                && self
+                    .characters
+                    .get(&avatar.avatar_id)
+                    .is_some_and(|kept| kept.avatar_type == AVATAR_TYPE_FORMAL)
+            {
+                tracing::debug!(
+                    avatar_id = avatar.avatar_id,
+                    avatar_type = avatar.avatar_type,
+                    "keeping the owned avatar over a non-formal copy"
+                );
+                continue;
+            }
             for guid in &avatar.equip_guid_list {
                 self.character_equip_guid_map
                     .insert(*guid, avatar.avatar_id);
@@ -860,7 +882,7 @@ impl PlayerData {
             .characters
             .values()
             .filter_map(|character| {
-                if character.avatar_type != 1 {
+                if character.avatar_type != AVATAR_TYPE_FORMAL {
                     left_out.push(format!(
                         "{} (avatar type {})",
                         describe(character.avatar_id),
@@ -1799,6 +1821,44 @@ mod tests {
 
         assert!(report.is_empty(), "would toast: {}", report.summary());
         assert_eq!(report.degraded_summary(), "unknown_skill: 1");
+    }
+
+    #[test]
+    fn an_owned_character_beats_its_mirror_copy_in_either_order() {
+        // 7.1 lists Varka, Vesna and the Traveler twice: the owned avatar
+        // (type 1) and a mirror copy (type 3) under the same avatar id. The
+        // mirror arriving last used to replace the owned one and drop the
+        // character from the export.
+        let mirror = |avatar_id| {
+            let mut copy = character(avatar_id, &[]);
+            copy.avatar_type = 3;
+            copy.prop_map.get_mut(&4001).unwrap().val = 1;
+            copy
+        };
+        for roster in [
+            vec![character(10000128, &[]), mirror(10000128)],
+            vec![mirror(10000128), character(10000128, &[])],
+        ] {
+            let mut data = player_data_with(r#""10000128": "Varka""#, "", "");
+            data.process_characters(&roster);
+            let mut report = ExportReport::default();
+            let characters = data.export_genshin_optimizer_characters(&settings(), &mut report);
+            assert_eq!(characters.len(), 1);
+            assert_eq!(characters[0].key, "Varka");
+            assert_eq!(
+                characters[0].level, 90,
+                "the owned avatar's level, not the copy's"
+            );
+        }
+
+        // A mirror on its own is still not an owned character.
+        let mut data = player_data_with(r#""10000128": "Varka""#, "", "");
+        data.process_characters(&[mirror(10000128)]);
+        let mut report = ExportReport::default();
+        assert!(
+            data.export_genshin_optimizer_characters(&settings(), &mut report)
+                .is_empty()
+        );
     }
 
     #[test]

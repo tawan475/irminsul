@@ -1048,8 +1048,17 @@ impl eframe::App for IrminsulApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                // Cover the window at the art's own 1600x1000 aspect (cropping
+                // the sides) rather than stretching it to the window's shape.
+                const BACKGROUND_ASPECT: f32 = 1600.0 / 1000.0;
+                let screen = ui.ctx().screen_rect();
+                let size = if screen.aspect_ratio() > BACKGROUND_ASPECT {
+                    egui::vec2(screen.width(), screen.width() / BACKGROUND_ASPECT)
+                } else {
+                    egui::vec2(screen.height() * BACKGROUND_ASPECT, screen.height())
+                };
                 egui::Image::new(egui::include_image!("../assets/background.webp"))
-                    .paint_at(ui, ui.ctx().screen_rect());
+                    .paint_at(ui, egui::Rect::from_center_size(screen.center(), size));
             });
 
             ui.vertical(|ui| {

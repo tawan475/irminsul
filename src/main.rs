@@ -250,7 +250,9 @@ fn main() -> eframe::Result {
 
     let capture_backend = args.capture_backend;
 
-    let background_image_size = [1600., 1000.];
+    // Taller than the background's 1600x1000 at half size: the panels grew
+    // past 500 px. `app.rs` paints the background to cover, not stretched.
+    let window_size = [800., 580.];
 
     // Set by the UI once a self-update has been installed. The relaunch has to
     // happen out here, after `run_native` returns and `instance` is dropped:
@@ -262,7 +264,7 @@ fn main() -> eframe::Result {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size(background_image_size.map(|v| v * 0.5))
+            .with_inner_size(window_size)
             .with_resizable(false)
             .with_decorations(false)
             .with_icon(
