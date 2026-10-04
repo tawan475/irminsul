@@ -1113,24 +1113,22 @@ impl Monitor {
             "game poll"
         );
 
-        // Once, and only from the very first look. The user-facing notification
-        // is `app.rs`'s modal, which offers the three ways out; this is the log
-        // record, so a support log still shows why a session captured nothing.
-        // Matched on the specific cause, not on `LaunchMissed(_)`: the toast
-        // below says "already running" in so many words, and that is the only
-        // verdict a first look can reach today. Pinning it here means a later
-        // change to the transition table cannot quietly put the wrong sentence
-        // in front of the user.
-        if first_look
-            && matches!(
-                status,
-                GameStatus::LaunchMissed(game_watch::MissedLaunch::AlreadyRunning)
-            )
-        {
+        // The log record behind `app.rs`'s modal, so a support log shows why a
+        // session captured nothing. An already-open game is not a miss by
+        // itself (it may still be on the title screen); only game traffic
+        // without a login makes it one.
+        if first_look && status == GameStatus::AwaitingLogin {
+            tracing::info!(
+                "Genshin was already open when Irminsul started; waiting to see the login \
+                 (entering the world)"
+            );
+        }
+        let missed = GameStatus::LaunchMissed(game_watch::MissedLaunch::AlreadyRunning);
+        if status == missed && self.app_state.app_state.game_status != missed {
             tracing::warn!(
-                "Genshin was already running when Irminsul started: the login handshake, and \
-                 with it the session key, was missed, so nothing from this game session can be \
-                 decrypted"
+                "Genshin was already in the world when Irminsul started: game traffic arrived \
+                 with no login in it, so the session key was missed and nothing from this \
+                 game session can be decrypted"
             );
         }
 
@@ -1149,6 +1147,10 @@ impl Monitor {
                 .unwrap_or_default();
             let _ = writer.write_packet(ts, &packet);
         }
+
+        // Game traffic: for a game that was already open, starts the clock on
+        // telling "still on the title screen" from "already in the world".
+        self.game_watch.note_game_traffic();
 
         let Some(sniffer) = self.sniffer.as_ref() else {
             return;
@@ -1369,11 +1371,18 @@ impl Monitor {
     /// so nothing is lost by ignoring these here.
     fn handle_connection_packet(&mut self, conn: &ConnectionPacket) {
         match conn {
-            ConnectionPacket::HandshakeRequested => {
-                tracing::info!("Connection: Handshake Requested");
-            }
-            ConnectionPacket::HandshakeEstablished => {
-                tracing::info!("Connection: Handshake Established")
+            ConnectionPacket::HandshakeRequested | ConnectionPacket::HandshakeEstablished => {
+                if matches!(conn, ConnectionPacket::HandshakeRequested) {
+                    tracing::info!("Connection: Handshake Requested");
+                } else {
+                    tracing::info!("Connection: Handshake Established");
+                }
+                // A login being watched: whatever the process timing said, this
+                // connection's key exchange is inside the capture window.
+                if self.game_watch.note_login_seen() {
+                    let status = self.game_watch.status();
+                    self.app_state.update_game_status(status);
+                }
             }
             ConnectionPacket::Disconnected => {
                 tracing::info!("Connection: Disconnected");

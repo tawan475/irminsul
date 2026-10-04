@@ -128,6 +128,15 @@ pub enum GameStatus {
     /// failure is reported as an error toast and in the log, and shows here as
     /// this state simply never clearing.
     CaptureOff,
+    /// The game was already open when Irminsul started, and nothing says yet
+    /// whether its login is behind it or still to come.
+    ///
+    /// The common, working case: Genshin parked on the title screen, Irminsul
+    /// opened, then the door clicked. The key comes from the token exchange as
+    /// the client enters the world, so that session captures normally. Only
+    /// game traffic with no login in it (a session already in the world, see
+    /// [`IN_WORLD_GRACE`]) turns this into [`MissedLaunch::AlreadyRunning`].
+    AwaitingLogin,
     /// The game is running and Irminsul cannot have seen it start.
     LaunchMissed(MissedLaunch),
     /// A connection's login was seen, but its session key was not recovered,
@@ -144,6 +153,7 @@ impl GameStatus {
             GameStatus::LaunchCaptured => "Game: running, launch captured",
             GameStatus::Decoding => "Game: data decrypting",
             GameStatus::CaptureOff => "Game: running, capture starting",
+            GameStatus::AwaitingLogin => "Game: running — enter the world to capture",
             GameStatus::LaunchMissed(MissedLaunch::AlreadyRunning) => {
                 "Game: already running — restart Genshin to capture"
             }
@@ -184,16 +194,21 @@ impl GameStatus {
 
                  A brief gap does not usually cost the session: the key was recovered at login                  and Irminsul still holds it. If traffic flowed during the gap it can break the                  packet sequence, in which case data simply stops arriving and restarting Genshin                  gets a fresh session."
             }
+            GameStatus::AwaitingLogin => {
+                "Genshin was already open when Irminsul started. That is fine as long as you have \
+                 not entered the world yet: the key is recovered as the client connects to the \
+                 game server.\n\n\
+                 Click the door (or log in) now. This line changes to \"data decrypting\" once \
+                 the session's data arrives.\n\n\
+                 If you were already in the world, Irminsul can't read this session; it says so \
+                 here within a few seconds."
+            }
             GameStatus::LaunchMissed(MissedLaunch::AlreadyRunning) => {
-                "Genshin was already running when Irminsul started, so Irminsul did not watch this \
-                 session begin and cannot tell whether it caught the login exchange the session \
-                 key comes from.\n\n\
-                 Still on the title or login screen? Go into the world now. The key is recovered \
-                 as the client connects to the game server, and this line changes to \"data \
-                 decrypting\" within a second or two if that worked.\n\n\
-                 Already in the world? Then that exchange is behind you and nothing from this \
-                 session can be decrypted. Leave Irminsul running with capture started, close \
-                 Genshin, and start it again."
+                "Genshin was already in the world when Irminsul started: game traffic is \
+                 arriving, but the login exchange the session key comes from happened before \
+                 Irminsul was running, so nothing from this session can be decrypted.\n\n\
+                 To capture: with Irminsul running, return to the title screen and enter the \
+                 world again, or close Genshin and start it again."
             }
             GameStatus::LaunchMissed(MissedLaunch::CaptureStopped) => {
                 "Packet capture was stopped while Genshin was running, so the packet stream has a \
@@ -216,7 +231,9 @@ impl GameStatus {
 
     pub fn severity(self) -> Severity {
         match self {
-            GameStatus::NotRunning | GameStatus::CaptureOff => Severity::Neutral,
+            GameStatus::NotRunning | GameStatus::CaptureOff | GameStatus::AwaitingLogin => {
+                Severity::Neutral
+            }
             GameStatus::LaunchCaptured | GameStatus::Decoding => Severity::Good,
             GameStatus::LaunchMissed(_) | GameStatus::KeyLost => Severity::Problem,
         }
@@ -246,6 +263,16 @@ const DECODING_TTL: Duration = Duration::from_secs(10);
 /// [`GameWatch::note_key_recovery_failed`]), so this only has to catch what
 /// slips past both while staying clear of a slow but working login.
 pub const KEY_RECOVERY_GRACE: Duration = Duration::from_secs(30);
+
+/// How long game traffic may flow, for a game that was already open when
+/// Irminsul started, with no login seen in it before the session is judged to
+/// have begun before Irminsul.
+///
+/// A client on the title screen sends nothing to the game server; entering the
+/// world opens the connection with a handshake that the sniffer reports (see
+/// [`GameWatch::note_login_seen`]) well within this. A session already in the
+/// world keeps pinging, so it crosses this quickly and is reported missed.
+pub const IN_WORLD_GRACE: Duration = Duration::from_secs(8);
 
 /// The transition logic. See the module docs.
 #[derive(Debug, Default)]
@@ -289,6 +316,10 @@ pub struct GameWatch {
     awaiting_key_since: Option<Instant>,
     /// The sniffer gave up recovering the current connection's session key.
     key_recovery_failed: bool,
+    /// For a game that was already open when Irminsul started: when its game
+    /// traffic was first seen with no login watched since. See
+    /// [`IN_WORLD_GRACE`] and [`GameStatus::AwaitingLogin`].
+    traffic_without_login_since: Option<Instant>,
     /// Has the scan ever actually found the game?
     ///
     /// Until it has, an absence proves nothing. The process names here are a
@@ -313,9 +344,20 @@ impl GameWatch {
             // Only over a running game with capture up: "not running" and
             // "capture starting" are the more basic truths when they apply.
             GameStatus::KeyLost
+        } else if self.process_status == GameStatus::LaunchMissed(MissedLaunch::AlreadyRunning)
+            && !self.missed_in_world()
+        {
+            GameStatus::AwaitingLogin
         } else {
             self.process_status
         }
+    }
+
+    /// Has game traffic flowed long enough, with no login in it, to say the
+    /// already-open game's session began before Irminsul?
+    fn missed_in_world(&self) -> bool {
+        self.traffic_without_login_since
+            .is_some_and(|at| at.elapsed() >= IN_WORLD_GRACE)
     }
 
     /// Was a login seen whose session key has not arrived, and is not coming?
@@ -407,6 +449,7 @@ impl GameWatch {
             // Whatever connection the key was missing for is gone with it.
             self.awaiting_key_since = None;
             self.key_recovery_failed = false;
+            self.traffic_without_login_since = None;
         }
 
         if !running {
@@ -519,7 +562,41 @@ impl GameWatch {
     pub fn note_login_traffic(&mut self) -> bool {
         let before = self.status();
         self.awaiting_key_since.get_or_insert_with(Instant::now);
+        self.login_watched();
         self.status() != before
+    }
+
+    /// Game traffic arrived (any captured frame on the game's ports).
+    ///
+    /// Only matters for a game that was already open when Irminsul started:
+    /// it starts the [`IN_WORLD_GRACE`] clock, which a login seen in time
+    /// stops. The verdict itself changes at the next poll, so this does not
+    /// report a change.
+    pub fn note_game_traffic(&mut self) {
+        if self.holed_cause == Some(MissedLaunch::AlreadyRunning) {
+            self.traffic_without_login_since
+                .get_or_insert_with(Instant::now);
+        }
+    }
+
+    /// A login was watched -- a connection handshake or login traffic -- so
+    /// the current session's start fell inside the capture window, whatever
+    /// the process timing suggested.
+    ///
+    /// Returns whether the user-visible status changed.
+    pub fn note_login_seen(&mut self) -> bool {
+        let before = self.status();
+        self.login_watched();
+        self.status() != before
+    }
+
+    fn login_watched(&mut self) {
+        self.traffic_without_login_since = None;
+        if self.holed_cause.take().is_some()
+            && matches!(self.process_status, GameStatus::LaunchMissed(_))
+        {
+            self.process_status = GameStatus::LaunchCaptured;
+        }
     }
 
     /// The sniffer gave up recovering the current connection's session key.
@@ -540,6 +617,8 @@ impl GameWatch {
         self.decoded_at = None;
         self.awaiting_key_since = None;
         self.key_recovery_failed = false;
+        // A reset is the sniffer seeing a connection handshake: a login.
+        self.login_watched();
         self.status() != before
     }
 }
@@ -696,16 +775,85 @@ mod tests {
         assert_eq!(watch.status().severity(), Severity::Good);
     }
 
+    /// Ages the "traffic with no login" clock past [`IN_WORLD_GRACE`], i.e. a
+    /// session that was already in the world. Returns false (and the caller
+    /// skips) on the rare clock that cannot go back that far.
+    fn age_traffic_past_grace(watch: &mut GameWatch) -> bool {
+        watch.note_game_traffic();
+        match Instant::now().checked_sub(IN_WORLD_GRACE + Duration::from_secs(1)) {
+            Some(stale) => {
+                watch.traffic_without_login_since = Some(stale);
+                true
+            }
+            None => false,
+        }
+    }
+
     #[test]
-    fn a_game_already_running_at_the_first_poll_is_flagged() {
-        // Irminsul launched second. This is the failure the whole feature
-        // exists for, and it used to look identical to the working case.
+    fn a_game_already_open_at_the_first_poll_waits_for_the_login() {
+        // Genshin on the title screen, Irminsul opened, door not clicked yet:
+        // the common working order. Nothing is missed until the client
+        // connects, so this must not be red.
         let mut watch = GameWatch::default();
-        assert_eq!(
-            watch.observe(true, CAPTURING),
-            GameStatus::LaunchMissed(MissedLaunch::AlreadyRunning)
-        );
-        assert_eq!(watch.status().severity(), Severity::Problem);
+        assert_eq!(watch.observe(true, CAPTURING), GameStatus::AwaitingLogin);
+        assert_eq!(watch.status().severity(), Severity::Neutral);
+        // Some traffic, but not yet long enough to call it a session in progress.
+        watch.note_game_traffic();
+        assert_eq!(watch.observe(true, CAPTURING), GameStatus::AwaitingLogin);
+    }
+
+    #[test]
+    fn a_login_seen_after_opening_irminsul_is_a_captured_session() {
+        let mut watch = GameWatch::default();
+        watch.observe(true, CAPTURING);
+        watch.note_game_traffic();
+        assert!(watch.note_login_seen());
+        assert_eq!(watch.status(), GameStatus::LaunchCaptured);
+        // The traffic clock went with it: later traffic is not held against it.
+        if age_traffic_past_grace(&mut watch) {
+            assert_eq!(watch.observe(true, CAPTURING), GameStatus::LaunchCaptured);
+        }
+
+        // A connection handshake arriving as a session reset counts the same.
+        let mut watch = GameWatch::default();
+        watch.observe(true, CAPTURING);
+        assert!(watch.note_session_reset());
+        assert_eq!(watch.status(), GameStatus::LaunchCaptured);
+
+        // So does login traffic under the dispatch key.
+        let mut watch = GameWatch::default();
+        watch.observe(true, CAPTURING);
+        assert!(watch.note_login_traffic());
+        assert_eq!(watch.status(), GameStatus::LaunchCaptured);
+    }
+
+    #[test]
+    fn game_traffic_with_no_login_means_the_session_was_already_running() {
+        // Irminsul opened while already in the world: the game keeps talking to
+        // the server, but the login that carried the key is behind us.
+        let mut watch = GameWatch::default();
+        watch.observe(true, CAPTURING);
+        if age_traffic_past_grace(&mut watch) {
+            assert_eq!(
+                watch.observe(true, CAPTURING),
+                GameStatus::LaunchMissed(MissedLaunch::AlreadyRunning)
+            );
+            assert_eq!(watch.status().severity(), Severity::Problem);
+            // Going back to the title screen and in again recovers.
+            assert!(watch.note_login_seen());
+            assert_eq!(watch.status(), GameStatus::LaunchCaptured);
+        }
+    }
+
+    #[test]
+    fn traffic_only_counts_for_a_game_that_was_already_open() {
+        // A launch Irminsul watched has nothing to prove: its traffic must not
+        // start the clock.
+        let mut watch = watching_before_launch(CAPTURING);
+        watch.observe(true, CAPTURING);
+        watch.note_game_traffic();
+        assert_eq!(watch.traffic_without_login_since, None);
+        assert_eq!(watch.status(), GameStatus::LaunchCaptured);
     }
 
     #[test]
@@ -747,10 +895,15 @@ mod tests {
         let mut watch = GameWatch::default();
         watch.observe(true, CAPTURING);
         for _ in 0..10 {
-            assert_eq!(
-                watch.observe(true, CAPTURING),
-                GameStatus::LaunchMissed(MissedLaunch::AlreadyRunning)
-            );
+            assert_eq!(watch.observe(true, CAPTURING), GameStatus::AwaitingLogin);
+        }
+        if age_traffic_past_grace(&mut watch) {
+            for _ in 0..10 {
+                assert_eq!(
+                    watch.observe(true, CAPTURING),
+                    GameStatus::LaunchMissed(MissedLaunch::AlreadyRunning)
+                );
+            }
         }
     }
 
@@ -758,11 +911,15 @@ mod tests {
     fn restarting_the_game_clears_the_verdict_and_is_judged_fresh() {
         // The actual fix being recommended to the user has to work.
         let mut watch = GameWatch::default();
-        assert_eq!(
-            watch.observe(true, CAPTURING),
-            GameStatus::LaunchMissed(MissedLaunch::AlreadyRunning)
-        );
+        assert_eq!(watch.observe(true, CAPTURING), GameStatus::AwaitingLogin);
+        if age_traffic_past_grace(&mut watch) {
+            assert_eq!(
+                watch.observe(true, CAPTURING),
+                GameStatus::LaunchMissed(MissedLaunch::AlreadyRunning)
+            );
+        }
         assert_eq!(watch.observe(false, CAPTURING), GameStatus::NotRunning);
+        assert_eq!(watch.traffic_without_login_since, None);
         assert_eq!(watch.observe(true, CAPTURING), GameStatus::LaunchCaptured);
     }
 
@@ -836,7 +993,7 @@ mod tests {
         detector.running = true;
         assert_eq!(
             watch.poll(&mut detector, CAPTURING),
-            GameStatus::LaunchMissed(MissedLaunch::AlreadyRunning)
+            GameStatus::AwaitingLogin
         );
         assert!(watch.note_decoded_data());
         assert_eq!(watch.status(), GameStatus::Decoding);
@@ -936,10 +1093,13 @@ mod tests {
         // land on the green verdict the packets proved, not on the red one the
         // process timing guessed -- otherwise the line flaps on every lull.
         let mut watch = GameWatch::default();
-        assert_eq!(
-            watch.observe(true, CAPTURING),
-            GameStatus::LaunchMissed(MissedLaunch::AlreadyRunning)
-        );
+        watch.observe(true, CAPTURING);
+        if age_traffic_past_grace(&mut watch) {
+            assert_eq!(
+                watch.observe(true, CAPTURING),
+                GameStatus::LaunchMissed(MissedLaunch::AlreadyRunning)
+            );
+        }
         assert!(watch.note_decoded_data());
         assert_eq!(watch.status(), GameStatus::Decoding);
 
@@ -1015,7 +1175,7 @@ mod tests {
         assert!(!watch.has_polled());
         assert_eq!(
             watch.poll(&mut detector, CAPTURING),
-            GameStatus::LaunchMissed(MissedLaunch::AlreadyRunning)
+            GameStatus::AwaitingLogin
         );
         assert!(watch.has_polled());
 
