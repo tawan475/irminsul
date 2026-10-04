@@ -194,9 +194,27 @@ enum SnifferEvent {
     /// auto-artifactarium concluded that the game connection restarted. Always
     /// sent *before* the packet that concluded it.
     SessionReset,
-    /// A decoded packet, with the key the sniffer held once it was decoded:
-    /// only [`KeyState::Session`] means the commands are the account's data.
-    Packet(GamePacket, KeyState),
+    /// A decoded packet, with the sniffer's key situation once it was decoded.
+    Packet(GamePacket, KeyReport),
+}
+
+/// The sniffer's key situation, reported with every packet because the
+/// [`GameSniffer`] itself never leaves its thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyReport {
+    /// Only [`KeyState::Session`] means commands are the account's data.
+    state: KeyState,
+    /// The search for the current connection's session key gave up.
+    recovery_failed: bool,
+}
+
+impl KeyReport {
+    fn of(sniffer: &GameSniffer) -> Self {
+        Self {
+            state: sniffer.key_state(),
+            recovery_failed: sniffer.key_recovery_failed(),
+        }
+    }
 }
 
 /// Captured data waiting to be replaced by a new connection's.
@@ -323,7 +341,7 @@ fn decode_one_packet(
 
     match decoded {
         Some(decoded) => decoded_tx
-            .send(SnifferEvent::Packet(decoded, sniffer.key_state()))
+            .send(SnifferEvent::Packet(decoded, KeyReport::of(sniffer)))
             .is_ok(),
         None => true,
     }
@@ -988,7 +1006,7 @@ impl Monitor {
             // uploads the *union* of both inventories to whichever tracker
             // account holds the import key.
             SnifferEvent::SessionReset => self.handle_connection_reset(),
-            SnifferEvent::Packet(packet, key) => self.handle_game_packet(packet, key),
+            SnifferEvent::Packet(packet, report) => self.handle_game_packet(packet, report),
         }
     }
 
@@ -1001,14 +1019,20 @@ impl Monitor {
                 "new game connection; keeping the captured data until it delivers its own"
             );
         }
-        if self.game_watch.note_data_cleared() {
+        if self.game_watch.note_session_reset() {
             let status = self.game_watch.status();
             self.app_state.update_game_status(status);
         }
         self.ctx.request_repaint();
     }
 
-    fn handle_game_packet(&mut self, game_packet: GamePacket, key: KeyState) {
+    fn handle_game_packet(&mut self, game_packet: GamePacket, report: KeyReport) {
+        let key = report.state;
+        if report.recovery_failed && self.game_watch.note_key_recovery_failed() {
+            let status = self.game_watch.status();
+            self.app_state.update_game_status(status);
+        }
+
         let commands = match game_packet {
             GamePacket::Commands(commands) => commands,
             GamePacket::Connection(conn) => {
@@ -1020,12 +1044,21 @@ impl Monitor {
         // Non-empty is the whole point: a bare KCP ACK decodes to
         // `Commands(vec![])` with no key involved at all, while an actual
         // command batch means the XOR stream decrypted and the protobuf parsed.
-        // That is the only evidence this app has that the session key was
-        // really recovered, so it is what the status line is allowed to claim
-        // "decrypting" on.
-        if !commands.is_empty() && self.game_watch.note_decoded_data() {
-            let status = self.game_watch.status();
-            self.app_state.update_game_status(status);
+        // Under the session key that is the evidence the status line may claim
+        // "decrypting" on. Under the dispatch key it is only a login being
+        // watched -- every reconnect of 2026-10-04 got that far and no further
+        // while the line read "data decrypting" -- so it starts the clock on
+        // the key arriving instead.
+        if !commands.is_empty() {
+            let changed = if key == KeyState::Session {
+                self.game_watch.note_decoded_data()
+            } else {
+                self.game_watch.note_login_traffic()
+            };
+            if changed {
+                let status = self.game_watch.status();
+                self.app_state.update_game_status(status);
+            }
         }
 
         let log_packets = *self.log_packet_rx.borrow_and_update();
