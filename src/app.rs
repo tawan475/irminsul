@@ -358,6 +358,28 @@ fn missing_export_data_toast(missing: &[&'static str]) -> String {
     )
 }
 
+/// The captured UID, when the tracker key verified to an account with another.
+///
+/// `None` whenever either side is unknown: the old backend may answer with no
+/// UID ("N/A"), an account need not have one set, and no UID is claimed for a
+/// capture whose guids disagree.
+fn uid_mismatch(account: &TrackerAccount, captured: Option<u32>) -> Option<u32> {
+    let captured = captured?;
+    let linked: u64 = account.uid.trim().parse().ok()?;
+    (linked != u64::from(captured)).then_some(captured)
+}
+
+/// What the UID warning says, in its toast and its tooltip.
+fn uid_mismatch_message(account: &TrackerAccount, captured: u32) -> String {
+    format!(
+        "This capture is UID {captured}, but the tracker key belongs to {} (UID {}). Uploads \
+         still go to that account: log in with it, or link the key of the account you are \
+         playing.",
+        account.name,
+        account.uid.trim()
+    )
+}
+
 /// The data panel's account line, e.g. `AR 60 · WL 8 · Resin 124 at login`.
 ///
 /// `None` when none of the three was captured. "At login" because that is
@@ -453,6 +475,10 @@ pub struct IrminsulApp {
     tracker_account: Option<TrackerAccount>,
     tracker_verify_rx: Option<oneshot::Receiver<Result<TrackerAccount>>>,
     tracker_upload_rx: Option<oneshot::Receiver<Result<(), String>>>,
+    /// The `(linked account UID, captured UID)` pair the mismatch toast was
+    /// last raised for, so it appears once per occurrence rather than per
+    /// frame. See `note_uid_mismatch`.
+    uid_mismatch_warned: Option<(String, u32)>,
 
     /// The "Genshin is already running" modal.
     game_missed_modal_open: bool,
@@ -864,6 +890,7 @@ impl IrminsulApp {
             tracker_account: None,
             tracker_verify_rx,
             tracker_upload_rx: None,
+            uid_mismatch_warned: None,
             tray_icon,
             state_rx,
             wish_url_rx,
@@ -1910,6 +1937,39 @@ impl IrminsulApp {
         }
     }
 
+    /// Warn, once per occurrence, that the captured account is not the one the
+    /// tracker key belongs to.
+    ///
+    /// Only a warning: an upload still goes to the key's account, as it always
+    /// has, and the UID scheme this relies on is not yet proven on every
+    /// capture. Raised as soon as both UIDs are known, which is ahead of the
+    /// automation export's debounce; the tracker section keeps saying it for as
+    /// long as it is true.
+    fn note_uid_mismatch(&mut self, captured_uid: Option<u32>) {
+        let mismatch = self.tracker_account.as_ref().and_then(|account| {
+            uid_mismatch(account, captured_uid).map(|captured| (account.clone(), captured))
+        });
+        let Some((account, captured)) = mismatch else {
+            // Re-armed, so a later recurrence speaks up again.
+            self.uid_mismatch_warned = None;
+            return;
+        };
+
+        let occurrence = (account.uid.clone(), captured);
+        if self.uid_mismatch_warned.as_ref() == Some(&occurrence) {
+            return;
+        }
+        tracing::warn!(
+            captured,
+            linked = %account.uid,
+            "the captured account is not the one the tracker key belongs to"
+        );
+        self.toasts
+            .warning(uid_mismatch_message(&account, captured))
+            .duration(Some(Duration::from_secs(15)));
+        self.uid_mismatch_warned = Some(occurrence);
+    }
+
     fn request_tracker_verify(&mut self) {
         let key = self.saved_state.tracker_import_key.clone();
         if key.is_empty() {
@@ -2005,6 +2065,9 @@ impl IrminsulApp {
             }
         }
 
+        let captured_uid = app_state.player.as_ref().and_then(|player| player.uid);
+        self.note_uid_mismatch(captured_uid);
+
         // Only while the key is verified: `tracker_account` is set by a
         // successful verify and cleared whenever one starts or fails.
         let dashboard_url = self
@@ -2087,6 +2150,18 @@ impl IrminsulApp {
                                 .color(Color32::GRAY),
                         );
                     });
+                    // Shown for as long as it is true; the toast in
+                    // `note_uid_mismatch` only announces it.
+                    if let Some(captured) = uid_mismatch(account, captured_uid) {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} Captured UID {captured} is not this account's",
+                                egui_material_icons::icons::ICON_WARNING
+                            ))
+                            .color(Color32::RED),
+                        )
+                        .on_hover_text(uid_mismatch_message(account, captured));
+                    }
                 } else if self.tracker_verify_rx.is_some() {
                     ui.label(RichText::new("Verifying...").color(Color32::YELLOW));
                 } else {
@@ -2403,6 +2478,21 @@ impl IrminsulApp {
 
             OptimizerExportTarget::TrackerManual => {
                 if can_upload_to_tracker(&self.saved_state) {
+                    // Said again at the click, then uploaded anyway: see
+                    // `note_uid_mismatch`.
+                    let captured_uid = self
+                        .state_rx
+                        .borrow()
+                        .player
+                        .as_ref()
+                        .and_then(|player| player.uid);
+                    if let Some(account) = &self.tracker_account
+                        && let Some(captured) = uid_mismatch(account, captured_uid)
+                    {
+                        self.toasts
+                            .warning(uid_mismatch_message(account, captured))
+                            .duration(Some(Duration::from_secs(15)));
+                    }
                     self.tracker_upload_json(json);
                 } else if !self.saved_state.tracker_import_key.is_empty() {
                     self.toasts
@@ -2995,5 +3085,42 @@ mod tests {
         ] {
             assert!(details.contains(fact), "{fact} missing from {details}");
         }
+    }
+
+    fn linked_account(uid: &str) -> TrackerAccount {
+        TrackerAccount {
+            name: "Main".to_string(),
+            uid: uid.to_string(),
+            server: "ASIA".to_string(),
+            dashboard_url: None,
+        }
+    }
+
+    #[test]
+    fn a_capture_of_another_account_is_a_uid_mismatch() {
+        let account = linked_account("813152114");
+        assert_eq!(uid_mismatch(&account, Some(800_000_001)), Some(800_000_001));
+        assert_eq!(uid_mismatch(&account, Some(813_152_114)), None);
+
+        let message = uid_mismatch_message(&account, 800_000_001);
+        assert!(message.contains("UID 800000001"), "{message}");
+        assert!(message.contains("Main (UID 813152114)"), "{message}");
+    }
+
+    #[test]
+    fn an_unknown_uid_on_either_side_is_no_mismatch() {
+        // Nothing captured yet, or the guids disagreed.
+        assert_eq!(uid_mismatch(&linked_account("813152114"), None), None);
+        // The old backend's answer without a UID, or an account without one.
+        assert_eq!(
+            uid_mismatch(&linked_account("N/A"), Some(800_000_001)),
+            None
+        );
+        assert_eq!(uid_mismatch(&linked_account(""), Some(800_000_001)), None);
+        // A numeric answer read back as a string, with stray whitespace.
+        assert_eq!(
+            uid_mismatch(&linked_account(" 800000001 "), Some(800_000_001)),
+            None
+        );
     }
 }
