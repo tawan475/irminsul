@@ -1,3 +1,4 @@
+use std::io;
 use std::time::Instant;
 
 use kcp::{KCP_OVERHEAD, Kcp, get_conv};
@@ -7,7 +8,12 @@ use crate::bytes_as_hex;
 
 pub(crate) struct KcpSniffer {
     pub(crate) conv_id: u32,
-    kcp: Kcp<Vec<u8>>,
+    /// The reassembler. Its output is where it "sends" the ACK it answers
+    /// every push with; this is a passive listener that never transmits, so
+    /// that is [`io::Sink`]. It used to be a `Vec<u8>` nothing drained, which
+    /// grew by roughly 24 bytes per received push for the life of the
+    /// connection -- about 10 MB over a two-hour session.
+    kcp: Kcp<io::Sink>,
     time_start: Instant,
     foreign: ForeignTally,
 }
@@ -162,8 +168,8 @@ impl KcpSniffer {
 const RCV_WND: u16 = 1024;
 
 #[inline]
-fn new_kcp(conv_id: u32) -> Kcp<Vec<u8>> {
-    let mut kcp = Kcp::new(conv_id, Vec::new());
+fn new_kcp(conv_id: u32) -> Kcp<io::Sink> {
+    let mut kcp = Kcp::new(conv_id, io::sink());
     kcp.set_wndsize(1024, RCV_WND);
     kcp
 }
@@ -637,6 +643,26 @@ mod tests {
             "{} warnings",
             logged.len()
         );
+    }
+
+    #[test]
+    fn acknowledgements_go_nowhere_and_delivery_is_unchanged() {
+        // The reassembler answers every push with an ACK it "sends" through its
+        // output. A passive listener sends nothing, and an output that stored
+        // those bytes grew by ~24 bytes per received push for the life of the
+        // connection. The sink stores nothing by construction...
+        assert_eq!(std::mem::size_of::<io::Sink>(), 0);
+        let _: &Kcp<io::Sink> = &KcpSniffer::new(7).kcp;
+
+        // ...and swapping it in changed nothing about what is delivered.
+        let mut sniffer = KcpSniffer::new(7);
+        for sn in 0..2_000u32 {
+            assert_eq!(
+                sniffer.receive_segments(&game_segment(7, sn, &sn.to_le_bytes())),
+                vec![sn.to_le_bytes().to_vec()],
+                "sn {sn}"
+            );
+        }
     }
 
     /// One hostile segment does not cost the good segments sharing its datagram.
