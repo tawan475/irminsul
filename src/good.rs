@@ -88,6 +88,36 @@ pub struct Good {
     /// Only characters with at least one known value appear.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gi_characters: Option<BTreeMap<String, GiCharacter>>,
+    /// How values that are still being verified were derived, so an export
+    /// file shows whether they work. Not data the tracker reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gi_debug: Option<GiDebug>,
+}
+
+/// `gi_debug`: the evidence behind derived values.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GiDebug {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid_check: Option<UidCheck>,
+}
+
+/// How `gi_player.uid` was read off the item guids (see
+/// `PlayerData::uid_check`): the top 32 bits of each non-zero item guid are
+/// counted, and the most common value is the UID when enough items agree.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UidCheck {
+    /// The UID reported in `gi_player.uid`, if any.
+    pub uid: Option<u32>,
+    /// Item guids whose top half is the most common one.
+    pub agreeing: usize,
+    /// Item guids counted (non-zero).
+    pub total: usize,
+    /// The most common item guid top halves, `[top, count]`, most first.
+    pub item_top_halves: Vec<(u64, usize)>,
+    /// The same for avatar guids, which don't vote (field unverified).
+    pub avatar_top_halves: Vec<(u64, usize)>,
 }
 
 /// One character's entry in `gi_characters`.
@@ -319,6 +349,7 @@ mod tests {
                     obtained_at: Some(1_646_092_800),
                 },
             )])),
+            gi_debug: None,
         };
 
         let json = serde_json::to_value(&good).expect("Good must serialize");
@@ -466,6 +497,7 @@ mod tests {
             gi_player: None,
             gi_achievement_times: None,
             gi_characters: None,
+            gi_debug: None,
         };
 
         let json = serde_json::to_value(&good).expect("Good must serialize");
