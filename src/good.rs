@@ -118,6 +118,25 @@ pub struct UidCheck {
     pub item_top_halves: Vec<(u64, usize)>,
     /// The same for avatar guids, which don't vote (field unverified).
     pub avatar_top_halves: Vec<(u64, usize)>,
+    /// Items whose guid top half is not the UID, grouped (most first, at most
+    /// 100 groups): what they are, to explain where they came from.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub strays: Vec<UidStray>,
+}
+
+/// Items of one kind and id whose guids carry one foreign top half.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UidStray {
+    /// The guid top half (another account's UID, if the scheme holds).
+    pub top: u64,
+    pub item_id: u32,
+    /// `material`, `weapon`, `artifact`, `furniture` or `other`.
+    pub kind: String,
+    /// From the game data, when it knows the item.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub count: usize,
 }
 
 /// One character's entry in `gi_characters`.
