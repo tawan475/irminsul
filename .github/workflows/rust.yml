@@ -65,8 +65,10 @@ jobs:
           }
           Expand-Archive -Path sdk.zip -DestinationPath . -Force
       # clippy and rustfmt come from rust-toolchain.toml's components list.
-      - run: cargo fmt --check
-      - run: cargo clippy --release --locked --no-default-features --features "${{ matrix.features }}" -- -Dwarnings
+      - run: cargo fmt --all --check
+      # Every target (tests included) of every workspace member; `--features`
+      # only applies to the members that define it.
+      - run: cargo clippy --release --locked --workspace --all-targets --no-default-features --features "${{ matrix.features }}" -- -Dwarnings
         env:
           LIB: ${{ github.workspace }}/Lib/x64/
       - run: cargo test --release --locked --no-default-features --features "${{ matrix.features }}"
@@ -96,9 +98,39 @@ jobs:
         if: vars.TRACKER_API_URL != ''
         shell: bash
         run: echo "TRACKER_API_URL=${{ vars.TRACKER_API_URL }}" >> "$GITHUB_ENV"
-      - run: cargo clippy --locked --no-default-features -- -Dwarnings
+      - run: cargo clippy --locked --workspace --all-targets --no-default-features -- -Dwarnings
       - run: cargo test --locked --no-default-features
       - run: cargo build --locked --no-default-features
+
+  # crates/auto-artifactarium, the packet-parsing library. It has no capture
+  # backend and no system dependencies, so unlike the legs above it needs
+  # neither GTK nor a pcap SDK, and it is checked once per OS rather than once
+  # per irminsul feature set. Same checks the library ran in its own repository,
+  # now on the workspace toolchain (rust-toolchain.toml) and lockfile.
+  library:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # --all-features so the `cli` binary (src/main.rs) is linted and tested
+      # too; without it the bin is skipped for want of its required feature.
+      - run: cargo clippy --locked -p auto-artifactarium --all-targets --all-features -- -Dwarnings
+      - run: cargo test --locked -p auto-artifactarium --all-features
+      # Default features must stay CLI-free: this is what irminsul builds, and
+      # it proves clap/anyhow are not in the library's dependency graph.
+      - run: cargo build --locked -p auto-artifactarium
+      - run: cargo build --locked -p auto-artifactarium --all-features
+      # Broken intra-doc links (e.g. a public doc linking to a private item)
+      # fail the build. Rustdoc output does not differ per OS, so one is enough.
+      - name: Doc
+        if: runner.os == 'Linux'
+        run: cargo doc --locked -p auto-artifactarium --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -Dwarnings
 
   # update_rev.py is what turns "upstream pushed something" into a new pinned
   # revision in Cargo.toml, and its two guards -- refuse to run under an active
