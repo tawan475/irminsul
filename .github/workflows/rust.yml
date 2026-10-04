@@ -46,8 +46,10 @@ jobs:
       # cache budget and evict the branch caches.
       - uses: Swatinem/rust-cache@v2
         with:
-          # One cache per feature set; the two Windows legs used to share one key.
-          key: ${{ matrix.features || 'default' }}
+          # One cache per leg; the two Windows legs used to share one key. Not
+          # keyed on `features`: cache keys can't contain commas, and the Linux
+          # leg's "pcap,static-libpcap" silently disabled its cache.
+          key: ${{ matrix.artifact_name }}
           cache-workspace-crates: true
           save-if: ${{ github.event_name == 'push' }}
       - name: Export tracker API URL
