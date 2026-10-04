@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -77,6 +77,12 @@ pub struct Good {
     // tracker reads it. Append only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gi_player: Option<GiPlayer>,
+    /// When each achievement in `gi_achievements` was finished, in unix
+    /// seconds, keyed by achievement id (a JSON object key, so a string). Only
+    /// achievements the game sent a plausible finish time for: a subset of
+    /// `gi_achievements`, never more.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gi_achievement_times: Option<BTreeMap<u32, u32>>,
 }
 
 /// Account values GOOD has no place for: `gi_player`.
@@ -283,6 +289,7 @@ mod tests {
                 max_stamina: Some(24_000),
                 game_data: Some("792978e5503ecfba73dcb3562ed44a0d35a2abe2".to_string()),
             }),
+            gi_achievement_times: Some(BTreeMap::from([(80001, 1_650_000_000)])),
         };
 
         let json = serde_json::to_value(&good).expect("Good must serialize");
@@ -307,6 +314,7 @@ mod tests {
                 "artifacts",
                 "characters",
                 "format",
+                "gi_achievement_times",
                 "gi_achievements",
                 "gi_player",
                 "materials",
@@ -393,6 +401,12 @@ mod tests {
             ]
         );
         assert_eq!(json["gi_player"]["uid"], serde_json::json!(813_152_114));
+
+        // Achievement id (a JSON object key, so a string) -> unix seconds.
+        assert_eq!(
+            json["gi_achievement_times"],
+            serde_json::json!({ "80001": 1_650_000_000 })
+        );
     }
 
     #[test]
@@ -413,6 +427,7 @@ mod tests {
             gi_achievements: None,
             timestamp: None,
             gi_player: None,
+            gi_achievement_times: None,
         };
 
         let json = serde_json::to_value(&good).expect("Good must serialize");
@@ -420,6 +435,7 @@ mod tests {
         assert!(!object.contains_key("gi_achievements"));
         assert!(!object.contains_key("timestamp"));
         assert!(!object.contains_key("gi_player"));
+        assert!(!object.contains_key("gi_achievement_times"));
     }
 
     #[test]

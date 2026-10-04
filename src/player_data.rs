@@ -71,6 +71,28 @@ fn tps_avatar_ids(game_data: &AnimeGameData) -> [u32; 2] {
     ]
 }
 
+/// Whether an achievement counts as done: `FINISHED` (2) or `REWARD_TAKEN` (3).
+/// `gi_achievements` and `gi_achievement_times` both use this, so they agree.
+fn achievement_completed(achievement: &Achievement) -> bool {
+    achievement.status == 2 || achievement.status == 3
+}
+
+/// 2020-09-15 00:00:00 UTC, two weeks before the game launched: nothing was
+/// finished or obtained before it.
+const EARLIEST_PLAUSIBLE_TIME: u64 = 1_600_128_000;
+
+/// How far past this machine's clock a game time may be: a day, for a clock
+/// that runs behind the server's.
+const CLOCK_SLACK_SECS: u64 = 86_400;
+
+/// Whether `secs` (unix seconds) can be a real moment in the game's history,
+/// given that it is now `now_secs`. These times come from fields matched by
+/// shape or from field numbers carried over from older versions, so a value
+/// outside the window means the field was misread.
+fn plausible_time(secs: u64, now_secs: u64) -> bool {
+    (EARLIEST_PLAUSIBLE_TIME..=now_secs.saturating_add(CLOCK_SLACK_SECS)).contains(&secs)
+}
+
 /// A player property `gi_player` reports: its client `PROP_*` id, and the range
 /// a real value falls in.
 ///
@@ -500,11 +522,45 @@ impl PlayerData {
     pub fn export_achievements(&self) -> Result<Vec<u32>> {
         let mut ids = Vec::new();
         for ach in self.achievements.values() {
-            if ach.status == 2 || ach.status == 3 {
+            if achievement_completed(ach) {
                 ids.push(ach.id);
             }
         }
         Ok(ids)
+    }
+
+    /// `gi_achievement_times`: when each completed achievement was finished,
+    /// for those the game sent a plausible time for.
+    ///
+    /// The same achievements as [`export_achievements`](Self::export_achievements)
+    /// and never more, so the two keys cannot disagree. A time outside
+    /// [`plausible_time`]'s window is left out rather than sent; pre-1.0
+    /// accounts are known to carry finished achievements with no time at all.
+    fn export_achievement_times(&self, now_secs: u64) -> BTreeMap<u32, u32> {
+        let mut times = BTreeMap::new();
+        let mut implausible: Vec<(u32, u32)> = Vec::new();
+        for ach in self.achievements.values() {
+            if !achievement_completed(ach) {
+                continue;
+            }
+            let Some(finished) = ach.finish_timestamp else {
+                continue;
+            };
+            if plausible_time(u64::from(finished), now_secs) {
+                times.insert(ach.id, finished);
+            } else {
+                implausible.push((ach.id, finished));
+            }
+        }
+        if !implausible.is_empty() {
+            implausible.sort_unstable();
+            tracing::warn!(
+                count = implausible.len(),
+                sample = ?&implausible[..implausible.len().min(3)],
+                "achievement finish times outside 2020-09-15..now were left out"
+            );
+        }
+        times
     }
 
     /// A captured player property, if it lies in the range a real one can.
@@ -662,6 +718,9 @@ impl PlayerData {
             },
             timestamp: Some(now_ms),
             gi_player,
+            // Omitted when empty, for the same reason as `gi_achievements`.
+            gi_achievement_times: Some(self.export_achievement_times(now_ms / 1000))
+                .filter(|times| !times.is_empty()),
         };
 
         if settings.include_characters {
@@ -1921,7 +1980,7 @@ mod tests {
         data.process_achievements(&[Achievement {
             id: 80014,
             status: 3,
-            finish_timestamp: None,
+            finish_timestamp: extras.then_some(1_650_000_000),
         }]);
 
         if extras {
@@ -1965,7 +2024,8 @@ mod tests {
     const GOLDEN_EXTRAS: &str = concat!(
         r#","gi_player":{"uid":800123456,"ar":60,"arExp":0,"wl":8,"wlLimit":9,"#,
         r#""storyKeys":3,"maxStamina":24000,"#,
-        r#""gameData":"792978e5503ecfba73dcb3562ed44a0d35a2abe2"}}"#,
+        r#""gameData":"792978e5503ecfba73dcb3562ed44a0d35a2abe2"},"#,
+        r#""gi_achievement_times":{"80014":1650000000}}"#,
     );
 
     #[test]
@@ -1989,13 +2049,89 @@ mod tests {
         let mut report = ExportReport::default();
         let mut good = data.build_good(&settings(), &mut report, GOLDEN_TIMESTAMP_MS);
         assert!(good.gi_player.is_some());
+        assert!(good.gi_achievement_times.is_some());
         let with = serde_json::to_string(&good).unwrap();
 
         good.gi_player = None;
+        good.gi_achievement_times = None;
         let without = serde_json::to_string(&good).unwrap();
 
         let good_part = without.strip_suffix('}').unwrap();
         assert!(with.starts_with(good_part), "{with}\n{without}");
         assert!(with[good_part.len()..].starts_with(r#","gi_player":"#));
+    }
+
+    // -- gi_achievement_times ------------------------------------------------------
+
+    /// 2026-10-05 00:00:00 UTC, standing in for "now".
+    const NOW_SECS: u64 = 1_791_158_400;
+
+    fn achievement(id: u32, status: u32, finish_timestamp: Option<u32>) -> Achievement {
+        Achievement {
+            id,
+            status,
+            finish_timestamp,
+        }
+    }
+
+    #[test]
+    fn finish_times_are_exported_for_completed_achievements() {
+        let mut data = player_data();
+        data.process_achievements(&[
+            achievement(80001, 2, Some(1_650_000_000)), // finished
+            achievement(80002, 3, Some(1_700_000_000)), // reward taken
+            achievement(80003, 1, Some(1_700_000_000)), // unfinished: not done
+            achievement(80004, 3, None),                // done, time not recorded
+        ]);
+
+        assert_eq!(
+            data.export_achievement_times(NOW_SECS),
+            BTreeMap::from([(80001, 1_650_000_000), (80002, 1_700_000_000)])
+        );
+    }
+
+    #[test]
+    fn implausible_finish_times_are_left_out() {
+        let tomorrow = (NOW_SECS + CLOCK_SLACK_SECS) as u32;
+        let mut data = player_data();
+        data.process_achievements(&[
+            achievement(80001, 3, Some(1_600_127_999)), // before 2020-09-15
+            achievement(80002, 3, Some(1_600_128_000)), // 2020-09-15: the edge
+            achievement(80003, 3, Some(tomorrow)),      // a day ahead: the edge
+            achievement(80004, 3, Some(tomorrow + 1)),  // further ahead
+            achievement(80005, 3, Some(5)),             // a counter, not a time
+        ]);
+
+        assert_eq!(
+            data.export_achievement_times(NOW_SECS),
+            BTreeMap::from([(80002, 1_600_128_000), (80003, tomorrow)])
+        );
+    }
+
+    #[test]
+    fn finish_times_never_name_an_achievement_the_list_leaves_out() {
+        let mut data = player_data();
+        data.process_achievements(&[
+            achievement(80001, 3, Some(1_650_000_000)),
+            achievement(80002, 1, Some(1_650_000_000)),
+            achievement(80003, 0, Some(1_650_000_000)),
+            achievement(80004, 2, None),
+        ]);
+
+        let listed: HashSet<u32> = data.export_achievements().unwrap().into_iter().collect();
+        let timed = data.export_achievement_times(NOW_SECS);
+        assert!(timed.keys().all(|id| listed.contains(id)), "{timed:?}");
+        assert_eq!(listed, HashSet::from([80001, 80004]));
+    }
+
+    #[test]
+    fn no_finish_times_means_no_key() {
+        let mut data = player_data();
+        data.process_achievements(&[achievement(80001, 3, None)]);
+
+        let mut report = ExportReport::default();
+        let good = data.build_good(&settings(), &mut report, NOW_SECS * 1000);
+        assert_eq!(good.gi_achievements, Some(vec![80001]));
+        assert_eq!(good.gi_achievement_times, None);
     }
 }
