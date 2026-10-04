@@ -1,4 +1,6 @@
 use std::collections::HashSet;
+use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -6,7 +8,8 @@ use futures::stream::FusedStream;
 use pktmon::filter::{PktMonFilter, TransportProtocol};
 use pktmon::{Capture, Packet, PacketPayload};
 
-use crate::capture::{CaptureBackend, CaptureError, PORT_RANGE, Result};
+use crate::capture::dedupe::{DEDUPE_CAPACITY, DEDUPE_WINDOW, Deduper};
+use crate::capture::{CaptureBackend, CaptureError, DUPLICATES_DROPPED, PORT_RANGE, Result};
 
 /// Length of an Ethernet II header (destination MAC, source MAC, ethertype).
 const ETHERNET_HEADER_LEN: usize = 14;
@@ -39,6 +42,9 @@ pub struct PktmonBackend {
     /// Payload kinds already reported, so an unexpected link layer produces one
     /// log line rather than one per packet.
     warned_payload_kinds: HashSet<&'static str>,
+    /// pktmon reports each datagram once per point of the stack it passes;
+    /// only the first copy is passed on.
+    dedupe: Deduper,
 }
 
 impl PktmonBackend {
@@ -81,6 +87,7 @@ impl PktmonBackend {
         Ok(Self {
             stream: Box::new(stream.boxed().fuse()),
             warned_payload_kinds: HashSet::new(),
+            dedupe: Deduper::new(DEDUPE_CAPACITY, DEDUPE_WINDOW),
         })
     }
 
@@ -166,22 +173,29 @@ fn payload_kind(payload: &PacketPayload) -> &'static str {
 #[async_trait]
 impl CaptureBackend for PktmonBackend {
     async fn next_packet(&mut self) -> Result<Vec<u8>> {
-        // The payload is pulled out of the `select!` before it is converted so
-        // the mutable borrow of `self.stream` ends before `self` is reborrowed.
-        let payload = futures::select! {
-            packet = self.stream.select_next_some() => Some(packet.payload),
-            complete => None,
-        };
+        loop {
+            // The payload is pulled out of the `select!` before it is converted
+            // so the mutable borrow of `self.stream` ends before `self` is
+            // reborrowed.
+            let payload = futures::select! {
+                packet = self.stream.select_next_some() => Some(packet.payload),
+                complete => None,
+            };
 
-        let Some(payload) = payload else {
-            return Err(CaptureError::CaptureClosed);
-        };
+            let Some(payload) = payload else {
+                return Err(CaptureError::CaptureClosed);
+            };
 
-        let (frame, note) = to_ethernet_frame(payload);
-        if let Some(note) = note {
-            self.note_payload(note);
+            let (frame, note) = to_ethernet_frame(payload);
+            if let Some(note) = note {
+                self.note_payload(note);
+            }
+            if self.dedupe.is_duplicate(&frame, Instant::now()) {
+                DUPLICATES_DROPPED.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            return Ok(frame);
         }
-        Ok(frame)
     }
 }
 
