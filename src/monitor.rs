@@ -1716,12 +1716,24 @@ async fn upload_to_tracker(
     }
 }
 
+/// What the tracker says about an import key (`verify-key`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrackerAccount {
+    pub name: String,
+    pub uid: String,
+    pub server: String,
+    /// The account's page in the tracker's web app, when the tracker reports
+    /// one (the hosted tracker does; the old backend does not). Only http(s)
+    /// URLs are kept: the UI opens this in the user's browser.
+    pub dashboard_url: Option<String>,
+}
+
 /// Ask the tracker who an import key belongs to.
 async fn verify_tracker_key(
     client: &reqwest::Client,
     url: &str,
     key: &str,
-) -> Result<(String, String, String)> {
+) -> Result<TrackerAccount> {
     let response = client
         .get(url)
         .header("x-import-key", key)
@@ -1739,11 +1751,14 @@ async fn verify_tracker_key(
     if !status.is_success() {
         return Err(anyhow!("Verify failed: HTTP {}", status));
     }
+    parse_verify_response(&body)
+}
 
+/// Reads a successful `verify-key` body. The old backend wraps it in
+/// `{ data: { ... } }`; the hosted tracker answers at the top level.
+fn parse_verify_response(body: &str) -> Result<TrackerAccount> {
     let json: serde_json::Value =
-        serde_json::from_str(&body).map_err(|_| anyhow!("Invalid JSON response"))?;
-
-    // Backend wraps responses in { data: { ... } }
+        serde_json::from_str(body).map_err(|_| anyhow!("Invalid JSON response"))?;
     let inner = json.get("data").unwrap_or(&json);
     let name = inner
         .get("accountName")
@@ -1763,8 +1778,26 @@ async fn verify_tracker_key(
         .and_then(|v| v.as_str())
         .unwrap_or("N/A")
         .to_string();
+    let dashboard_url = inner
+        .get("dashboardUrl")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|url| is_web_url(url))
+        .map(str::to_owned);
 
-    Ok((name, uid, server))
+    Ok(TrackerAccount {
+        name,
+        uid,
+        server,
+        dashboard_url,
+    })
+}
+
+/// Whether a server-supplied link is safe to hand to the browser: an absolute
+/// http(s) URL with a host, nothing like `file:` or `javascript:`.
+fn is_web_url(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
 }
 
 async fn get_database(
@@ -1840,6 +1873,61 @@ fn load_keys() -> Result<HashMap<u16, Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verify_reads_the_hosted_trackers_answer_and_its_dashboard_link() {
+        let body = r#"{"accountId":11,"accountName":"Main","uid":"813152114","server":"ASIA","dashboardUrl":"https://genshin-tracker.475.dev/app/a/11"}"#;
+        assert_eq!(
+            parse_verify_response(body).unwrap(),
+            TrackerAccount {
+                name: "Main".into(),
+                uid: "813152114".into(),
+                server: "ASIA".into(),
+                dashboard_url: Some("https://genshin-tracker.475.dev/app/a/11".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn verify_reads_the_old_backends_wrapped_answer_without_a_dashboard() {
+        let body = r#"{"status":200,"message":"ok","data":{"accountName":"Alt","uid":800000000,"server":null}}"#;
+        let account = parse_verify_response(body).unwrap();
+        assert_eq!(account.name, "Alt");
+        assert_eq!(account.uid, "800000000");
+        assert_eq!(account.server, "N/A");
+        assert_eq!(account.dashboard_url, None);
+    }
+
+    #[test]
+    fn verify_only_keeps_web_links_for_the_dashboard() {
+        for url in [
+            "javascript:alert(1)",
+            "file:///C:/Windows/System32/calc.exe",
+            "/app/a/11",
+            "",
+            "https://",
+        ] {
+            let body = serde_json::json!({ "accountName": "x", "dashboardUrl": url }).to_string();
+            assert_eq!(
+                parse_verify_response(&body).unwrap().dashboard_url,
+                None,
+                "{url}"
+            );
+        }
+        let body = r#"{"accountName":"x","dashboardUrl":" http://localhost:5173/app/a/1 "}"#;
+        assert_eq!(
+            parse_verify_response(body)
+                .unwrap()
+                .dashboard_url
+                .as_deref(),
+            Some("http://localhost:5173/app/a/1")
+        );
+    }
+
+    #[test]
+    fn verify_rejects_a_body_that_is_not_json() {
+        assert!(parse_verify_response("<html>").is_err());
+    }
 
     fn command(command_id: u16, header: &[u8], data: &[u8]) -> GameCommand {
         GameCommand {
