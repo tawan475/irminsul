@@ -111,10 +111,18 @@ pub struct SavedAppState {
     pub minimize_to_tray: Option<bool>,
 }
 
-/// Where the tracker lives when nothing has been configured in the UI.
-const FALLBACK_TRACKER_URL: &str = "http://localhost:49000";
+/// Where the tracker lives when the build bakes in no `TRACKER_API_URL`: the
+/// hosted Genshin Data Tracker. Its Worker mounts the API under `/api`, so the
+/// endpoint paths are appended after that; without it the request reaches the
+/// single-page app, which answers every unknown path with HTML.
+const FALLBACK_TRACKER_URL: &str = "https://genshin-tracker.475.dev/api";
 
-/// Resolve the compile-time `TRACKER_API_URL` against the local default.
+/// The default before the hosted tracker existed: the self-hosted NestJS
+/// backend on its default port. `app.ron` files written by those builds hold
+/// it, and [`migrated_tracker_url`] moves them to the current default.
+const LEGACY_TRACKER_URL: &str = "http://localhost:49000";
+
+/// Resolve the compile-time `TRACKER_API_URL` against the hosted default.
 ///
 /// `option_env!` yields `Some("")` for a variable that is *set but empty*, so
 /// `unwrap_or` alone silently lost the fallback and left every request built
@@ -129,9 +137,46 @@ fn resolve_tracker_url(baked_in: Option<&str>) -> String {
         .to_string()
 }
 
-/// The tracker base URL baked in at compile time, or the local default.
+/// The tracker base URL baked in at compile time, or the hosted default.
 fn default_tracker_url() -> String {
     resolve_tracker_url(option_env!("TRACKER_API_URL"))
+}
+
+/// Whether `url` is [`LEGACY_TRACKER_URL`], give or take surrounding
+/// whitespace and trailing slashes.
+fn is_legacy_tracker_url(url: &str) -> bool {
+    url.trim().trim_end_matches('/') == LEGACY_TRACKER_URL
+}
+
+/// The URL a saved `tracker_api_url` should be replaced with on load, if any.
+///
+/// The saved value is persisted, so an install that never touched the field
+/// would otherwise keep the old local default forever. An empty value is
+/// repaired too: it makes every request a relative URL that reqwest refuses
+/// to send. Anything else was typed by the user and is kept.
+///
+/// There is no "already migrated" marker, so the legacy URL is moved on every
+/// load; pointing a hosted-default build at a local backend on that port means
+/// spelling it differently (`http://127.0.0.1:49000`). A build whose own
+/// default *is* the legacy URL (`TRACKER_API_URL=http://localhost:49000`)
+/// leaves it alone rather than "migrating" it to itself.
+fn migrated_tracker_url(saved: &str, default: &str) -> Option<String> {
+    let stale = saved.trim().is_empty()
+        || (is_legacy_tracker_url(saved) && !is_legacy_tracker_url(default));
+    (stale && saved != default).then(|| default.to_string())
+}
+
+impl SavedAppState {
+    /// Bring state loaded from an older `app.ron` up to date.
+    fn migrate(&mut self) {
+        if let Some(url) = migrated_tracker_url(&self.tracker_api_url, &default_tracker_url()) {
+            tracing::info!(
+                "Moving tracker API URL from {:?} to the default {url}",
+                self.tracker_api_url
+            );
+            self.tracker_api_url = url;
+        }
+    }
 }
 
 impl Default for SavedAppState {
@@ -585,11 +630,12 @@ impl IrminsulApp {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         egui_material_icons::initialize(&cc.egui_ctx);
 
-        let saved_state: SavedAppState = if let Some(storage) = cc.storage {
+        let mut saved_state: SavedAppState = if let Some(storage) = cc.storage {
             eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default()
         } else {
             Default::default()
         };
+        saved_state.migrate();
 
         tracing::info!("Tracker API URL: {}", saved_state.tracker_api_url);
 
@@ -2674,6 +2720,97 @@ mod tests {
         assert_eq!(resolve_tracker_url(Some("")), FALLBACK_TRACKER_URL);
         assert_eq!(resolve_tracker_url(Some("   ")), FALLBACK_TRACKER_URL);
         assert_eq!(resolve_tracker_url(Some("\n")), FALLBACK_TRACKER_URL);
+    }
+
+    #[test]
+    fn the_default_tracker_is_the_hosted_api() {
+        // The tracker Worker mounts its API under `/api`
+        // (genshin-data-tracker/apps/tracker/worker/index.ts `basePath`).
+        assert_eq!(FALLBACK_TRACKER_URL, "https://genshin-tracker.475.dev/api");
+        assert_eq!(resolve_tracker_url(None), FALLBACK_TRACKER_URL);
+    }
+
+    #[test]
+    fn a_saved_legacy_default_moves_to_the_current_default() {
+        for saved in [
+            "http://localhost:49000",
+            "http://localhost:49000/",
+            "http://localhost:49000//",
+            " http://localhost:49000/\n",
+        ] {
+            assert_eq!(
+                migrated_tracker_url(saved, FALLBACK_TRACKER_URL).as_deref(),
+                Some(FALLBACK_TRACKER_URL),
+                "{saved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_saved_tracker_url_is_repaired() {
+        for saved in ["", "   ", "\n"] {
+            assert_eq!(
+                migrated_tracker_url(saved, FALLBACK_TRACKER_URL).as_deref(),
+                Some(FALLBACK_TRACKER_URL),
+                "{saved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_customised_tracker_url_is_never_rewritten() {
+        for saved in [
+            FALLBACK_TRACKER_URL,
+            "https://gdt.example/api",
+            "http://127.0.0.1:49000",
+            "http://localhost:49001",
+            "http://localhost:49000/api",
+            "https://localhost:49000",
+        ] {
+            assert_eq!(
+                migrated_tracker_url(saved, FALLBACK_TRACKER_URL),
+                None,
+                "{saved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_build_that_bakes_in_the_legacy_url_keeps_it() {
+        // `TRACKER_API_URL=http://localhost:49000` makes the legacy URL the
+        // build's own default; there is nothing to move it to.
+        assert_eq!(
+            migrated_tracker_url("http://localhost:49000", LEGACY_TRACKER_URL),
+            None
+        );
+        assert_eq!(
+            migrated_tracker_url("http://localhost:49000/", LEGACY_TRACKER_URL),
+            None
+        );
+        // An empty value is still repaired.
+        assert_eq!(
+            migrated_tracker_url("", LEGACY_TRACKER_URL).as_deref(),
+            Some(LEGACY_TRACKER_URL)
+        );
+    }
+
+    #[test]
+    fn loading_state_saved_by_an_old_build_migrates_its_tracker_url() {
+        // Round-trip through serde so the test sees state the way `new` does.
+        // Compared against `default_tracker_url()`, not the constant, because
+        // CI may bake in `TRACKER_API_URL`.
+        let mut old = serde_json::to_value(SavedAppState::default()).unwrap();
+        old["tracker_api_url"] = "http://localhost:49000".into();
+        let mut state: SavedAppState = serde_json::from_value(old).unwrap();
+        state.migrate();
+        assert_eq!(state.tracker_api_url, default_tracker_url());
+
+        let mut custom = SavedAppState {
+            tracker_api_url: "https://gdt.example/api".to_string(),
+            ..Default::default()
+        };
+        custom.migrate();
+        assert_eq!(custom.tracker_api_url, "https://gdt.example/api");
     }
 
     #[test]

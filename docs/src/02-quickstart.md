@@ -92,20 +92,25 @@ Which data gets exported can be controlled by clicking on the settings icon.
 
 ## Upload to a Genshin Data Tracker
 
-This fork can also push a capture straight to a self-hosted Genshin Data Tracker
-account, from the "Tracker" section of the main window:
+This fork can also push a capture straight to a Genshin Data Tracker account,
+from the "Tracker" section of the main window. By default it talks to the hosted
+tracker at <https://genshin-tracker.475.dev>:
 
-1. In the tracker dashboard, generate an **Import Key** for the Genshin account you want to fill. It looks like `gdt_import_<account id>_<hex>`.
+1. In the tracker dashboard, generate an **Import Key** for the Genshin account you want to fill.
 2. In Irminsul, click the gear icon in the "Tracker" section, paste the key, and click "Save & Close". Irminsul verifies the key and shows the account name, UID and server it belongs to.
 3. With a capture completed, click the cloud upload icon to send the current data. Tick "Auto export to tracker" in the same section to upload every completed capture automatically.
 
 The same modal has a **Tracker API base URL** field, so a self-hosted tracker
-on another host or port needs no rebuild -- point it at your backend and click
-"Save & Close". The compile-time `TRACKER_API_URL` (default
-`http://localhost:49000`) only supplies the value a fresh install starts with;
-once you have edited or saved the field the stored URL wins, including after an
-update to a build with a different baked-in default. "Reset URL to default"
-puts the build's own value back.
+needs no rebuild -- point it at your backend's API base and click "Save &
+Close". The default is `https://genshin-tracker.475.dev/api`; note the `/api`,
+under which the tracker serves its API. The compile-time `TRACKER_API_URL`
+replaces that default for a build and only supplies the value a fresh install
+starts with; once you have edited or saved the field the stored URL wins,
+including after an update to a build with a different baked-in default. The
+exceptions are an empty field and the old default `http://localhost:49000`,
+which Irminsul resets to the build's default when it starts (to keep using a
+local backend on that port, enter it as `http://127.0.0.1:49000`). "Reset URL
+to default" puts the build's own value back.
 
 The key is stored with the rest of Irminsul's saved state on your machine and
 is sent only to the tracker it belongs to.

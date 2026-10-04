@@ -1779,5 +1779,10 @@ mod tests {
         assert_eq!(import_url("http://localhost:49000"), expected);
         assert_eq!(import_url("http://localhost:49000/"), expected);
         assert_eq!(import_url("http://localhost:49000///"), expected);
+
+        // A base with a path (the hosted tracker's `/api`) keeps it.
+        let expected = "https://genshin-tracker.475.dev/api/genshin-accounts-public/import-by-key";
+        assert_eq!(import_url("https://genshin-tracker.475.dev/api"), expected);
+        assert_eq!(import_url("https://genshin-tracker.475.dev/api/"), expected);
     }
 }
