@@ -24,6 +24,19 @@ This repository is a Cargo workspace:
 
 `python check.py` runs the same checks as CI for both.
 
+## Releasing
+
+Work happens on `develop` (the default branch); `main` only holds what has
+been released or is about to be. Both are protected: changes land through a
+pull request once CI is green. To publish, open a pull request from `develop`
+into `main`, merge it, then run the **Create Release** workflow on `main`
+(Actions → Create Release → Run workflow). There is nothing to type: `next_version.py` takes the
+base version from `Cargo.toml` and appends the next `-T-N` from the existing
+tags (`v0.2.2-T-2` → `v0.2.2-T-3`). To move to a new base, change
+`package.version` in `Cargo.toml` (e.g. to `0.2.3`) in a pull request; the next
+release is then `v0.2.3-T-1`. `Cargo.toml` keeps the bare base version on
+purpose: local builds count as stable and are never offered a `-T-N` update.
+
 ## Command line options
 
 Irminsul accepts a handful of command line options for advanced use cases:

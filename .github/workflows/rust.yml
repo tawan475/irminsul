@@ -1,10 +1,12 @@
 name: Rust
 
+# develop is the integration branch; main only receives develop when releasing.
+# Both are protected and require these checks, so both must trigger them.
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "develop"]
   pull_request:
-    branches: ["main"]
+    branches: ["main", "develop"]
 
 env:
   CARGO_TERM_COLOR: always
