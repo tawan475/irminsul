@@ -88,22 +88,10 @@ pub struct Good {
     /// Only characters with at least one known value appear.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gi_characters: Option<BTreeMap<String, GiCharacter>>,
-    /// How values that are still being verified were derived, so an export
-    /// file shows whether they work. Not data the tracker reads.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gi_debug: Option<GiDebug>,
-}
-
-/// `gi_debug`: the evidence behind derived values.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GiDebug {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub uid_check: Option<UidCheck>,
 }
 
 /// How `gi_player.uid` was read off the item guids (see
-/// `PlayerData::uid_check`): the top 32 bits of each non-zero item guid are
+/// `PlayerData::uid_check`; logged with every export, not exported): the top 32 bits of each non-zero item guid are
 /// counted, and the most common value is the UID when enough items agree.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -368,7 +356,6 @@ mod tests {
                     obtained_at: Some(1_646_092_800),
                 },
             )])),
-            gi_debug: None,
         };
 
         let json = serde_json::to_value(&good).expect("Good must serialize");
@@ -516,7 +503,6 @@ mod tests {
             gi_player: None,
             gi_achievement_times: None,
             gi_characters: None,
-            gi_debug: None,
         };
 
         let json = serde_json::to_value(&good).expect("Good must serialize");

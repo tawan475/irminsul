@@ -667,7 +667,7 @@ mod tests {
         replay.apply(KeyState::Session, vec![(1, inventory(222))], Some(data_ns));
 
         let good = replay.finish().unwrap();
-        let uid_check = good.gi_debug.unwrap().uid_check.unwrap();
+        let uid_check = replay.player_data.uid_check();
         assert_eq!(uid_check.uid, Some(222));
         assert_eq!(uid_check.total, 10, "not merged with the first account");
         assert_eq!(good.gi_player.unwrap().uid, Some(222));

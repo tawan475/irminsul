@@ -152,6 +152,19 @@ impl AppStateManager {
 /// Both upload paths run the same request; only the reporting differs, and
 /// keeping them in one function is what stops them drifting apart again (the
 /// repo's own `CLAUDE.md` calls the duplication out).
+/// Whether a capture from `source` may export automatically or upload.
+///
+/// Not when replaying a recording (`-r`): its data is old, and uploading it
+/// would file a stale snapshot under today's capture. `--replay-export` is the
+/// supported way to inspect a recording; it never reaches this code at all.
+fn uploads_allowed(source: &CaptureSource) -> bool {
+    !matches!(source, CaptureSource::File(_))
+}
+
+/// What `spawn_tracker_upload` answers instead of uploading during a replay.
+const REPLAY_UPLOAD_REFUSED: &str =
+    "Uploads are off while replaying a recording (-r); use --replay-export to inspect one";
+
 enum UploadReport {
     /// Answer the UI's oneshot. `app.rs` turns it into a toast and drops the
     /// verified state when it recognises a 401/403.
@@ -1495,6 +1508,9 @@ impl Monitor {
     }
 
     fn check_automation_trigger(&mut self) {
+        if !uploads_allowed(&self.capture_source) {
+            return;
+        }
         let saved_state = self.saved_state_rx.borrow().clone();
         let want_file = saved_state.save_result_to_file;
         // The same predicate the manual upload button uses. This used to omit
@@ -1663,9 +1679,15 @@ impl Monitor {
         let ctx = self.ctx.clone();
         let toast_tx = self.toast_tx.clone();
         let captured_at = self.capture_timestamp_ms;
+        let allowed = uploads_allowed(&self.capture_source);
 
         tokio::spawn(async move {
-            let result = upload_to_tracker(&client, &url, &key, json, captured_at).await;
+            let result = if allowed {
+                upload_to_tracker(&client, &url, &key, json, captured_at).await
+            } else {
+                tracing::warn!("{REPLAY_UPLOAD_REFUSED}");
+                Err(REPLAY_UPLOAD_REFUSED.to_string())
+            };
             match report {
                 UploadReport::Reply(reply_tx) => {
                     let _ = reply_tx.send(result);
@@ -1972,6 +1994,17 @@ pub(crate) fn load_keys() -> Result<HashMap<u16, Vec<u8>>> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn a_replayed_recording_never_uploads_or_auto_exports() {
+        assert!(!uploads_allowed(&CaptureSource::File(PathBuf::from(
+            "old.pcapng"
+        ))));
+        assert!(uploads_allowed(&CaptureSource::Device(None)));
+        assert!(uploads_allowed(&CaptureSource::Device(Some(
+            PathBuf::from("rec.pcap")
+        ))));
+    }
 
     #[test]
     fn verify_reads_the_hosted_trackers_answer_and_its_dashboard_link() {

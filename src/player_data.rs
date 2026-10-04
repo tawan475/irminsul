@@ -704,7 +704,7 @@ impl PlayerData {
     }
 
     /// How the account UID is read off the captured item guids, with the
-    /// evidence (exported as `gi_debug.uidCheck` so it can be checked).
+    /// evidence (logged with every export).
     ///
     /// Assumed, not documented: the game mints item guids as
     /// `(uid << 32) + counter` (Grasscutter's `Player::getNextGuid`;
@@ -951,11 +951,6 @@ impl PlayerData {
                 .filter(|times| !times.is_empty()),
             // Filled in with the characters below.
             gi_characters: None,
-            gi_debug: (uid_check.total > 0 || !uid_check.avatar_top_halves.is_empty()).then_some(
-                good::GiDebug {
-                    uid_check: Some(uid_check),
-                },
-            ),
         };
 
         if settings.include_characters {
@@ -2410,40 +2405,11 @@ mod tests {
         data
     }
 
-    /// The export without `gi_debug`, which is diagnostics, not data: it
-    /// appears whenever guids were captured and is checked on its own below.
     fn golden_json(data: &PlayerData) -> String {
         let mut report = ExportReport::default();
-        let mut good = data.build_good(&settings(), &mut report, GOLDEN_TIMESTAMP_MS);
-        assert!(report.is_empty(), "{}", report.summary());
-        good.gi_debug = None;
-        serde_json::to_string(&good).unwrap()
-    }
-
-    #[test]
-    fn gi_debug_shows_how_the_uid_was_read_and_comes_last() {
-        let data = golden_player_data(true);
-        let mut report = ExportReport::default();
         let good = data.build_good(&settings(), &mut report, GOLDEN_TIMESTAMP_MS);
-        let check = good
-            .gi_debug
-            .as_ref()
-            .and_then(|debug| debug.uid_check.as_ref());
-        let check = check.expect("guids were captured");
-        assert_eq!(
-            check.uid,
-            good.gi_player.as_ref().and_then(|player| player.uid)
-        );
-        assert_eq!(check.agreeing, check.total);
-        let json = serde_json::to_string(&good).unwrap();
-        let debug_at = json
-            .find(r#","gi_debug":{"uidCheck":{"#)
-            .expect("gi_debug serialized");
-        assert!(json[..debug_at].ends_with('}'));
-        assert!(
-            json.find(r#""gi_characters""#).unwrap() < debug_at,
-            "{json}"
-        );
+        assert!(report.is_empty(), "{}", report.summary());
+        serde_json::to_string(&good).unwrap()
     }
 
     /// The GOOD part of an export, byte for byte. A change here is a change to
@@ -2499,7 +2465,6 @@ mod tests {
         good.gi_player = None;
         good.gi_achievement_times = None;
         good.gi_characters = None;
-        good.gi_debug = None;
         let without = serde_json::to_string(&good).unwrap();
 
         let good_part = without.strip_suffix('}').unwrap();
