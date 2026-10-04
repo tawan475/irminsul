@@ -54,6 +54,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Write;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine;
@@ -65,7 +66,7 @@ use rsa::pkcs1::DecodeRsaPrivateKey;
 use tracing::{debug, info, info_span, instrument, trace, warn};
 
 use crate::Key::Dispatch;
-use crate::connection::parse_connection_packet;
+use crate::connection::parse_frame;
 use crate::crypto::{bruteforce, decrypt_command, guess, lookup_initial_key};
 use crate::r#gen::protos::{AvatarInfo, Item, PacketHead, PropValue, Unk, prop_value};
 use crate::kcp::{KcpSniffer, SegmentHead, segment_head};
@@ -443,6 +444,20 @@ pub enum Key {
     Session(Vec<u8>),
 }
 
+/// Which key a [`GameSniffer`] holds for the current connection, as reported
+/// by [`GameSniffer::key_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyState {
+    /// No key: nothing from the current connection has been decrypted.
+    None,
+    /// The baked-in dispatch key, which only covers the login exchange. Game
+    /// data needs the session key, so a connection that stays here is not
+    /// decoding anything useful.
+    Dispatch,
+    /// The session key recovered for this connection: game data decrypts.
+    Session,
+}
+
 /// Session seeds recovered from a `GetPlayerTokenRsp`, with the send time of the
 /// packet that carried them.
 ///
@@ -488,7 +503,7 @@ fn protocol_version(data: &[u8]) -> Option<u16> {
 }
 
 /// What the currently installed key can do with the message in hand.
-enum KeyState {
+enum KeyCheck {
     /// No key at all yet.
     Absent,
     /// The dispatch key decrypts this message.
@@ -571,6 +586,9 @@ pub struct GameSniffer {
     /// Conversations of connections that have ended, oldest first, at most
     /// [`MAX_RETIRED_CONVS`]. A lane is never opened for one of them.
     retired_convs: Vec<u32>,
+    /// The conversation last announced in the log, so each one is announced
+    /// once rather than once per direction.
+    announced_conv: Option<u32>,
     /// Times `reset_session` has run. Published by
     /// [`GameSniffer::session_generation`] so a consumer can latch on a reset
     /// this library actually concluded, rather than on a raw handshake datagram
@@ -635,6 +653,23 @@ impl GameSniffer {
             && !matches!(self.key, Some(Key::Session(_)))
     }
 
+    /// Which key is installed for the current connection.
+    ///
+    /// Only [`KeyState::Session`] means game data is decrypting: the first
+    /// login messages decrypt under the dispatch key alone, and a connection
+    /// whose session key was never recovered stays on it.
+    pub fn key_state(&self) -> KeyState {
+        match self.key {
+            None => KeyState::None,
+            Some(Dispatch(_)) => KeyState::Dispatch,
+            Some(Key::Session(_)) => KeyState::Session,
+        }
+    }
+
+    /// The KCP conversation `direction` is bound to, if any. Diagnostics: a
+    /// direction that stays unbound, or bound to a conversation the other
+    /// direction is not on, explains a capture that receives packets and
+    /// decodes nothing.
     pub fn bound_conversation(&self, direction: PacketDirection) -> Option<u32> {
         let lane = match direction {
             PacketDirection::Sent => &self.sent,
@@ -645,7 +680,7 @@ impl GameSniffer {
 
     #[instrument(skip_all, fields(len = bytes.len()))]
     pub fn receive_packet(&mut self, bytes: Vec<u8>) -> Option<GamePacket> {
-        let packet = parse_connection_packet(&PORTS, bytes)?;
+        let (packet, server) = parse_frame(&PORTS, bytes)?;
         match packet {
             ConnectionPacket::HandshakeRequested => {
                 // Any process able to put a 20-byte datagram on a game port
@@ -678,7 +713,7 @@ impl GameSniffer {
             }
 
             ConnectionPacket::SegmentData(direction, kcp_seg) => {
-                let commands = self.receive_kcp_segment(direction, &kcp_seg);
+                let commands = self.receive_kcp_segment(direction, &kcp_seg, server);
                 match commands {
                     Some(commands) => Some(GamePacket::Commands(commands)),
                     None => Some(GamePacket::Connection(ConnectionPacket::SegmentData(
@@ -750,10 +785,24 @@ impl GameSniffer {
             && !self.is_bound_anywhere(head.conv)
     }
 
+    /// Log a conversation the first time a lane binds to it. Both directions
+    /// share one, so this is once per connection.
+    fn announce_conversation(&mut self, conv: u32, server: Option<SocketAddr>) {
+        if self.announced_conv == Some(conv) {
+            return;
+        }
+        self.announced_conv = Some(conv);
+        match server {
+            Some(server) => info!(conv, %server, "new kcp conversation"),
+            None => info!(conv, "new kcp conversation"),
+        }
+    }
+
     fn receive_kcp_segment(
         &mut self,
         direction: PacketDirection,
         kcp_seg: &[u8],
+        server: Option<SocketAddr>,
     ) -> Option<Vec<GameCommand>> {
         let current_conv = self.bound_conversation(direction);
 
@@ -810,6 +859,7 @@ impl GameSniffer {
                      no sniffer",
                 );
             }
+            self.announce_conversation(head.conv, server);
             *self.lane(direction) = Lane {
                 kcp: Some(KcpSniffer::new(head.conv)),
                 ..Lane::default()
@@ -821,7 +871,7 @@ impl GameSniffer {
         if kcp.conv_id != head.conv {
             // Counted and logged (rate-limited) by the sniffer, then dropped.
             kcp.receive_segments(kcp_seg);
-            return Some(self.consider_switching(direction, head, kcp_seg));
+            return Some(self.consider_switching(direction, head, kcp_seg, server));
         }
 
         let messages = kcp.receive_segments(kcp_seg);
@@ -863,6 +913,7 @@ impl GameSniffer {
         direction: PacketDirection,
         head: SegmentHead,
         datagram: &[u8],
+        server: Option<SocketAddr>,
     ) -> Vec<GameCommand> {
         let retired = self.retired_convs.contains(&head.conv);
         let lane = self.lane(direction);
@@ -908,6 +959,8 @@ impl GameSniffer {
             "this direction's conversation never decoded anything while another kept arriving \
              from its start; switching to it"
         );
+        self.announce_conversation(candidate.conv, server);
+        let lane = self.lane(direction);
         let mut kcp = KcpSniffer::new(candidate.conv);
         let messages: Vec<Vec<u8>> = candidate
             .datagrams
@@ -981,27 +1034,27 @@ impl GameSniffer {
     /// dropped.
     fn ensure_key(&mut self, data: &[u8]) -> bool {
         let state = match &self.key {
-            None => KeyState::Absent,
+            None => KeyCheck::Absent,
             Some(Dispatch(key)) => {
                 if magic_matches(key, data) {
-                    KeyState::DispatchOk
+                    KeyCheck::DispatchOk
                 } else {
-                    KeyState::DispatchStale
+                    KeyCheck::DispatchStale
                 }
             }
             Some(Key::Session(key)) => {
                 if magic_matches(key, data) {
-                    KeyState::SessionOk
+                    KeyCheck::SessionOk
                 } else {
-                    KeyState::SessionStale
+                    KeyCheck::SessionStale
                 }
             }
         };
 
         match state {
-            KeyState::Absent => self.install_dispatch_key(data),
-            KeyState::DispatchOk => true,
-            KeyState::SessionOk => {
+            KeyCheck::Absent => self.install_dispatch_key(data),
+            KeyCheck::DispatchOk => true,
+            KeyCheck::SessionOk => {
                 self.session_failures = 0;
                 self.session_rederive_exhausted = false;
                 // Once the session this key belongs to has *kept* decrypting,
@@ -1021,11 +1074,11 @@ impl GameSniffer {
                 }
                 true
             }
-            KeyState::DispatchStale => {
+            KeyCheck::DispatchStale => {
                 debug!("dispatch key no longer decrypts; looking for the session key");
                 self.recover_session_key(data)
             }
-            KeyState::SessionStale => self.handle_session_key_reject(data),
+            KeyCheck::SessionStale => self.handle_session_key_reject(data),
         }
     }
 
@@ -2564,6 +2617,63 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), sniffer.time_anchors.len(), "no duplicates");
+    }
+
+    // -- state reported to the caller ---------------------------------------------
+
+    #[test]
+    fn the_key_state_follows_the_login() {
+        let mut sniffer = connected_sniffer();
+        assert_eq!(sniffer.key_state(), KeyState::None);
+
+        let mut conn = Conn::new(122_486);
+        sniffer.receive_packet(handshake_frame());
+        let combined = 0x1111_2222_3333_4444;
+        token_exchange(
+            &mut sniffer,
+            &mut conn,
+            LOGIN_MS,
+            client_draw(LOGIN_MS, 0) ^ combined,
+        );
+        assert_eq!(sniffer.key_state(), KeyState::Dispatch);
+
+        command_ids(
+            &mut sniffer,
+            conn.server_message(&new_key_from_seed(combined), SESSION_MESSAGE),
+        );
+        assert_eq!(sniffer.key_state(), KeyState::Session);
+
+        // A reconnect starts over.
+        let mut next = Conn::new(122_628);
+        sniffer.receive_packet(handshake_frame());
+        token_exchange(&mut sniffer, &mut next, LOGIN_MS + HOUR_MS, 0x77);
+        assert_eq!(sniffer.key_state(), KeyState::Dispatch);
+    }
+
+    #[test]
+    fn each_new_conversation_is_logged_once_with_its_server() {
+        let mut sniffer = connected_sniffer();
+        let mut conn = Conn::new(122_486);
+        let lines = crate::test_support::logged(tracing::Level::INFO, || {
+            log_in(
+                &mut sniffer,
+                &mut conn,
+                LOGIN_MS,
+                client_draw(LOGIN_MS, 0),
+                0x1111,
+            );
+            // More traffic in both directions is not news.
+            let key = new_key_from_seed(0x1111);
+            command_ids(&mut sniffer, conn.server_message(&key, 1));
+        });
+
+        let announced: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("new kcp conversation"))
+            .collect();
+        assert_eq!(announced.len(), 1, "{lines:#?}");
+        assert!(announced[0].contains("122486"), "{announced:?}");
+        assert!(announced[0].contains(":22102"), "{announced:?}");
     }
 
     // -- conversation binding ----------------------------------------------------

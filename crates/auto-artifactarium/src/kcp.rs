@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use kcp::{KCP_OVERHEAD, Kcp, get_conv};
-use tracing::{Level, info, instrument, span, trace, warn};
+use tracing::{Level, debug, instrument, span, trace, warn};
 
 use crate::bytes_as_hex;
 
@@ -91,7 +91,8 @@ pub(crate) fn segment_head(datagram: &[u8]) -> Option<SegmentHead> {
 impl KcpSniffer {
     #[instrument]
     pub(crate) fn new(conv_id: u32) -> Self {
-        info!("new connection, created new kcp instance");
+        // `GameSniffer` announces each conversation once, with its server.
+        debug!("created a kcp instance");
 
         KcpSniffer {
             conv_id,
