@@ -160,6 +160,16 @@ const RECONNECT_SEED_DEPTH: i32 = 10_000;
 /// tiny cost to search.
 const MAX_RETIRED_CONVS: usize = 8;
 
+/// Datagrams of another conversation, counted from its first segment, that
+/// switch a lane whose own conversation has decoded nothing.
+///
+/// Every one of them is kept and replayed into the new sniffer, so the count
+/// only decides how sure the switch is, never what it costs in data. A login
+/// sends far more than this within a second in each direction (the client
+/// acknowledges every push), while a stray datagram or two cannot reach it.
+/// Memory is bounded by this many datagrams per lane.
+const REBIND_AFTER: usize = 32;
+
 /// Entries a store notify needs before it is believed.
 ///
 /// Mirrors the floor already applied inside `matches_items_all_data_notify`; it
@@ -480,10 +490,33 @@ enum KeyState {
     SessionStale,
 }
 
+/// One direction of the game connection.
+#[derive(Default)]
+struct Lane {
+    kcp: Option<KcpSniffer>,
+    /// The bound conversation has decoded into at least one command, so it is
+    /// the real one in this direction and can never be switched away from.
+    ///
+    /// Decoded commands rather than delivered KCP messages: an empty push
+    /// "delivers" a zero-length message, and a stray one is exactly what can
+    /// put a lane on the wrong conversation.
+    proven: bool,
+    /// Datagrams of another conversation that arrived, from its first segment
+    /// on, while this lane's own conversation had decoded nothing. Kept so
+    /// the lane can switch to it without losing a message. See
+    /// [`GameSniffer::consider_switching`].
+    candidate: Option<Candidate>,
+}
+
+struct Candidate {
+    conv: u32,
+    datagrams: Vec<Vec<u8>>,
+}
+
 #[derive(Default)]
 pub struct GameSniffer {
-    sent_kcp: Option<KcpSniffer>,
-    recv_kcp: Option<KcpSniffer>,
+    sent: Lane,
+    recv: Lane,
     /// The send time that produced the live session key. Named for what it holds
     /// -- it is a timestamp, not a seed the client chose.
     ///
@@ -587,11 +620,11 @@ impl GameSniffer {
     }
 
     pub fn bound_conversation(&self, direction: PacketDirection) -> Option<u32> {
-        match direction {
-            PacketDirection::Sent => self.sent_kcp.as_ref(),
-            PacketDirection::Received => self.recv_kcp.as_ref(),
-        }
-        .map(|kcp| kcp.conv_id)
+        let lane = match direction {
+            PacketDirection::Sent => &self.sent,
+            PacketDirection::Received => &self.recv,
+        };
+        lane.kcp.as_ref().map(|kcp| kcp.conv_id)
     }
 
     #[instrument(skip_all, fields(len = bytes.len()))]
@@ -649,8 +682,9 @@ impl GameSniffer {
         // The ended connection's conversation may still have segments in
         // flight; none of them may open a lane for the next one.
         for direction in [PacketDirection::Sent, PacketDirection::Received] {
-            if let Some(conv) = self.lane(direction).take().map(|kcp| kcp.conv_id) {
-                self.retire_conversation(conv);
+            let lane = std::mem::take(self.lane(direction));
+            if let Some(kcp) = lane.kcp {
+                self.retire_conversation(kcp.conv_id);
             }
         }
         self.key = None;
@@ -676,10 +710,10 @@ impl GameSniffer {
         }
     }
 
-    fn lane(&mut self, direction: PacketDirection) -> &mut Option<KcpSniffer> {
+    fn lane(&mut self, direction: PacketDirection) -> &mut Lane {
         match direction {
-            PacketDirection::Sent => &mut self.sent_kcp,
-            PacketDirection::Received => &mut self.recv_kcp,
+            PacketDirection::Sent => &mut self.sent,
+            PacketDirection::Received => &mut self.recv,
         }
     }
 
@@ -721,7 +755,7 @@ impl GameSniffer {
             self.reset_session("handshake request confirmed by a new kcp conversation");
         }
 
-        if self.lane(direction).is_none() {
+        if self.lane(direction).kcp.is_none() {
             // A conversation of a connection that already ended. The late
             // segment that bound one at 06:59 on 2026-10-04 left its lane
             // rejecting the live conversation until irminsul was closed.
@@ -757,16 +791,122 @@ impl GameSniffer {
                      no sniffer",
                 );
             }
-            *self.lane(direction) = Some(KcpSniffer::new(head.conv));
+            *self.lane(direction) = Lane {
+                kcp: Some(KcpSniffer::new(head.conv)),
+                ..Lane::default()
+            };
         }
 
-        let segments = self.lane(direction).as_mut()?.receive_segments(kcp_seg);
-        Some(
-            segments
-                .into_iter()
-                .flat_map(|data| self.receive_commands(data))
-                .collect(),
-        )
+        let lane = self.lane(direction);
+        let kcp = lane.kcp.as_mut()?;
+        if kcp.conv_id != head.conv {
+            // Counted and logged (rate-limited) by the sniffer, then dropped.
+            kcp.receive_segments(kcp_seg);
+            return Some(self.consider_switching(direction, head, kcp_seg));
+        }
+
+        let messages = kcp.receive_segments(kcp_seg);
+        let commands: Vec<GameCommand> = messages
+            .into_iter()
+            .flat_map(|data| self.receive_commands(data))
+            .collect();
+        self.note_lane_decoded(direction, &commands);
+        Some(commands)
+    }
+
+    /// The bound conversation of `direction` produced `commands`. If any, it
+    /// is the real one, so nothing may take its place.
+    fn note_lane_decoded(&mut self, direction: PacketDirection, commands: &[GameCommand]) {
+        if !commands.is_empty() {
+            let lane = self.lane(direction);
+            lane.proven = true;
+            lane.candidate = None;
+        }
+    }
+
+    /// A segment of another conversation reached a bound lane: switch the lane
+    /// to that conversation if its own has never decoded anything and the
+    /// other one keeps arriving from its start.
+    ///
+    /// This is the way out of a lane that was bound to the wrong conversation
+    /// -- a straggler the retired list did not know about, a stray datagram --
+    /// which otherwise rejects the live conversation for as long as the
+    /// process runs. The other conversation's datagrams are kept from its
+    /// first segment and replayed into the new sniffer, so switching loses
+    /// nothing.
+    ///
+    /// A lane whose conversation has decoded even one command is the real
+    /// session and is never switched: no burst of datagrams on another
+    /// conversation, forged or not, can take it over. A reconnect replaces
+    /// that lane through the deferred reset instead.
+    fn consider_switching(
+        &mut self,
+        direction: PacketDirection,
+        head: SegmentHead,
+        datagram: &[u8],
+    ) -> Vec<GameCommand> {
+        let retired = self.retired_convs.contains(&head.conv);
+        let lane = self.lane(direction);
+        let Some(bound) = lane.kcp.as_ref() else {
+            return Vec::new();
+        };
+        if lane.proven || retired {
+            return Vec::new();
+        }
+        let from = bound.conv_id;
+
+        if let Some(candidate) = lane
+            .candidate
+            .as_mut()
+            .filter(|candidate| candidate.conv == head.conv)
+        {
+            candidate.datagrams.push(datagram.to_vec());
+        } else if head.could_open_conversation() {
+            lane.candidate = Some(Candidate {
+                conv: head.conv,
+                datagrams: vec![datagram.to_vec()],
+            });
+        } else {
+            return Vec::new();
+        }
+
+        if lane
+            .candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.datagrams.len() < REBIND_AFTER)
+        {
+            return Vec::new();
+        }
+        let Some(candidate) = lane.candidate.take() else {
+            return Vec::new();
+        };
+
+        info!(
+            ?direction,
+            from,
+            to = candidate.conv,
+            datagrams = candidate.datagrams.len(),
+            "this direction's conversation never decoded anything while another kept arriving \
+             from its start; switching to it"
+        );
+        let mut kcp = KcpSniffer::new(candidate.conv);
+        let messages: Vec<Vec<u8>> = candidate
+            .datagrams
+            .iter()
+            .flat_map(|datagram| kcp.receive_segments(datagram))
+            .collect();
+        *lane = Lane {
+            kcp: Some(kcp),
+            ..Lane::default()
+        };
+        self.retire_conversation(from);
+
+        let commands: Vec<GameCommand> = messages
+            .into_iter()
+            .flat_map(|data| self.receive_commands(data))
+            .collect();
+        self.note_lane_decoded(direction, &commands);
+        commands
     }
 
     /// Decrypt one KCP message and parse every command it carries.
@@ -2571,6 +2711,103 @@ mod tests {
     }
 
     #[test]
+    fn a_lane_stuck_on_a_silent_conversation_switches_to_the_live_one() {
+        // Whatever else guards the binding, a lane can still end up on a
+        // conversation that will never deliver (here: a stray segment before
+        // anything was retired). The live conversation then keeps arriving
+        // while the bound one stays silent; switching to it -- and replaying
+        // what it sent meanwhile -- must lose nothing and duplicate nothing.
+        let mut sniffer = connected_sniffer();
+        sniffer.receive_packet(segment_frame_at(PacketDirection::Received, 555, 0, 0, &[]));
+        assert_eq!(
+            sniffer.bound_conversation(PacketDirection::Received),
+            Some(555)
+        );
+
+        let dispatch = dispatch_key();
+        let mut live = Conn::new(123_582);
+        let request = command_bytes(TOKEN_REQ, &[], &field_varint(1, 1));
+        assert_eq!(
+            command_ids(
+                &mut sniffer,
+                live.push(PacketDirection::Sent, &dispatch, &request)
+            ),
+            vec![TOKEN_REQ]
+        );
+
+        let mut decoded = Vec::new();
+        let messages: Vec<u16> = (1..=REBIND_AFTER as u16 + 8).collect();
+        for &id in &messages {
+            decoded.extend(command_ids(
+                &mut sniffer,
+                live.server_message(&dispatch, id),
+            ));
+        }
+
+        assert_eq!(decoded, messages, "every message once, in order");
+        assert_eq!(
+            sniffer.bound_conversation(PacketDirection::Received),
+            Some(123_582)
+        );
+        assert_eq!(sniffer.session_generation(), 0, "a lane switch is no reset");
+    }
+
+    #[test]
+    fn a_delivering_lane_is_never_taken_over() {
+        // The switch above is for a lane whose conversation has decoded
+        // nothing. One that has is the real session, and no burst of datagrams
+        // on another conversation -- forged or not -- may displace it.
+        let mut sniffer = connected_sniffer();
+        let mut conn = Conn::new(122_486);
+        let combined = 0x1111_2222_3333_4444;
+        log_in(
+            &mut sniffer,
+            &mut conn,
+            LOGIN_MS,
+            client_draw(LOGIN_MS, 0),
+            combined,
+        );
+        let generation = sniffer.session_generation();
+
+        let mut intruder = Conn::new(9_999);
+        for id in 0..REBIND_AFTER as u16 * 4 {
+            sniffer.receive_packet(intruder.server_message(&dispatch_key(), id));
+        }
+
+        assert_eq!(
+            sniffer.bound_conversation(PacketDirection::Received),
+            Some(conn.conv)
+        );
+        assert_eq!(sniffer.session_generation(), generation);
+        let key = new_key_from_seed(combined);
+        assert_eq!(
+            command_ids(&mut sniffer, conn.server_message(&key, 77)),
+            vec![77]
+        );
+    }
+
+    #[test]
+    fn a_switch_needs_the_other_conversation_from_its_start() {
+        // Datagrams from the middle of a conversation cannot be replayed into
+        // anything that delivers, so they never start the count.
+        let mut sniffer = connected_sniffer();
+        sniffer.receive_packet(segment_frame_at(PacketDirection::Received, 555, 0, 0, &[]));
+        for sn in 0..REBIND_AFTER as u32 * 2 {
+            sniffer.receive_packet(segment_frame_at(
+                PacketDirection::Received,
+                777,
+                5_000 + sn,
+                5_000,
+                &[0u8; 40],
+            ));
+        }
+        assert_eq!(
+            sniffer.bound_conversation(PacketDirection::Received),
+            Some(555)
+        );
+    }
+
+    #[test]
     fn giving_up_on_a_connections_key_is_said_once_and_reported() {
         // After the budget is spent every further message of the connection is
         // dropped at debug level, which is how 1h44m of nothing decoding left
@@ -2703,7 +2940,7 @@ mod tests {
         assert_eq!(sniffer.time_anchors, vec![1]);
         assert_eq!(sniffer.session_generation(), 1);
         assert!(
-            sniffer.recv_kcp.as_ref().map(|kcp| kcp.conv_id) == Some(7),
+            sniffer.bound_conversation(PacketDirection::Received) == Some(7),
             "the new conversation's sniffer must survive the reset it triggered"
         );
     }
