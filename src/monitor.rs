@@ -9,7 +9,7 @@ use anime_game_data::AnimeGameData;
 use anyhow::{Context, Result, anyhow};
 use auto_artifactarium::{
     CommandMatch, ConnectionPacket, GameCommand, GamePacket, GameSniffer, KeyState,
-    classify_command,
+    PacketDirection, classify_command,
 };
 use base64::prelude::*;
 use chrono::prelude::*;
@@ -270,6 +270,81 @@ impl DataReplacement {
     }
 }
 
+/// How often the sniffer thread logs what it has been doing.
+const STATS_INTERVAL: Duration = Duration::from_secs(60);
+
+/// What the sniffer thread did, for one INFO line a minute.
+///
+/// The log of 2026-10-04 had nothing to show for the hour and three quarters
+/// in which nothing decoded: no line said frames were still arriving, that
+/// the key was missing, or which conversation each direction was stuck on.
+/// This is that line.
+#[derive(Debug, Default)]
+struct SnifferStats {
+    /// Frames this interval.
+    frames: u64,
+    /// Frames the interval before, so going quiet is reported once.
+    previous_frames: u64,
+    /// Deepest the queue to this thread got this interval.
+    max_queue: usize,
+    /// Commands decoded since the last session reset.
+    commands_since_reset: u64,
+    /// When commands last decoded.
+    last_decode: Option<Instant>,
+    /// The process-wide duplicate count at the last report.
+    duplicates_reported: u64,
+}
+
+/// One stats line.
+#[derive(Debug)]
+struct StatsLine {
+    frames: u64,
+    duplicates: u64,
+    max_queue: usize,
+    commands_since_reset: u64,
+    last_decode_age: Option<Duration>,
+}
+
+impl SnifferStats {
+    /// A frame was taken off the queue, which then held `queued` (this one
+    /// included).
+    fn note_frame(&mut self, queued: usize) {
+        self.frames += 1;
+        self.max_queue = self.max_queue.max(queued);
+    }
+
+    fn note_commands(&mut self, count: usize, now: Instant) {
+        if count > 0 {
+            self.commands_since_reset += count as u64;
+            self.last_decode = Some(now);
+        }
+    }
+
+    fn note_reset(&mut self) {
+        self.commands_since_reset = 0;
+    }
+
+    /// The line for the interval ending `now`, given the process-wide count of
+    /// dropped duplicates. `None` while capture is idle: a line is due when
+    /// frames arrived this interval, or the interval before (so the drop to
+    /// zero is reported once).
+    fn report(&mut self, duplicates_total: u64, now: Instant) -> Option<StatsLine> {
+        let due = self.frames > 0 || self.previous_frames > 0;
+        let line = due.then(|| StatsLine {
+            frames: self.frames,
+            duplicates: duplicates_total.saturating_sub(self.duplicates_reported),
+            max_queue: self.max_queue,
+            commands_since_reset: self.commands_since_reset,
+            last_decode_age: self.last_decode.map(|at| now.saturating_duration_since(at)),
+        });
+        self.previous_frames = self.frames;
+        self.frames = 0;
+        self.max_queue = 0;
+        self.duplicates_reported = duplicates_total;
+        line
+    }
+}
+
 /// Move packet decoding off the monitor's `select!` loop.
 ///
 /// Recovering a session key can take seconds -- it is a search over candidate
@@ -290,13 +365,50 @@ fn spawn_sniffer_thread(
         .name("irminsul-sniffer".to_string())
         .spawn(move || {
             let mut last_generation = sniffer.session_generation();
-            // Ends when the monitor drops its sender, i.e. when the app exits.
-            while let Ok(packet) = packet_rx.recv() {
-                let delivered =
-                    decode_one_packet(&mut sniffer, &mut last_generation, packet, &decoded_tx);
-                thread_queued.fetch_sub(1, Ordering::Relaxed);
-                if !delivered {
-                    break;
+            let mut stats = SnifferStats::default();
+            let mut next_report = Instant::now() + STATS_INTERVAL;
+            loop {
+                // Woken at least once per interval, so the stats line keeps its
+                // schedule when no packet arrives.
+                let wait = next_report.saturating_duration_since(Instant::now());
+                match packet_rx.recv_timeout(wait) {
+                    Ok(packet) => {
+                        stats.note_frame(thread_queued.load(Ordering::Relaxed));
+                        let delivered = decode_one_packet(
+                            &mut sniffer,
+                            &mut last_generation,
+                            packet,
+                            &decoded_tx,
+                            &mut stats,
+                        );
+                        thread_queued.fetch_sub(1, Ordering::Relaxed);
+                        if !delivered {
+                            break;
+                        }
+                    }
+                    Err(blocking_mpsc::RecvTimeoutError::Timeout) => {}
+                    // The monitor dropped its sender, i.e. the app is exiting.
+                    Err(blocking_mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+
+                let now = Instant::now();
+                if now >= next_report {
+                    next_report = now + STATS_INTERVAL;
+                    let duplicates = capture::DUPLICATES_DROPPED.load(Ordering::Relaxed);
+                    if let Some(line) = stats.report(duplicates, now) {
+                        tracing::info!(
+                            frames = line.frames,
+                            duplicates_dropped = line.duplicates,
+                            max_queue = line.max_queue,
+                            commands_since_reset = line.commands_since_reset,
+                            key = ?sniffer.key_state(),
+                            key_given_up = sniffer.key_recovery_failed(),
+                            sent_conv = ?sniffer.bound_conversation(PacketDirection::Sent),
+                            recv_conv = ?sniffer.bound_conversation(PacketDirection::Received),
+                            last_decode_secs = ?line.last_decode_age.map(|age| age.as_secs()),
+                            "capture stats (last minute)"
+                        );
+                    }
                 }
             }
             tracing::info!("sniffer thread exiting");
@@ -328,15 +440,21 @@ fn decode_one_packet(
     last_generation: &mut u64,
     packet: Vec<u8>,
     decoded_tx: &mpsc::UnboundedSender<SnifferEvent>,
+    stats: &mut SnifferStats,
 ) -> bool {
     let decoded = sniffer.receive_packet(packet);
 
     let generation = sniffer.session_generation();
     if generation != *last_generation {
         *last_generation = generation;
+        stats.note_reset();
         if decoded_tx.send(SnifferEvent::SessionReset).is_err() {
             return false;
         }
+    }
+
+    if let Some(GamePacket::Commands(commands)) = &decoded {
+        stats.note_commands(commands.len(), Instant::now());
     }
 
     match decoded {
@@ -1798,7 +1916,8 @@ mod tests {
             &mut sniffer,
             &mut generation,
             handshake_frame(),
-            &tx
+            &tx,
+            &mut SnifferStats::default()
         ));
 
         assert!(matches!(rx.try_recv(), Ok(SnifferEvent::SessionReset)));
@@ -1816,7 +1935,8 @@ mod tests {
             &mut sniffer,
             &mut generation,
             segment_frame(7, &[0u8; 40]),
-            &tx
+            &tx,
+            &mut SnifferStats::default()
         ));
         assert!(matches!(rx.try_recv(), Ok(SnifferEvent::Packet(..))));
         assert!(
@@ -1844,7 +1964,8 @@ mod tests {
                 &mut sniffer,
                 &mut generation,
                 connection_frame(code),
-                &tx
+                &tx,
+                &mut SnifferStats::default()
             ));
             assert!(matches!(
                 rx.try_recv(),
@@ -1868,11 +1989,71 @@ mod tests {
             &mut sniffer,
             &mut generation,
             segment_frame(7, &[0u8; 40]),
-            &tx
+            &tx,
+            &mut SnifferStats::default()
         ));
 
         assert!(matches!(rx.try_recv(), Ok(SnifferEvent::Packet(..))));
         assert!(rx.try_recv().is_err());
+    }
+
+    // -- the sniffer's stats line ----------------------------------------------
+
+    #[test]
+    fn an_idle_sniffer_reports_nothing() {
+        let mut stats = SnifferStats::default();
+        assert!(stats.report(0, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn a_report_covers_its_own_interval() {
+        let mut stats = SnifferStats::default();
+        let start = Instant::now();
+        for queued in [1, 5, 3] {
+            stats.note_frame(queued);
+        }
+        stats.note_commands(4, start);
+        stats.note_commands(0, start);
+
+        let line = stats.report(80, start).expect("frames arrived");
+        assert_eq!(line.frames, 3);
+        assert_eq!(line.duplicates, 80);
+        assert_eq!(line.max_queue, 5);
+        assert_eq!(line.commands_since_reset, 4);
+        assert_eq!(line.last_decode_age, Some(Duration::ZERO));
+
+        // The next interval counts afresh, except what spans intervals.
+        stats.note_frame(1);
+        let later = start + Duration::from_secs(60);
+        let line = stats.report(100, later).expect("a frame arrived");
+        assert_eq!(line.frames, 1);
+        assert_eq!(line.duplicates, 20, "a delta, not the running total");
+        assert_eq!(line.max_queue, 1);
+        assert_eq!(line.commands_since_reset, 4);
+        assert_eq!(line.last_decode_age, Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn capture_going_quiet_is_reported_once() {
+        let mut stats = SnifferStats::default();
+        let now = Instant::now();
+        stats.note_frame(1);
+        assert!(stats.report(0, now).is_some());
+
+        let quiet = stats.report(0, now).expect("the drop to zero is news");
+        assert_eq!(quiet.frames, 0);
+        assert!(stats.report(0, now).is_none(), "and then it stays quiet");
+    }
+
+    #[test]
+    fn a_reset_restarts_the_command_count() {
+        let mut stats = SnifferStats::default();
+        let now = Instant::now();
+        stats.note_frame(1);
+        stats.note_commands(7, now);
+        stats.note_reset();
+        stats.note_commands(2, now);
+        assert_eq!(stats.report(0, now).unwrap().commands_since_reset, 2);
     }
 
     // -- keeping the last good data across a reset -----------------------------
