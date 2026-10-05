@@ -498,6 +498,9 @@ pub struct IrminsulApp {
     /// "Start Irminsul on startup": the scheduled task's state, read in the
     /// background, and the warning when it starts another copy.
     startup: Startup,
+
+    /// The window background, uploaded once; see [`load_background`].
+    background: Option<egui::TextureHandle>,
 }
 
 trait ToastError<T> {
@@ -526,6 +529,106 @@ fn load_tray_icon() -> Option<tray_icon::Icon> {
     let rgba = icon_data.into_rgba8();
     let (width, height) = rgba.dimensions();
     tray_icon::Icon::from_rgba(rgba.into_raw(), width, height).ok()
+}
+
+const BACKGROUND_WEBP: &[u8] = include_bytes!("../assets/background.webp");
+
+/// Upload the window background as a texture, once.
+///
+/// It used to go through `egui::include_image!` and the installed image
+/// loaders, which keep the decoded 1600x1000 image (6 MB) in their cache for
+/// the life of the process, next to the texture made from it. A texture
+/// keeps no copy on the CPU side. The decode is the loaders' own, so the
+/// pixels are the same.
+fn load_background(ctx: &Context) -> Option<egui::TextureHandle> {
+    match egui_extras::image::load_image_bytes(BACKGROUND_WEBP) {
+        Ok(image) => Some(ctx.load_texture("background", image, egui::TextureOptions::LINEAR)),
+        Err(e) => {
+            tracing::warn!("could not decode the background image: {e}");
+            None
+        }
+    }
+}
+
+/// How long after the window is hidden or minimized its memory is handed back:
+/// long enough for the frame that hid it to have been drawn.
+#[cfg(windows)]
+const RELEASE_HIDDEN_MEMORY_DELAY: Duration = Duration::from_secs(2);
+
+/// Hand back the RAM a window that is out of sight was holding.
+///
+/// Most of a visible Irminsul's memory belongs to the graphics driver (on an
+/// NVIDIA card its OpenGL context alone is over 100 MB, kept until the process
+/// exits) and to egui, and none of it is touched while the window is in the
+/// tray or minimized, because nothing is drawn. Windows takes such pages back
+/// only once it runs short, so until then they count against a machine that is
+/// also running the game. Trimming the working set returns them at once; the
+/// capture and decoding keep the few MB they use, and the rest is read back in
+/// (from RAM, if nothing has claimed it yet) when the window is shown again.
+///
+/// Skipped if the window is back on screen by the time the delay is up.
+#[cfg(windows)]
+fn release_memory_once_hidden() {
+    let spawned = thread::Builder::new()
+        .name("release-hidden-memory".into())
+        .spawn(|| {
+            thread::sleep(RELEASE_HIDDEN_MEMORY_DELAY);
+            if !window_out_of_sight() {
+                return;
+            }
+            match trim_working_set() {
+                Ok(()) => tracing::info!("window hidden: released its memory"),
+                Err(e) => tracing::warn!("could not release the hidden window's memory: {e}"),
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("could not start the thread that releases hidden memory: {e}");
+    }
+}
+
+/// Remove as many pages as possible from this process's working set.
+#[cfg(windows)]
+fn trim_working_set() -> windows::core::Result<()> {
+    use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
+
+    // (SIZE_T)-1 for both bounds is the documented "trim it" request; it sets
+    // no limit on how far the working set may grow again.
+    unsafe { SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX) }
+}
+
+/// Whether Irminsul's window is hidden or minimized. `false` when it cannot
+/// be found, so nothing is released on a guess.
+///
+/// Only a window of this process counts: any other top-level window can be
+/// titled "Irminsul" too, an Explorer window on a folder of that name for one.
+#[cfg(windows)]
+fn window_out_of_sight() -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowExW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    };
+    use windows::core::PCWSTR;
+
+    let title: Vec<u16> = std::ffi::OsStr::new("Irminsul")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut after = None;
+    unsafe {
+        while let Ok(hwnd) = FindWindowExW(None, after, PCWSTR::null(), PCWSTR(title.as_ptr()))
+            && !hwnd.0.is_null()
+        {
+            let mut pid = 0;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid == std::process::id() {
+                return !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool();
+            }
+            after = Some(hwnd);
+        }
+    }
+    false
 }
 
 /// Bring a window hidden to the tray back.
@@ -857,6 +960,7 @@ impl IrminsulApp {
             minimize_modal_remember: true,
             app_settings_open: false,
             startup,
+            background: load_background(&cc.egui_ctx),
             monitor_cancel_token: cancel_token,
             monitor_handle: Some(monitor_handle),
             install_lock,
@@ -1008,8 +1112,9 @@ impl eframe::App for IrminsulApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                egui::Image::new(egui::include_image!("../assets/background.webp"))
-                    .paint_at(ui, ui.ctx().screen_rect());
+                if let Some(background) = &self.background {
+                    egui::Image::from_texture(background).paint_at(ui, ui.ctx().screen_rect());
+                }
             });
 
             ui.vertical(|ui| {
@@ -1210,6 +1315,9 @@ impl IrminsulApp {
     /// quit, and "Remember my choice" puts the next launch one click from the
     /// same trap.
     fn minimize(&self, ctx: &Context, to_tray: bool) {
+        #[cfg(windows)]
+        release_memory_once_hidden();
+
         if to_tray && self.tray_menu_ready.load(Ordering::Relaxed) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             return;
@@ -2717,6 +2825,37 @@ mod tests {
             "the monitor is joined with a deadline while it may still be spending the \
              capture teardown budget, so the outer one has to be strictly larger"
         );
+    }
+
+    /// The background is decoded by hand at startup, where a broken asset
+    /// would only show as a missing background and a log line; and `main.rs`
+    /// sizes the window from it.
+    #[test]
+    fn the_background_decodes_at_the_size_the_window_is_built_around() {
+        let image = egui_extras::image::load_image_bytes(BACKGROUND_WEBP).unwrap();
+        assert_eq!(image.size, [1600, 1000]);
+    }
+
+    #[test]
+    fn the_background_becomes_a_texture() {
+        let ctx = Context::default();
+        let texture = load_background(&ctx).expect("the bundled background decodes");
+        assert_eq!(texture.size(), [1600, 1000]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_working_set_can_be_trimmed() {
+        // Harmless to the test process: the pages fault back in when touched.
+        trim_working_set().unwrap();
+    }
+
+    /// The test process has no window, so whatever "Irminsul" windows exist on
+    /// the machine (a running copy, an Explorer folder) are someone else's.
+    #[cfg(windows)]
+    #[test]
+    fn another_process_window_never_counts_as_ours() {
+        assert!(!window_out_of_sight());
     }
 
     fn verified_state() -> SavedAppState {

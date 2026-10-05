@@ -71,7 +71,20 @@ log = "0.4.27"
 # a direct entry here would pull in a second, independently versioned copy.
 open = "5.3.2"
 regex = "1.11.2"
-reqwest = { version = "0.12.23", features = ["gzip", "stream", "multipart"] }
+# The rustls features are for memory: every client irminsul builds selects
+# rustls (see `http_client_builder` in `src/main.rs`), because the default
+# native-tls is SChannel on Windows, and its first HTTPS request leaves about
+# 30 MB behind for the life of the process. `rustls-tls` adds the bundled
+# Mozilla roots and `rustls-tls-native-roots` the OS store, so a root the user
+# installed (an antivirus or company proxy) is still trusted. Neither is a new
+# TLS stack: self_update already compiles rustls in for the release check.
+reqwest = { version = "0.12.23", features = [
+	"gzip",
+	"stream",
+	"multipart",
+	"rustls-tls",
+	"rustls-tls-native-roots",
+] }
 # `compression-flate2` (which pulls in `archive-tar`) is what lets the Linux
 # release tarball be unpacked before `self_replace` installs the binary
 # inside it. Without it `src/update.rs` can only refuse the asset, which
@@ -102,6 +115,8 @@ pcap = { version = "2.3.0", features = ["capture-stream"], optional = true }
 windows = { version = "0.61.3", features = [
 	"Win32_System_Console",
 	"Win32_System_Registry",
+	# SetProcessWorkingSetSize: give back RAM while the window is hidden (app.rs).
+	"Win32_System_Threading",
 	"Win32_UI_Shell",
 	"Win32_UI_WindowsAndMessaging",
 ] }
