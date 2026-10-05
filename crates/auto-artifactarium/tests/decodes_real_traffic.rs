@@ -254,6 +254,78 @@ fn an_avatar_capture_decodes_into_a_roster() {
     }
 }
 
+fn push_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+/// `entries` as a repeated message field numbered `field`: what a game patch
+/// that renumbers the list puts on the wire.
+fn repeated_on<M: Message>(field: u32, entries: &[M]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for entry in entries {
+        let bytes = entry.write_to_bytes().unwrap();
+        push_varint(&mut out, (u64::from(field) << 3) | 2);
+        push_varint(&mut out, bytes.len() as u64);
+        out.extend_from_slice(&bytes);
+    }
+    out
+}
+
+/// What every game patch used to need a code change for: the inventory and
+/// the roster moving to other field numbers (5 -> 6 and 6 -> 7 in 7.1). The
+/// entries kept their numbering; only the lists move, and they are found
+/// wherever they land.
+#[test]
+fn lists_moved_by_a_patch_still_decode() {
+    let items: Vec<Item> = (0..12u32)
+        .map(|i| {
+            let mut item = Item::new();
+            item.item_id = 100_000 + i;
+            item.guid = (800_000_001 << 32) + 1 + u64::from(i);
+            let mut material = Material::new();
+            material.count = 5;
+            item.set_material(material);
+            item
+        })
+        .collect();
+    let avatars: Vec<AvatarInfo> = (0..3u32)
+        .map(|i| {
+            let mut avatar = AvatarInfo::new();
+            avatar.avatar_id = 10_000_002 + i;
+            avatar.guid = (800_000_001 << 32) + 100 + u64::from(i);
+            avatar.prop_map.insert(4001, prop(4001, 80));
+            avatar
+        })
+        .collect();
+
+    let mut capture = Capture::new();
+    for field in [5u32, 9, 14] {
+        let head = packet_head(22160, 1_756_400_005_000);
+        let store = capture.send_one(22160, &head, &repeated_on(field, &items));
+        match classify_command(&store) {
+            Some(CommandMatch::Items(found)) => {
+                assert_eq!(found.len(), 12, "field {field}");
+                assert_eq!(found[11].material().count, 5);
+            }
+            other => panic!("an inventory on field {field} was classified as {other:?}"),
+        }
+
+        let head = packet_head(27799, 1_756_400_005_000);
+        let roster = capture.send_one(27799, &head, &repeated_on(field, &avatars));
+        match classify_command(&roster) {
+            Some(CommandMatch::Avatars(found)) => {
+                assert_eq!(found.len(), 3, "field {field}");
+                assert_eq!(found[0].prop_map[&4001].val, 80);
+            }
+            other => panic!("a roster on field {field} was classified as {other:?}"),
+        }
+    }
+}
+
 /// Player properties decode, and the values come back from the declared
 /// `PropValue` fields rather than from guesswork.
 #[test]
@@ -331,7 +403,7 @@ fn a_sequence_of_commands_over_one_connection_all_decode() {
     for i in 0..12u32 {
         let mut item = Item::new();
         item.item_id = 100_000 + i;
-        item.guid = 1 + u64::from(i);
+        item.guid = (800_000_001 << 32) + 1 + u64::from(i);
         let mut material = Material::new();
         material.count = 1;
         item.set_material(material);

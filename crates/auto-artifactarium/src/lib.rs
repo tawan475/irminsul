@@ -183,13 +183,6 @@ const REBIND_AFTER: usize = 32;
 /// a session that is really alive reaches it within a minute or so.
 const PENDING_RESET_DISARM_MESSAGES: u32 = 64;
 
-/// Entries a store notify needs before it is believed.
-///
-/// Mirrors the floor already applied inside `matches_items_all_data_notify`; it
-/// is not a new restriction, it just counts entries that carry real inventory
-/// evidence instead of anything that happened to parse.
-const MIN_REAL_ITEMS: usize = 10;
-
 /// Entries a property notify needs before it is believed.
 ///
 /// Deliberately unchanged. Lowering it to catch single-property delta notifies
@@ -204,19 +197,15 @@ const MIN_PROPERTIES: usize = 5;
 /// Primogems, 10016 Mora, and the newest ones a 7.1 login carries reach 10100.
 /// Avatar properties (1001 EXP, 1002 ascension, 4001 level) sit outside it, and
 /// so do the 20xxx ids of the identity map 7.1 also sends at login. Left
-/// deliberately wide, like [`PLAYER_AVATAR_IDS`], so new properties cannot age
-/// it out; a property notify only has to have *most* of its keys in here.
+/// deliberately wide, like [`PLAYER_AVATAR_IDS`](unk_util::PLAYER_AVATAR_IDS),
+/// so new properties cannot age it out; a property notify only has to have
+/// *most* of its keys in here.
 const PLAYER_PROPERTY_IDS: std::ops::RangeInclusive<u32> = 10_000..=10_999;
 
 /// Ceiling used when ranking raw values recovered from an unrecognised
 /// `PropValue` layout, so a float bit pattern can never outrank a real counter.
 /// The largest real player property is Mora, capped at 9,999,999,999.
 const MAX_PLAUSIBLE_PROPERTY: u64 = 1_000_000_000_000;
-
-/// Playable avatars live in one contiguous block of ids (`10000002` upwards);
-/// monsters and NPCs are two orders of magnitude away. The block is left
-/// deliberately wide so a new release cannot age this check out.
-const PLAYER_AVATAR_IDS: std::ops::RangeInclusive<u32> = 10_000_000..=10_999_999;
 
 /// Distinct top-level fields a delete notify is allowed to carry.
 ///
@@ -1386,49 +1375,27 @@ pub fn try_matches_achievement_packet(
 
 /// Recover the inventory from a `PlayerStoreNotify`, or `None` if this is not one.
 ///
-/// Observed command id: `PlayerStoreNotify` was 8132 in 7.0, kept as
-/// documentation only.
-///
-/// The packet is identified by payload-intrinsic evidence: enough entries at
-/// field 5 that carry both a guid and one of the material/equip/furniture
-/// detail arms. The previous second discriminator ("field 1 or 3 is a varint")
-/// only ever matched `PacketHead`'s `packet_id`/`client_sequence_id`, so it
-/// filtered nothing while the header was being fed to the matcher, and would
-/// have rejected every store notify the moment the header was split off.
+/// Observed ids, kept as documentation only: the command was 8132 in 7.0 and
+/// 22160 in 7.1, and its item list sat on field 5 in 7.0 and field 6 in 7.1.
+/// Neither is matched on. The command is recognised by payload-intrinsic
+/// evidence and the list is found by shape (see
+/// [`matches_items_all_data_notify`]); the first match logs both numbers, so a
+/// game patch that moves them shows up in the log rather than as a missing
+/// inventory.
 pub fn matches_item_packet(game_command: &GameCommand) -> Option<Vec<Item>> {
-    let items = matches_items_all_data_notify(&game_command.proto_data)?;
-
-    // A `map<uint32, PropValue>` entry parses as an `Item` too -- its field 2 is
-    // a submessage where `guid` wants a varint, so the mismatch lands in the
-    // unknown fields and `guid` reads back as 0, and none of the detail arms are
-    // set. Real inventory entries have both. Counting rather than requiring a
-    // majority keeps this from rejecting an inventory that is mostly virtual
-    // items, and irminsul already discards entries with no detail arm anyway.
-    let real = items
-        .iter()
-        .filter(|item| {
-            item.guid != 0 && (item.has_material() || item.has_equip() || item.has_furniture())
-        })
-        .count();
-    if real < MIN_REAL_ITEMS {
-        trace!(
-            command_id = game_command.command_id,
-            total = items.len(),
-            real,
-            "field 5 parsed as items, but too few carry a guid and a detail arm"
-        );
-        return None;
-    }
+    let (field, items) = unk_util::discover_items(&game_command.proto_data)?;
 
     if first_time(&STORE_NOTIFY_LOGGED) {
         info!(
             command_id = game_command.command_id,
+            field,
             count = items.len(),
             "discovered PlayerStoreNotify"
         );
     } else {
         debug!(
             command_id = game_command.command_id,
+            field,
             count = items.len(),
             "item packet"
         );
@@ -1598,42 +1565,29 @@ pub fn matches_item_del_packet(game_command: &GameCommand) -> Option<Vec<u64>> {
 /// Recover the character roster from an `AvatarDataNotify`, or `None` if this is
 /// not one.
 ///
-/// Observed command id: `AvatarDataNotify` was 6586 in 7.0, kept as
-/// documentation only.
+/// Observed ids, kept as documentation only: the command was 6586 in 7.0 and
+/// 27799 in 7.1, and its avatar list sat on field 6 in 7.0 and field 7 in 7.1.
+/// Neither is matched on; the list is found by shape (see
+/// [`matches_avatars_all_data_notify`]) and the first match logs both numbers.
 ///
-/// The previous shape test was "some field 6 is length-delimited", which any
-/// repeated submessage satisfies. The discriminator used here instead is that
-/// `AvatarInfo` carries a `prop_map`; a plain `{varint, varint}` list does not.
+/// The discriminator is that an `AvatarInfo` carries a playable id and a
+/// `prop_map` holding its level; a plain `{varint, varint}` list does not.
 /// There is deliberately **no** minimum roster size: a new account owns fewer
 /// than ten characters and still has to export.
 pub fn matches_avatar_packet(game_command: &GameCommand) -> Option<Vec<AvatarInfo>> {
-    let avatars = matches_avatars_all_data_notify(&game_command.proto_data)?;
-
-    let plausible = avatars
-        .iter()
-        .filter(|avatar| {
-            !avatar.prop_map.is_empty() && PLAYER_AVATAR_IDS.contains(&avatar.avatar_id)
-        })
-        .count();
-    if plausible * 2 <= avatars.len() {
-        trace!(
-            command_id = game_command.command_id,
-            total = avatars.len(),
-            plausible,
-            "field 6 parsed as avatars, but too few look like playable characters"
-        );
-        return None;
-    }
+    let (field, avatars) = unk_util::discover_avatars(&game_command.proto_data)?;
 
     if first_time(&AVATAR_NOTIFY_LOGGED) {
         info!(
             command_id = game_command.command_id,
+            field,
             count = avatars.len(),
             "discovered AvatarDataNotify"
         );
     } else {
         debug!(
             command_id = game_command.command_id,
+            field,
             count = avatars.len(),
             "avatar packet"
         );
@@ -1872,15 +1826,21 @@ pub fn matches_player_property_packet(game_command: &GameCommand) -> Option<Hash
 #[cfg(test)]
 mod tests {
     use etherparse::PacketBuilder;
+    use tracing::Level;
 
     use super::*;
     use crate::crypto::new_key_from_seed;
     use crate::cs_rand::Random;
-    use crate::test_support::warnings;
+    use crate::test_support::{logged, warnings};
 
     const PROP_MAP_TAG: u32 = 4;
+    /// Where 7.1 put `PlayerStoreNotify`'s item list and `AvatarDataNotify`'s
+    /// avatar list. The matchers find them by shape; the fixtures use the real
+    /// numbers unless a test says otherwise.
     const ITEM_LIST_TAG: u32 = 6;
     const AVATAR_LIST_TAG: u32 = 7;
+    /// The uid half of the fixtures' guids.
+    const TEST_UID: u64 = 800_123_456;
 
     fn varint(mut value: u64) -> Vec<u8> {
         let mut out = Vec::new();
@@ -2002,10 +1962,15 @@ mod tests {
         out
     }
 
-    fn item_packet(count: u32) -> Vec<u8> {
+    /// `count` items on field `tag`, with guids minted the way the game does.
+    fn item_packet_on(tag: u32, count: u32) -> Vec<u8> {
         (0..count)
-            .flat_map(|i| field_bytes(ITEM_LIST_TAG, &item_entry(1000 + i, u64::from(i) + 1)))
+            .flat_map(|i| field_bytes(tag, &item_entry(1000 + i, guid(TEST_UID, u64::from(i) + 1))))
             .collect()
+    }
+
+    fn item_packet(count: u32) -> Vec<u8> {
+        item_packet_on(ITEM_LIST_TAG, count)
     }
 
     /// One `AvatarInfo` with an id, a guid and a one-entry `prop_map`.
@@ -2016,15 +1981,20 @@ mod tests {
         out
     }
 
-    fn avatar_packet(count: u32) -> Vec<u8> {
+    /// A roster of `count` characters on field `tag`.
+    fn avatar_packet_on(tag: u32, count: u32) -> Vec<u8> {
         (0..count)
             .flat_map(|i| {
                 field_bytes(
-                    AVATAR_LIST_TAG,
-                    &avatar_entry(10_000_002 + i, u64::from(i) + 1),
+                    tag,
+                    &avatar_entry(10_000_002 + i, guid(TEST_UID, u64::from(i) + 1)),
                 )
             })
             .collect()
+    }
+
+    fn avatar_packet(count: u32) -> Vec<u8> {
+        avatar_packet_on(AVATAR_LIST_TAG, count)
     }
 
     // -- GameCommand::try_new --------------------------------------------------
@@ -3583,18 +3553,28 @@ mod tests {
         assert!(matches_avatar_packet(&command).is_none());
     }
 
-    #[test]
-    fn a_prop_map_at_field_5_is_not_mistaken_for_an_inventory() {
-        // The exact collision the audit called out: the item matcher runs first
-        // in the caller's chain, so a prop map landing on field 5 would swallow
-        // the properties entirely.
-        let entries: Vec<Vec<u8>> = (10_001..=10_040u32)
-            .map(|i| field_bytes(ITEM_LIST_TAG, &prop_entry(i, &prop_val(i, 1))))
-            .collect();
-        let command = command(entries.concat());
+    /// Field numbers the item and avatar lists have sat on (5 and 6 in 7.0, 6
+    /// and 7 in 7.1), and one standing for wherever a later patch moves them.
+    const LIST_TAGS: [u32; 4] = [5, 6, 7, 12];
 
-        assert!(matches_item_packet(&command).is_none());
-        assert!(matches_player_property_packet(&command).is_some());
+    #[test]
+    fn a_prop_map_is_not_mistaken_for_an_inventory_on_any_field() {
+        // The collision the audit called out: the item matcher runs first in
+        // the caller's chain, so a prop map taken for the item list would
+        // swallow the properties entirely. With the list's field number no
+        // longer fixed, it has to hold wherever the map sits.
+        for tag in LIST_TAGS {
+            let entries: Vec<Vec<u8>> = (10_001..=10_040u32)
+                .map(|i| field_bytes(tag, &prop_entry(i, &prop_val(i, 1))))
+                .collect();
+            let command = command(entries.concat());
+
+            assert!(matches_item_packet(&command).is_none(), "field {tag}");
+            assert!(
+                matches_player_property_packet(&command).is_some(),
+                "field {tag}"
+            );
+        }
     }
 
     // -- item and avatar matchers ---------------------------------------------
@@ -3606,10 +3586,62 @@ mod tests {
         let items = matches_item_packet(&command).expect("should match");
         assert_eq!(items.len(), 40);
         assert!(matches_player_property_packet(&command).is_none());
+        assert!(matches_avatar_packet(&command).is_none());
         assert!(matches!(
             classify_command(&command),
             Some(CommandMatch::Items(_))
         ));
+    }
+
+    /// What a game patch used to break: the list moving to another field
+    /// number (5 -> 6 for the inventory and 6 -> 7 for the roster in 7.1).
+    #[test]
+    fn the_lists_are_recognised_on_any_field_number() {
+        for tag in LIST_TAGS {
+            let store = command(item_packet_on(tag, 40));
+            match classify_command(&store) {
+                Some(CommandMatch::Items(items)) => assert_eq!(items.len(), 40, "field {tag}"),
+                other => panic!("an inventory on field {tag} was classified as {other:?}"),
+            }
+
+            let roster = command(avatar_packet_on(tag, 3));
+            match classify_command(&roster) {
+                Some(CommandMatch::Avatars(avatars)) => {
+                    assert_eq!(avatars.len(), 3, "field {tag}")
+                }
+                other => panic!("a roster on field {tag} was classified as {other:?}"),
+            }
+        }
+    }
+
+    /// A patch that moves a list has to show in the log, not only as data
+    /// that went missing. The first match logs at INFO and every later one at
+    /// DEBUG, and both carry the field number.
+    #[test]
+    fn the_field_a_list_was_found_on_is_logged() {
+        let store = command(item_packet_on(12, 40));
+        let roster = command(avatar_packet_on(5, 3));
+        // The one-shot INFO line may already have gone to another test in this
+        // process, so the second run of each is the one asserted on.
+        let _ = matches_item_packet(&store);
+        let _ = matches_avatar_packet(&roster);
+        let lines = logged(Level::DEBUG, || {
+            let _ = matches_item_packet(&store);
+            let _ = matches_avatar_packet(&roster);
+        });
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("item packet") && line.contains(" field=12")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("avatar packet") && line.contains(" field=5")),
+            "{lines:?}"
+        );
     }
 
     #[test]
@@ -3633,18 +3665,20 @@ mod tests {
     }
 
     #[test]
-    fn a_varint_pair_list_at_field_6_is_not_a_roster() {
-        let pairs: Vec<Vec<u8>> = (0..40u32)
-            .map(|i| {
-                let mut entry = field_varint(1, u64::from(10_000_002 + i));
-                entry.extend(field_varint(2, u64::from(i) + 1));
-                field_bytes(AVATAR_LIST_TAG, &entry)
-            })
-            .collect();
-        assert!(
-            matches_avatar_packet(&command(pairs.concat())).is_none(),
-            "an avatar carries a prop_map; a bare id/guid pair does not"
-        );
+    fn a_varint_pair_list_is_not_a_roster() {
+        for tag in LIST_TAGS {
+            let pairs: Vec<Vec<u8>> = (0..40u32)
+                .map(|i| {
+                    let mut entry = field_varint(1, u64::from(10_000_002 + i));
+                    entry.extend(field_varint(2, guid(TEST_UID, u64::from(i) + 1)));
+                    field_bytes(tag, &entry)
+                })
+                .collect();
+            assert!(
+                matches_avatar_packet(&command(pairs.concat())).is_none(),
+                "an avatar carries a prop_map; a bare id/guid pair does not (field {tag})"
+            );
+        }
     }
 
     #[test]
@@ -3653,7 +3687,7 @@ mod tests {
             .map(|i| {
                 field_bytes(
                     AVATAR_LIST_TAG,
-                    &avatar_entry(24_000_000 + i, u64::from(i) + 1),
+                    &avatar_entry(24_000_000 + i, guid(TEST_UID, u64::from(i) + 1)),
                 )
             })
             .collect();

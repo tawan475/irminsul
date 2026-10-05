@@ -39,6 +39,14 @@ base, change `package.version` in `Cargo.toml` (e.g. to `0.2.3`); the next
 release is then `v0.2.3-T-1`. `Cargo.toml` keeps the bare base version on
 purpose: local builds count as stable and are never offered a `-T-N` update.
 
+## Game patches
+
+What a new game version needs:
+
+- **Protocol numbers: nothing.** Commands are recognised by the shape of their payload rather than their id, and the inventory and character lists are found on whichever field the patch moved them to. Until 7.1 every patch meant hand-editing those two field numbers in `crates/auto-artifactarium/protos/protos.proto`. The first match logs where each was found, e.g. `discovered PlayerStoreNotify command_id=22160 field=6`.
+- **New characters, weapons, artifacts and materials** (their GOOD keys and data) come from Dimbreath's game data dump, which release builds download when they are built. A release made after the dump caught up with the patch carries it, so shipping it means running **Create Release**.
+- **Still needs a human:** a patch that renumbers the fields *inside* `Item` or `AvatarInfo` (unchanged through 7.1) shows up as an empty or wrong export. Record a login with a debug build and run `--replay-export` on it (see below): the log says which list was found on which field, the export shows what decoded, and the message to fix is in `protos.proto`.
+
 ## Command line options
 
 Irminsul accepts a handful of command line options for advanced use cases:
