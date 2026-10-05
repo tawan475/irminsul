@@ -115,6 +115,32 @@ to default" puts the build's own value back.
 The key is stored with the rest of Irminsul's saved state on your machine and
 is sent only to the tracker it belongs to.
 
+## Start Irminsul when you sign in (Windows)
+
+Tick "Start Irminsul on startup" in the "Automation" section. Irminsul then
+registers a Task Scheduler task named `Irminsul` that starts this copy about 15
+seconds after you sign in, with the administrator rights packet capture needs
+and without a UAC prompt. Untick it to remove the task. (Older versions used the
+ordinary startup list, which Windows never runs for a program that needs
+administrator rights; a newer version moves that entry to the task when it
+starts.)
+
+If the task starts a different copy of Irminsul, or a file that is no longer
+there, an amber warning icon appears next to the checkbox. Click it to see both
+paths, and "Start this copy instead" to point the task at the copy you are
+running.
+
+## Memory use
+
+Most of what an open Irminsul window holds belongs to the graphics driver and
+the window itself, not to the capture: on Windows typically 50 to 150 MB in
+Task Manager's "Memory" column, depending on the graphics driver, against some
+15 MB for capturing and decoding a whole account. Minimize Irminsul, to the tray or the taskbar, while
+you play: within a couple of seconds it hands the window's share back to
+Windows, and the column drops to the capture's few MB. It comes back when you
+open the window again. ("Commit size" stays higher, since the driver keeps its
+reservation until Irminsul exits.)
+
 ## Command line options
 
 Irminsul also supports a couple of command line flags when launching from a terminal:

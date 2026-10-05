@@ -167,64 +167,30 @@ impl GameStatus {
     /// The long explanation, shown on hover so the line itself stays short.
     pub fn tooltip(self) -> &'static str {
         match self {
-            GameStatus::NotRunning => {
-                "No GenshinImpact.exe / YuanShen.exe process found.\n\n\
-                 Start the game with capture already running: Irminsul has to watch the login \
-                 handshake to recover the key the packets are encrypted with."
-            }
+            GameStatus::NotRunning => "Start Genshin while Irminsul is running.",
             GameStatus::LaunchCaptured => {
-                "Genshin started while packet capture was running, so the login handshake was \
-                 inside the capture window.\n\n\
-                 Open the in-game menus you want to export — Inventory, Characters, Achievements \
-                 — and watch the ticks above. Seeing the launch is necessary for the session key, \
-                 not proof that it was recovered; this line says \"data decrypting\" once packets \
-                 actually decode."
+                "Login seen. Says \"data decrypting\" once your data arrives."
             }
             GameStatus::Decoding => {
-                "Game commands from the current session are decrypting, so Irminsul saw the login \
-                 and the traffic is reaching it readable.\n\n\
-                 That is not yet a full export: open the in-game menus you want — Inventory, \
-                 Characters, Achievements — and let the ticks above confirm each one actually \
-                 arrived."
+                "Reading this session. Inventory, characters and achievements arrive by \
+                 themselves as you enter the world."
             }
             GameStatus::CaptureOff => {
-                "Genshin is running but the capture backend is not up, so nothing is being read                  right now.
-
-                 Capture has no on/off control: it starts with Irminsul and restarts itself if it                  fails, so this normally clears within a few seconds. If it persists, capture                  cannot start at all — check that Irminsul is running as administrator, and look                  in the log for the reason.
-
-                 A brief gap does not usually cost the session: the key was recovered at login                  and Irminsul still holds it. If traffic flowed during the gap it can break the                  packet sequence, in which case data simply stops arriving and restarting Genshin                  gets a fresh session."
+                "Capture isn't running; it restarts itself within seconds. If this stays, run \
+                 Irminsul as administrator and check the log."
             }
-            GameStatus::AwaitingLogin => {
-                "Genshin was already open when Irminsul started. That is fine as long as you have \
-                 not entered the world yet: the key is recovered as the client connects to the \
-                 game server.\n\n\
-                 Click the door (or log in) now. This line changes to \"data decrypting\" once \
-                 the session's data arrives.\n\n\
-                 If you were already in the world, Irminsul can't read this session; it says so \
-                 here within a few seconds."
-            }
+            GameStatus::AwaitingLogin => "Fine if you're on the title screen: enter the world now.",
             GameStatus::LaunchMissed(MissedLaunch::AlreadyRunning) => {
-                "Genshin was already in the world when Irminsul started: game traffic is \
-                 arriving, but the login exchange the session key comes from happened before \
-                 Irminsul was running, so nothing from this session can be decrypted.\n\n\
-                 To capture: with Irminsul running, return to the title screen and enter the \
-                 world again, or close Genshin and start it again."
+                "Irminsul started after you entered the world. Return to the title screen and \
+                 enter again, or restart Genshin."
             }
             GameStatus::LaunchMissed(MissedLaunch::CaptureStopped) => {
-                "Packet capture was stopped while Genshin was running, so the packet stream has a \
-                 hole in it — and Irminsul is a passive listener that can never ask for a \
-                 retransmit of what fell in.\n\n\
-                 Not in the world yet? Start capture, then go in: this line changes to \"data \
-                 decrypting\" if the login exchange is caught.\n\n\
-                 Already in the world? Nothing more can be captured from this session. With \
-                 capture running, close Genshin and start it again."
+                "Capture was off when you logged in. Return to the title screen and enter the \
+                 world again, or restart Genshin."
             }
             GameStatus::KeyLost => {
-                "The game connected (or reconnected) and Irminsul saw it, but could not recover \
-                 the key for this connection, so nothing new is being decrypted.\n\n\
-                 The data captured before is kept and can still be exported.\n\n\
-                 To capture again, with Irminsul running: return to the login screen and enter \
-                 the world again, or restart Genshin."
+                "Couldn't read this login. Return to the title screen and enter again. Data \
+                 captured before is kept."
             }
         }
     }
