@@ -475,7 +475,7 @@ async fn download_new_version_and_replace_current(
         .tempdir_in(exe_dir)?;
     let tmp_asset_path = tmp_dir.path().join(&asset.name);
 
-    let client = reqwest::Client::builder().gzip(true).build()?;
+    let client = crate::http_client_builder().gzip(true).build()?;
 
     // The download is the long, network-bound half and nothing has been written
     // over the install yet, so closing the window during it must give up

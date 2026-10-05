@@ -848,7 +848,7 @@ impl Monitor {
         // One client for the whole process: clones share its connection pool,
         // and building one per request was also how every tracker call ended up
         // with no timeout at all.
-        let http = reqwest::Client::builder()
+        let http = crate::http_client_builder()
             .timeout(TRACKER_REQUEST_TIMEOUT)
             .connect_timeout(TRACKER_CONNECT_TIMEOUT)
             .build()
