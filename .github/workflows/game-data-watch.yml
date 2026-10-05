@@ -1,0 +1,41 @@
+name: Game data watch
+# Release builds download Dimbreath's newest game data dump when they are built
+# (the anime-game-data crate, from build.rs), so a dump newer than the latest
+# release is new characters, weapons, artifacts and materials waiting for a
+# release. Once a day this looks for one and opens an issue (label `game-data`)
+# per dump; shipping it is running Create Release on main. The logic and its
+# tests: .github/scripts/game_data_watch.py, test_game_data_watch.py.
+#
+# Scheduled workflows only run from the default branch, so this starts once it
+# reaches main.
+on:
+  schedule:
+    - cron: "17 3 * * *" # daily, off the hour when scheduled runs pile up
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only print the decision; open no issue"
+        type: boolean
+        default: false
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: game-data-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Look for a dump newer than the latest release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python .github/scripts/game_data_watch.py ${{ inputs.dry_run && '--dry-run' || '' }}

@@ -95,6 +95,12 @@ message Item {
     }
 }
 
+// `PlayerStoreNotify`, reduced to its item list. The list's field number
+// changes between game versions (5 in 7.0, 6 in 7.1); the library finds it by
+// shape at runtime and only decodes the entries with `Item`, so the number
+// here records 7.1's layout and is not read by the matcher. Tests build
+// real-shaped payloads with it. If a patch renumbers `Item` itself, that is
+// still a hand edit.
 message PacketWithItems {
 	repeated Item items = 6;
 }
@@ -176,6 +182,10 @@ message AvatarTeam {
     repeated uint64 avatar_guid_list = 15;
 }
 
+// Reduced to its avatar list, whose field number changes between game versions
+// (6 in 7.0, 7 in 7.1). Like `PacketWithItems`: found by shape at runtime, the
+// number records 7.1's layout and is not read by the matcher; `AvatarInfo`'s
+// own numbering still is.
 message AvatarDataNotify {
     repeated AvatarInfo avatar_list = 7;
     //map<uint32, AvatarTeam> avatar_team_map = 14;
