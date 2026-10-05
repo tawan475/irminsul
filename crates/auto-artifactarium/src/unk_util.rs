@@ -25,6 +25,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::ops::RangeInclusive;
 
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
@@ -32,7 +33,7 @@ use protobuf::Message;
 use protobuf::UnknownValueRef::*;
 use rsa::{Pkcs1v15Encrypt, RsaPrivateKey};
 
-use crate::r#gen::protos::{AvatarDataNotify, AvatarInfo, Item, PacketWithItems, Unk};
+use crate::r#gen::protos::{AvatarInfo, Item, Unk};
 
 /// Upper bound on the number of truncation points tried when looking for the
 /// end of the base64 seed field in a `GetPlayerTokenRsp`. Only a corrupt or
@@ -242,6 +243,22 @@ fn classify_submessage(bytes: &[u8]) -> SubMessage {
     }
 }
 
+/// Every top-level length-delimited field of `msg`, grouped by field number.
+///
+/// A repeated submessage field is one such value per entry, so each group is a
+/// candidate list. The values of one field number keep their wire order, and
+/// the groups come out in field-number order, so the same payload is always
+/// read the same way whatever order the parser's own map iterates in.
+fn length_delimited_fields(msg: &Unk) -> BTreeMap<u32, Vec<&[u8]>> {
+    let mut groups: BTreeMap<u32, Vec<&[u8]>> = BTreeMap::new();
+    for (tag, field) in msg.unknown_fields().iter() {
+        if let LengthDelimited(bytes) = field {
+            groups.entry(tag).or_default().push(bytes);
+        }
+    }
+    groups
+}
+
 /// Group the top-level length-delimited fields by tag, dropping the groups whose
 /// contents cannot be a repeated `Achievement`.
 ///
@@ -251,23 +268,21 @@ fn classify_submessage(bytes: &[u8]) -> SubMessage {
 /// foreign top-level fields are the norm rather than a sign of the wrong packet.
 fn achievement_candidate_groups(msg: &Unk) -> BTreeMap<u32, Vec<Entry>> {
     let mut groups: BTreeMap<u32, Vec<Entry>> = BTreeMap::new();
-    let mut rejected: BTreeSet<u32> = BTreeSet::new();
 
-    for (tag, field) in msg.unknown_fields().iter() {
-        let LengthDelimited(bytes) = field else {
-            continue;
-        };
-        if rejected.contains(&tag) {
-            continue;
-        }
-        match classify_submessage(bytes) {
-            SubMessage::Entry(entry) => groups.entry(tag).or_default().push(entry),
-            SubMessage::Degenerate => {}
-            SubMessage::NotAnEntry => {
-                tracing::trace!("field {tag} is not a list of achievements, skipping it");
-                rejected.insert(tag);
-                groups.remove(&tag);
+    'fields: for (tag, values) in length_delimited_fields(msg) {
+        let mut entries = Vec::new();
+        for bytes in values {
+            match classify_submessage(bytes) {
+                SubMessage::Entry(entry) => entries.push(entry),
+                SubMessage::Degenerate => {}
+                SubMessage::NotAnEntry => {
+                    tracing::trace!("field {tag} is not a list of achievements, skipping it");
+                    continue 'fields;
+                }
             }
+        }
+        if !entries.is_empty() {
+            groups.insert(tag, entries);
         }
     }
 
@@ -582,42 +597,256 @@ pub fn matches_achievement_all_data_notify(data: impl AsRef<[u8]>) -> Option<Vec
     }
 }
 
-pub fn matches_items_all_data_notify(data: &[u8]) -> Option<Vec<Item>> {
-    let packet = PacketWithItems::parse_from_bytes(data).ok()?;
+// --- Repeated lists found by shape --------------------------------------------
+//
+// `PlayerStoreNotify`'s item list and `AvatarDataNotify`'s avatar list move to a
+// new field number in most game versions (5 -> 6 and 6 -> 7 in 7.1), while the
+// `Item` and `AvatarInfo` messages inside them kept their numbering. So entries
+// are still decoded with the generated types, but the field holding them is
+// found the way the achievement list is: every top-level repeated field is
+// decoded, and the one with by far the most believable entries wins.
 
-    // Filter out items with 0 (default) item ID. Virtual items like Mora may have guid = 0.
-    let items: Vec<Item> = packet
-        .items
-        .into_iter()
-        .filter(|item| item.item_id != 0)
-        .collect();
+/// Plausible entries a field needs before it is taken for the inventory.
+///
+/// The floor the fixed-number parse always had. A real `PlayerStoreNotify` is
+/// the whole bag -- thousands of entries -- while a handful of item-shaped
+/// entries turns up in other messages (`StoreItemChangeNotify`, pick-up
+/// notifies).
+const MIN_ITEM_ENTRIES: usize = 10;
 
-    // Differentiate items packets from other that look alike.
-    if items.len() < 10 {
-        return None;
-    }
+/// Playable avatars live in one contiguous block of ids (`10000002` upwards);
+/// monsters and NPCs are two orders of magnitude away. The block is left
+/// deliberately wide so a new release cannot age this check out.
+pub(crate) const PLAYER_AVATAR_IDS: RangeInclusive<u32> = 10_000_000..=10_999_999;
 
-    Some(items)
+/// `PROP_LEVEL`: every avatar's `prop_map` carries its level under this id.
+const PROP_LEVEL: u32 = 4001;
+
+/// How many times as many plausible entries the winning field needs as any
+/// other field before it is believed.
+///
+/// A real packet carries one such list, so anything close to a tie means the
+/// payload is not the shape this expects, and picking one would export the
+/// wrong list rather than none.
+const CLEAR_WINNER_FACTOR: usize = 2;
+
+/// What one kind of repeated list looks like, for [`discover_list`].
+struct ListShape<T> {
+    /// For the logs.
+    name: &'static str,
+    /// Entries returned at all: the filter the fixed-number parse applied, so
+    /// callers get exactly the entries they always got.
+    keep: fn(&T) -> bool,
+    /// Kept entries that are evidence the field is this list. Gets the raw
+    /// entry as well, to test it against messages that share its shape.
+    plausible: fn(&T, &[u8]) -> bool,
+    /// Plausible entries the winning field needs.
+    min_plausible: usize,
+    /// Whether the plausible entries also have to be most of the kept ones.
+    needs_majority: bool,
 }
 
-pub fn matches_avatars_all_data_notify(data: &[u8]) -> Option<Vec<AvatarInfo>> {
-    let packet = AvatarDataNotify::parse_from_bytes(data).ok()?;
-    let avatar_list: Vec<AvatarInfo> = packet
-        .avatar_list
-        .into_iter()
-        .filter(|avatar| avatar.avatar_id != 0 && avatar.guid != 0)
-        .collect();
+/// One field's entries, scored.
+struct Candidate<T> {
+    field: u32,
+    entries: Vec<T>,
+    plausible: usize,
+}
 
-    if avatar_list.is_empty() {
+/// Find the top-level repeated field of `data` that holds a list of `T`, and
+/// return its field number with its kept entries, in wire order.
+///
+/// Every length-delimited field is decoded entry by entry as `T`; an entry
+/// that does not decode is skipped, never fatal (see the module docs). The
+/// field with the most plausible entries wins if it clears the shape's floor
+/// and holds [`CLEAR_WINNER_FACTOR`] times as many as any other field.
+fn discover_list<T: Message>(data: &[u8], shape: &ListShape<T>) -> Option<(u32, Vec<T>)> {
+    let msg = Unk::parse_from_bytes(data).ok()?;
+    let name = shape.name;
+
+    let mut candidates: Vec<Candidate<T>> = Vec::new();
+    for (field, values) in length_delimited_fields(&msg) {
+        let mut entries = Vec::with_capacity(values.len());
+        let mut plausible = 0usize;
+        for bytes in values {
+            let Ok(entry) = T::parse_from_bytes(bytes) else {
+                continue;
+            };
+            if !(shape.keep)(&entry) {
+                continue;
+            }
+            if (shape.plausible)(&entry, bytes) {
+                plausible += 1;
+            }
+            entries.push(entry);
+        }
+        if plausible > 0 {
+            candidates.push(Candidate {
+                field,
+                entries,
+                plausible,
+            });
+        }
+    }
+
+    // Most plausible first. The sort is stable, so ties stay in field order.
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.plausible));
+    let mut ranked = candidates.into_iter();
+    let best = ranked.next()?;
+    let runner_up = ranked.next();
+
+    if best.plausible < shape.min_plausible {
+        tracing::trace!(
+            field = best.field,
+            plausible = best.plausible,
+            "too few plausible {name} entries for a {name} list"
+        );
+        return None;
+    }
+    if shape.needs_majority && best.plausible * 2 <= best.entries.len() {
+        tracing::trace!(
+            field = best.field,
+            plausible = best.plausible,
+            total = best.entries.len(),
+            "most {name} entries are implausible"
+        );
+        return None;
+    }
+    if let Some(other) = &runner_up
+        && best.plausible <= other.plausible * CLEAR_WINNER_FACTOR
+    {
+        tracing::warn!(
+            field = best.field,
+            plausible = best.plausible,
+            other_field = other.field,
+            other_plausible = other.plausible,
+            "two fields look like the {name} list; reading neither"
+        );
         return None;
     }
 
-    Some(avatar_list)
+    tracing::debug!(
+        field = best.field,
+        plausible = best.plausible,
+        total = best.entries.len(),
+        "found the {name} list"
+    );
+    Some((best.field, best.entries))
+}
+
+/// The inventory list: entries with an item id, of which at least
+/// [`MIN_ITEM_ENTRIES`] carry real inventory evidence.
+const ITEM_LIST: ListShape<Item> = ListShape {
+    name: "item",
+    keep: has_item_id,
+    plausible: plausible_item,
+    min_plausible: MIN_ITEM_ENTRIES,
+    needs_majority: false,
+};
+
+/// The roster: entries with an id and a guid, most of them playable
+/// characters. No floor beyond one: a new account owns a handful of
+/// characters and still has to export.
+const AVATAR_LIST: ListShape<AvatarInfo> = ListShape {
+    name: "avatar",
+    keep: has_avatar_id_and_guid,
+    plausible: plausible_avatar,
+    min_plausible: 1,
+    needs_majority: true,
+};
+
+fn has_item_id(item: &Item) -> bool {
+    item.item_id != 0
+}
+
+/// An entry that carries real inventory evidence: an account's guid and one of
+/// the material/equip/furniture arms.
+///
+/// The game mints guids as `(uid << 32) + counter`, so a real item's guid
+/// never fits in 32 bits (virtual items such as Mora carry none at all).
+/// Requiring that is what keeps other lists out: a 7.1 session sends, minutes
+/// after login, lists of 58 and 105 entries (command 27685, on field 8) that
+/// decode as items with ids 2 to 4, an equip arm and guids below 2^32, and
+/// with no field number to go by they passed for an inventory. A
+/// `map<uint32, PropValue>` entry decodes as an `Item` whose guid reads 0 (its
+/// field 2 is a submessage) and whose arms are all unset.
+///
+/// Counting these rather than requiring most entries to be them keeps an
+/// inventory that is mostly virtual items acceptable.
+fn plausible_item(item: &Item, bytes: &[u8]) -> bool {
+    item.guid >> 32 != 0
+        && (item.has_material() || item.has_equip() || item.has_furniture())
+        && !is_avatar_entry(item.item_id, bytes)
+}
+
+/// Whether an entry is really an `AvatarInfo`.
+///
+/// An `AvatarInfo` can decode as an `Item`: its id and guid land on the
+/// item's, and its packed equip and talent lists and its fight-prop map are
+/// the material, equip and furniture arms' field numbers. Whether that decode
+/// succeeds depends on the bytes inside those lists, so with the item list no
+/// longer pinned to one field number a roster could pass for an inventory --
+/// and the item matcher runs first -- unless entries that are plausible
+/// avatars are ruled out. Item ids sit far below the avatar block, so a real
+/// item never pays for the second decode.
+fn is_avatar_entry(id: u32, bytes: &[u8]) -> bool {
+    PLAYER_AVATAR_IDS.contains(&id)
+        && AvatarInfo::parse_from_bytes(bytes).is_ok_and(|avatar| plausible_avatar(&avatar, bytes))
+}
+
+fn has_avatar_id_and_guid(avatar: &AvatarInfo) -> bool {
+    avatar.avatar_id != 0 && avatar.guid != 0
+}
+
+/// A playable character: an id in the avatar block, a guid, and a level in
+/// its `prop_map`. A bare `{id, guid}` pair has no `prop_map`; monsters and
+/// NPCs sit outside the block.
+fn plausible_avatar(avatar: &AvatarInfo, _bytes: &[u8]) -> bool {
+    PLAYER_AVATAR_IDS.contains(&avatar.avatar_id)
+        && avatar.guid != 0
+        && avatar.prop_map.contains_key(&PROP_LEVEL)
+}
+
+/// [`matches_items_all_data_notify`], with the number of the field the list
+/// was found on.
+pub(crate) fn discover_items(data: &[u8]) -> Option<(u32, Vec<Item>)> {
+    discover_list(data, &ITEM_LIST)
+}
+
+/// [`matches_avatars_all_data_notify`], with the number of the field the list
+/// was found on.
+pub(crate) fn discover_avatars(data: &[u8]) -> Option<(u32, Vec<AvatarInfo>)> {
+    discover_list(data, &AVATAR_LIST)
+}
+
+/// Recover the inventory from a `PlayerStoreNotify` payload, or `None` if this
+/// is not one.
+///
+/// The item list is found by shape, not by field number: whichever top-level
+/// repeated field holds by far the most entries that decode as an `Item` with
+/// an account's guid (`uid << 32 | counter`) and a material/equip/furniture
+/// arm -- at least ten of them -- is the list. Every entry of it with a
+/// non-zero item id is returned, virtual items (guid 0) included.
+pub fn matches_items_all_data_notify(data: &[u8]) -> Option<Vec<Item>> {
+    discover_items(data).map(|(_, items)| items)
+}
+
+/// Recover the character roster from an `AvatarDataNotify` payload, or `None`
+/// if this is not one.
+///
+/// The avatar list is found by shape, not by field number: whichever top-level
+/// repeated field holds by far the most entries that decode as an
+/// `AvatarInfo` with a playable avatar id, a guid and a level, provided they
+/// are most of its entries. Every entry of it with a non-zero id and guid is
+/// returned. There is no minimum roster size.
+pub fn matches_avatars_all_data_notify(data: &[u8]) -> Option<Vec<AvatarInfo>> {
+    discover_avatars(data).map(|(_, avatars)| avatars)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::r#gen::protos::{Equip, Material, PropValue, Weapon};
 
     // Field numbers of the real `Achievement` message, as recovered from
     // Grasscutter. The matcher must not depend on them, but using the real ones
@@ -889,6 +1118,305 @@ mod tests {
                 .expect("should match")
                 .len(),
             120
+        );
+    }
+
+    // --- item and avatar lists ---------------------------------------------
+
+    /// Field numbers the lists have sat on (`PlayerStoreNotify` 5 then 6,
+    /// `AvatarDataNotify` 6 then 7) and one standing for a later patch.
+    const LIST_TAGS: [u32; 4] = [5, 6, 7, 12];
+
+    /// The uid half of every fixture guid.
+    const UID: u64 = 800_123_456;
+
+    /// A guid as the game mints them: `(uid << 32) + counter`.
+    fn guid(counter: u64) -> u64 {
+        (UID << 32) | counter
+    }
+
+    fn material_item(item_id: u32, guid: u64) -> Vec<u8> {
+        let mut item = Item::new();
+        item.item_id = item_id;
+        item.guid = guid;
+        let mut material = Material::new();
+        material.count = 3;
+        item.set_material(material);
+        item.write_to_bytes().unwrap()
+    }
+
+    /// `count` materials on field `tag`, with ids from `first_id`.
+    fn item_list(tag: u32, first_id: u32, count: u32) -> Vec<u8> {
+        (0..count)
+            .flat_map(|i| {
+                field_bytes(
+                    tag,
+                    &material_item(first_id + i, guid(u64::from(first_id + i))),
+                )
+            })
+            .collect()
+    }
+
+    /// A `PlayerStoreNotify`: `count` items on `tag` between the two scalar
+    /// siblings 7.1's carried (fields 9 and 11).
+    fn store_payload(tag: u32, count: u32) -> Vec<u8> {
+        let mut out = field_varint(9, 2_000);
+        out.extend(item_list(tag, 100_000, count));
+        out.extend(field_varint(11, 1));
+        out
+    }
+
+    fn avatar(avatar_id: u32, guid: u64) -> AvatarInfo {
+        let mut avatar = AvatarInfo::new();
+        avatar.avatar_id = avatar_id;
+        avatar.guid = guid;
+        let mut level = PropValue::new();
+        level.type_ = PROP_LEVEL;
+        level.val = 90;
+        avatar.prop_map.insert(PROP_LEVEL, level);
+        avatar
+    }
+
+    fn roster(count: u32) -> Vec<AvatarInfo> {
+        (0..count)
+            .map(|i| avatar(10_000_002 + i, guid(u64::from(i) + 1)))
+            .collect()
+    }
+
+    /// An `AvatarDataNotify`: `avatars` on `tag`, beside siblings shaped like
+    /// the real ones -- a packed guid list, the current team id and two
+    /// entries of the team map.
+    fn roster_payload(tag: u32, avatars: &[AvatarInfo]) -> Vec<u8> {
+        let packed_guids: Vec<u8> = (1..=4).flat_map(|i| varint(guid(i))).collect();
+        let mut out = field_bytes(1, &packed_guids);
+        out.extend(field_varint(2, 1));
+        for avatar in avatars {
+            out.extend(field_bytes(tag, &avatar.write_to_bytes().unwrap()));
+        }
+        for team in 1..=2u64 {
+            // `map<uint32, AvatarTeam>`: the team id, then the team.
+            let team_body = field_bytes(15, &packed_guids);
+            out.extend(field_bytes(
+                13,
+                &packet(&[field_varint(1, team), field_bytes(2, &team_body)]),
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn an_item_list_is_found_on_any_field_number() {
+        for tag in LIST_TAGS {
+            let data = store_payload(tag, 40);
+            let (field, items) = discover_items(&data).expect("an inventory");
+            assert_eq!(field, tag);
+            assert_eq!(items.len(), 40);
+            assert_eq!(items[0].item_id, 100_000, "wire order is kept");
+            assert_eq!(items[39].item_id, 100_039);
+            assert_eq!(items[0].material().count, 3);
+            assert_eq!(
+                matches_items_all_data_notify(&data).map(|items| items.len()),
+                Some(40)
+            );
+        }
+    }
+
+    #[test]
+    fn an_avatar_list_is_found_on_any_field_number() {
+        for tag in LIST_TAGS {
+            let data = roster_payload(tag, &roster(5));
+            let (field, avatars) = discover_avatars(&data).expect("a roster");
+            assert_eq!(field, tag);
+            assert_eq!(avatars.len(), 5);
+            assert_eq!(avatars[0].avatar_id, 10_000_002);
+            assert_eq!(avatars[0].prop_map[&PROP_LEVEL].val, 90);
+            assert_eq!(
+                matches_avatars_all_data_notify(&data).map(|avatars| avatars.len()),
+                Some(5)
+            );
+        }
+    }
+
+    #[test]
+    fn a_one_character_roster_is_a_roster() {
+        let data = roster_payload(7, &roster(1));
+        assert_eq!(discover_avatars(&data).expect("a roster").1.len(), 1);
+    }
+
+    /// Mora and friends carry no guid. They are returned, as they always
+    /// were, but they are no evidence of an inventory.
+    #[test]
+    fn virtual_items_ride_along_but_are_not_evidence() {
+        let mut data = item_list(6, 100_000, 10);
+        for id in [201u32, 202, 102] {
+            data.extend(field_bytes(6, &material_item(id, 0)));
+        }
+        assert_eq!(matches_items_all_data_notify(&data).unwrap().len(), 13);
+
+        let mut data = item_list(6, 100_000, 9);
+        for id in 1000..1030u32 {
+            data.extend(field_bytes(6, &material_item(id, 0)));
+        }
+        assert!(matches_items_all_data_notify(&data).is_none());
+    }
+
+    #[test]
+    fn ten_items_are_the_floor() {
+        assert!(matches_items_all_data_notify(&store_payload(6, 9)).is_none());
+        assert!(matches_items_all_data_notify(&store_payload(6, 10)).is_some());
+    }
+
+    /// The false positive the real 7.1 traffic turned up once the field number
+    /// stopped being fixed: lists of 58 and 105 entries (command 27685, field
+    /// 8) that decode as items with tiny ids, an equip arm and 32-bit guids.
+    #[test]
+    fn items_whose_guids_carry_no_uid_are_not_an_inventory() {
+        let lookalike: Vec<u8> = (0..105u64)
+            .flat_map(|i| {
+                let mut item = Item::new();
+                item.item_id = [2, 3, 4][(i % 3) as usize];
+                item.guid = 1_000 + i;
+                let mut equip = Equip::new();
+                equip.set_weapon(Weapon::new());
+                item.set_equip(equip);
+                field_bytes(8, &item.write_to_bytes().unwrap())
+            })
+            .collect();
+        let mut data = lookalike.clone();
+        data.extend(field_varint(10, 1));
+        assert!(matches_items_all_data_notify(&data).is_none());
+
+        // Beside a real inventory it is no competition either.
+        let mut data = lookalike;
+        data.extend(store_payload(6, 40));
+        assert_eq!(discover_items(&data).expect("an inventory").0, 6);
+    }
+
+    #[test]
+    fn a_small_lookalike_list_does_not_outvote_the_inventory() {
+        let mut data = item_list(1, 200_000, 3);
+        data.extend(store_payload(6, 40));
+        data.extend(item_list(12, 300_000, 15));
+        let (field, items) = discover_items(&data).expect("an inventory");
+        assert_eq!(field, 6);
+        assert_eq!(items.len(), 40);
+    }
+
+    #[test]
+    fn two_comparable_item_lists_are_read_as_neither() {
+        let mut data = item_list(5, 100_000, 40);
+        data.extend(item_list(12, 200_000, 30));
+        let logged = crate::test_support::warnings(|| {
+            assert!(matches_items_all_data_notify(&data).is_none());
+        });
+        assert!(
+            logged
+                .iter()
+                .any(|line| line.contains("two fields look like the item list")
+                    && line.contains("field=5")
+                    && line.contains("other_field=12")),
+            "an ambiguous payload has to say so: {logged:?}"
+        );
+
+        // An exact tie, too: no field order to fall back on.
+        let mut data = item_list(5, 100_000, 30);
+        data.extend(item_list(12, 200_000, 30));
+        assert!(matches_items_all_data_notify(&data).is_none());
+    }
+
+    #[test]
+    fn an_entry_that_does_not_decode_costs_only_itself() {
+        let mut data = store_payload(6, 40);
+        // A submessage that claims more bytes than it has.
+        data.extend(field_bytes(6, &[0x0a, 0x05, 0x01]));
+        assert_eq!(matches_items_all_data_notify(&data).unwrap().len(), 40);
+    }
+
+    /// An `AvatarInfo` can decode as an `Item` -- here its fight-prop map
+    /// fills the furniture arm -- so without ruling avatars out a roster on
+    /// any field would pass for an inventory, and the item matcher runs first.
+    #[test]
+    fn a_roster_is_not_taken_for_an_inventory() {
+        let avatars: Vec<AvatarInfo> = roster(20)
+            .into_iter()
+            .map(|mut avatar| {
+                avatar.fight_prop_map.insert(2000, 15_000.0);
+                avatar.skill_depot_id = 501;
+                avatar
+            })
+            .collect();
+        for avatar in &avatars {
+            let as_item = Item::parse_from_bytes(&avatar.write_to_bytes().unwrap())
+                .expect("the fixture must decode as an item");
+            assert!(
+                as_item.has_furniture() && as_item.guid >> 32 != 0,
+                "the fixture must look like an inventory entry"
+            );
+        }
+
+        for tag in LIST_TAGS {
+            let data = roster_payload(tag, &avatars);
+            assert!(
+                matches_items_all_data_notify(&data).is_none(),
+                "field {tag}"
+            );
+            assert_eq!(discover_avatars(&data).expect("a roster").0, tag);
+        }
+    }
+
+    #[test]
+    fn an_inventory_is_not_taken_for_a_roster() {
+        for tag in LIST_TAGS {
+            assert!(matches_avatars_all_data_notify(&store_payload(tag, 40)).is_none());
+        }
+    }
+
+    #[test]
+    fn avatars_outside_the_playable_block_are_not_a_roster() {
+        let monsters: Vec<AvatarInfo> = (0..20u32)
+            .map(|i| avatar(24_000_000 + i, guid(u64::from(i) + 1)))
+            .collect();
+        assert!(matches_avatars_all_data_notify(&roster_payload(6, &monsters)).is_none());
+
+        // Next to a real roster they do not compete with it.
+        let mut data = roster_payload(6, &monsters);
+        for avatar in roster(3) {
+            data.extend(field_bytes(9, &avatar.write_to_bytes().unwrap()));
+        }
+        let (field, avatars) = discover_avatars(&data).expect("a roster");
+        assert_eq!(field, 9);
+        assert_eq!(avatars.len(), 3);
+    }
+
+    #[test]
+    fn avatars_without_a_level_are_not_a_roster() {
+        let unlevelled: Vec<AvatarInfo> = roster(5)
+            .into_iter()
+            .map(|mut avatar| {
+                let level = avatar.prop_map.remove(&PROP_LEVEL).unwrap();
+                avatar.prop_map.insert(1002, level);
+                avatar
+            })
+            .collect();
+        assert!(matches_avatars_all_data_notify(&roster_payload(7, &unlevelled)).is_none());
+    }
+
+    #[test]
+    fn a_roster_has_to_be_mostly_playable_characters() {
+        let mut mixed = roster(3);
+        mixed.extend((0..3u32).map(|i| avatar(24_000_000 + i, guid(100 + u64::from(i)))));
+        assert!(
+            matches_avatars_all_data_notify(&roster_payload(7, &mixed)).is_none(),
+            "half is not most"
+        );
+
+        mixed.push(avatar(10_000_099, guid(99)));
+        assert_eq!(
+            matches_avatars_all_data_notify(&roster_payload(7, &mixed))
+                .unwrap()
+                .len(),
+            7,
+            "every kept entry is returned, the implausible ones included"
         );
     }
 
