@@ -55,7 +55,7 @@ const VALIDATE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// backend cannot initialise, which is exactly when `reqwest::Client::new`
 /// panics too.
 static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
+    crate::http_client_builder()
         .timeout(VALIDATE_REQUEST_TIMEOUT)
         .connect_timeout(VALIDATE_CONNECT_TIMEOUT)
         .build()
