@@ -183,6 +183,16 @@ const REBIND_AFTER: usize = 32;
 /// a session that is really alive reaches it within a minute or so.
 const PENDING_RESET_DISARM_MESSAGES: u32 = 64;
 
+/// `PacketHead` field the server sets on a compressed message: the payload's
+/// length once decompressed.
+///
+/// Not in the protos -- no generated type knows it -- so it is read from the
+/// header's unknown fields. Seen on 2026-10-05 on the `GetPlayerTokenRsp` from
+/// some gate servers only (25,563 bytes sent as 20,118), and on no other
+/// message of that session. This build cannot decompress it, so all it can do
+/// is say so.
+const COMPRESSED_LEN_FIELD: u32 = 8;
+
 /// Entries a property notify needs before it is believed.
 ///
 /// Deliberately unchanged. Lowering it to catch single-property delta notifies
@@ -573,6 +583,13 @@ pub struct GameSniffer {
     session_rederive_exhausted: bool,
     /// Full bruteforce runs already spent on the current [`SessionSeeds`].
     bruteforce_attempts: u32,
+    /// The dispatch key stopped decrypting this connection with no session
+    /// seeds to recover its successor from: the token response never arrived
+    /// in a form this build can read. Nothing of the connection can decrypt,
+    /// so it counts as a given-up key recovery.
+    seedless_login: bool,
+    /// A compressed message was reported for this connection (once).
+    compressed_reported: bool,
     /// A handshake request arrived while a session key was live. Nothing about
     /// that datagram is authenticated, so the reset it asks for waits for
     /// corroboration.
@@ -649,7 +666,8 @@ impl GameSniffer {
     /// decrypts in the meantime, so a caller can tell the user to log in again
     /// instead of showing a capture that looks healthy and stays empty.
     pub fn key_recovery_failed(&self) -> bool {
-        self.bruteforce_attempts >= MAX_BRUTEFORCE_ATTEMPTS
+        (self.bruteforce_attempts >= MAX_BRUTEFORCE_ATTEMPTS
+            || (self.seedless_login && self.session_seeds.is_none()))
             && !matches!(self.key, Some(Key::Session(_)))
     }
 
@@ -749,6 +767,8 @@ impl GameSniffer {
         self.session_failures = 0;
         self.session_rederive_exhausted = false;
         self.bruteforce_attempts = 0;
+        self.seedless_login = false;
+        self.compressed_reported = false;
         self.pending_reset = false;
         self.pending_reset_proof = 0;
     }
@@ -1110,7 +1130,18 @@ impl GameSniffer {
     /// Recover the session key from the retained seeds.
     fn recover_session_key(&mut self, data: &[u8]) -> bool {
         let Some(session) = self.session_seeds.clone() else {
-            debug!("no session seeds retained yet; dropping the message");
+            // Said once: every later message of the connection lands here too,
+            // and a log that just stops looks like a game that went quiet.
+            if !self.seedless_login {
+                warn!(
+                    "the login moved past the dispatch key, but no token response with readable \
+                     session seeds was seen; this connection cannot be decrypted -- return to the \
+                     title screen and enter the world again"
+                );
+            } else {
+                debug!("no session seeds retained yet; dropping the message");
+            }
+            self.seedless_login = true;
             return false;
         };
 
@@ -1247,6 +1278,7 @@ impl GameSniffer {
         }
 
         let Some(seeds) = matches_get_player_token_rsp(&command.proto_data, &self.rsa_keys) else {
+            self.report_compressed(command);
             return;
         };
 
@@ -1266,6 +1298,7 @@ impl GameSniffer {
                 // `time_anchors` stays: that is where a reconnect's key is found.
                 self.last_time_seed = None;
                 self.bruteforce_attempts = 0;
+                self.seedless_login = false;
             }
             Err(e) => {
                 warn!(
@@ -1275,6 +1308,32 @@ impl GameSniffer {
                 );
             }
         }
+    }
+}
+
+impl GameSniffer {
+    /// Log, once per connection, a login message the server compressed.
+    ///
+    /// The token response is the one that matters: its seeds are what the
+    /// session key is recovered from, and compressed they are unreadable.
+    fn report_compressed(&mut self, command: &GameCommand) {
+        if self.compressed_reported {
+            return;
+        }
+        let Ok(header) = command.parse_header::<PacketHead>() else {
+            return;
+        };
+        let Some(Varint(declared)) = header.unknown_fields().get(COMPRESSED_LEN_FIELD) else {
+            return;
+        };
+        self.compressed_reported = true;
+        warn!(
+            command_id = command.command_id,
+            sent = command.proto_data.len(),
+            decompressed = declared,
+            "a login message arrived compressed (packet header field 8), which this build cannot \
+             read; if it is the token response, this login's session key cannot be recovered"
+        );
     }
 }
 
@@ -2499,6 +2558,78 @@ mod tests {
     /// A realistic login time, in the epoch milliseconds `PacketHead` carries.
     const LOGIN_MS: u64 = 1_759_553_801_000;
     const HOUR_MS: u64 = 3_600_000;
+
+    #[test]
+    fn a_compressed_token_response_is_reported_as_a_lost_key_at_once() {
+        // 2026-10-05 02:33 and 11:21: some gate servers send the
+        // `GetPlayerTokenRsp` compressed -- header field 8 is its decompressed
+        // length, the payload is not protobuf. It decrypts under the dispatch
+        // key and parses as a command, yields no seeds, and every message after
+        // it was dropped at debug level: no warning, no "key lost", nothing.
+        let mut sniffer = connected_sniffer();
+        let mut conn = Conn::new(131_847);
+        let dispatch = dispatch_key();
+        sniffer.receive_packet(handshake_frame());
+
+        let request = command_bytes(TOKEN_REQ, &[], &field_varint(1, 1));
+        assert_eq!(
+            command_ids(
+                &mut sniffer,
+                conn.push(PacketDirection::Sent, &dispatch, &request)
+            ),
+            vec![TOKEN_REQ]
+        );
+        // Not protobuf: wire type 7 right after the first field.
+        let compressed: Vec<u8> = [0x09, 0, 0xa8, 0x45, 0xf3, 0x09, 0x37, 0xf2, 0xdf, 0x7f]
+            .into_iter()
+            .chain((0..200u32).map(|i| (i * 37 + 11) as u8))
+            .collect();
+        let mut header = field_varint(3, 1);
+        header.extend(field_varint(6, LOGIN_MS));
+        header.extend(field_varint(COMPRESSED_LEN_FIELD, 25_563));
+        let response = command_bytes(TOKEN_RSP, &header, &compressed);
+
+        let logged = crate::test_support::warnings(|| {
+            assert_eq!(
+                command_ids(
+                    &mut sniffer,
+                    conn.push(PacketDirection::Received, &dispatch, &response)
+                ),
+                vec![TOKEN_RSP],
+                "the response still decrypts under the dispatch key"
+            );
+            assert!(sniffer.session_seeds.is_none());
+            assert!(!sniffer.key_recovery_failed(), "nothing is lost yet");
+
+            let session = new_key_from_seed(0x1111_2222_3333_4444);
+            for _ in 0..3 {
+                assert!(
+                    command_ids(&mut sniffer, conn.server_message(&session, SESSION_MESSAGE))
+                        .is_empty()
+                );
+            }
+        });
+
+        assert!(sniffer.key_recovery_failed(), "the UI can say so at once");
+        assert_eq!(sniffer.key_state(), KeyState::Dispatch);
+        assert_eq!(
+            logged.iter().filter(|l| l.contains("compressed")).count(),
+            1,
+            "{logged:#?}"
+        );
+        assert_eq!(
+            logged
+                .iter()
+                .filter(|l| l.contains("no token response with readable session seeds"))
+                .count(),
+            1,
+            "said once, not per message: {logged:#?}"
+        );
+
+        // A new login starts clean.
+        sniffer.receive_packet(handshake_frame());
+        assert!(!sniffer.key_recovery_failed());
+    }
 
     #[test]
     fn a_first_login_recovers_the_session_key_from_the_send_time() {
