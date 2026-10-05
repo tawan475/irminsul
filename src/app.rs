@@ -1606,29 +1606,20 @@ impl IrminsulApp {
     /// later. Dismissing leaves the red status line in place, so the state is
     /// never hidden -- only the interruption is.
     fn game_missed_modal(&mut self, ui: &mut egui::Ui, cause: Option<MissedLaunch>) {
-        // Wider than the other modals on purpose: this one carries two full
-        // sentences of explanation, and at 420 the last word of a line kept
-        // being pushed onto one of its own.
-        ui.set_width(520.0);
+        ui.set_width(420.0);
         ui.heading(match cause {
             Some(MissedLaunch::CaptureStopped) => "Genshin ran while capture was off",
             _ => "Genshin was already in the world",
         });
         ui.separator();
         ui.label(match cause {
-            Some(MissedLaunch::CaptureStopped) => {
-                "Genshin was running while packet capture was stopped, so Irminsul missed the login handshake and has no key for this session. Nothing can be captured from it, however long you leave it running."
-            }
-            _ => {
-                "This game session logged in before Irminsul started: game traffic is arriving with no login in it, so Irminsul has no key for this session. Nothing can be captured from it, however long you leave it running. (Opening Irminsul while Genshin is on the title screen is fine; this only appears once you are in the world.)"
-            }
+            Some(MissedLaunch::CaptureStopped) => "Capture was off when you logged in.",
+            _ => "Irminsul started after you entered the world.",
         });
         ui.add_space(6.0);
         ui.label(
-            RichText::new(
-                "Fix: with Irminsul running, return to the title screen and enter the world again, or close Genshin and start it again.",
-            )
-            .strong(),
+            RichText::new("Return to the title screen and enter again, or restart Genshin.")
+                .strong(),
         );
         ui.separator();
 
@@ -1650,7 +1641,7 @@ impl IrminsulApp {
                 if ui
                     .button("Close Irminsul")
                     .on_hover_text(
-                        "Quit Irminsul. Start it before Genshin next time so it can watch the login handshake.",
+                        "Start Irminsul before Genshin next time.",
                     )
                     .clicked()
                 {
@@ -1661,7 +1652,7 @@ impl IrminsulApp {
                     if ui
                         .button("Close Genshin")
                         .on_hover_text(
-                            "Force the game to exit so you can start it again with capture running. Your account progress is stored on the server and is safe, but anything in progress right now -- a domain run, a boss fight -- is lost.",
+                            "Force-quits the game. Progress is safe; a domain run or fight in progress is lost.",
                         )
                         .clicked()
                     {
@@ -2551,8 +2542,8 @@ impl IrminsulApp {
                             } else {
                                 self.wish_link_failed_for = None;
                                 self.toasts.error(
-                                    "No achievement data captured yet. Open the Achievements \
-                                     menu in-game.",
+                                    "No achievements yet: they arrive when you enter the world \
+                                     with Irminsul running.",
                                 );
                             }
                         }
@@ -2606,7 +2597,7 @@ impl IrminsulApp {
                 } else {
                     self.wish_link_failed_for = None;
                     self.toasts
-                        .error("Export failed. Please open the achievements menu in-game first.");
+                        .error("Export failed: no achievements yet. Enter the world with Irminsul running.");
                 }
             }
         }
