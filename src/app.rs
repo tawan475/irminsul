@@ -2,8 +2,6 @@ use std::fmt::Display;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-#[cfg(target_os = "windows")]
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -21,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
+use crate::autostart::Startup;
 use crate::capture;
 use crate::monitor::TrackerAccount;
 
@@ -75,6 +74,10 @@ const CAPTURE_SUCCESS_DISPLAY: Duration = Duration::from_secs(5);
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct SavedAppState {
     pub export_settings: ExportSettings,
+    /// Whether Windows starts Irminsul at sign-in: the last state read from
+    /// Task Scheduler (see `autostart.rs`), which overrides this on every
+    /// read. Only a cache, kept so the checkbox has something to show before
+    /// the first read.
     #[serde(default)]
     pub start_on_startup: bool,
     #[serde(default)]
@@ -491,6 +494,10 @@ pub struct IrminsulApp {
     minimize_modal_remember: bool,
 
     app_settings_open: bool,
+
+    /// "Start Irminsul on startup": the scheduled task's state, read in the
+    /// background, and the warning when it starts another copy.
+    startup: Startup,
 }
 
 trait ToastError<T> {
@@ -508,47 +515,6 @@ impl<T, E: Display> ToastError<T> for std::result::Result<T, E> {
             }
         }
     }
-}
-
-#[cfg(windows)]
-fn set_launch_on_startup(enabled: bool) -> Result<()> {
-    const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
-    const RUN_VALUE_NAME: &str = "Irminsul";
-
-    if enabled {
-        let current_exe = std::env::current_exe()?;
-        let command_value = format!("\"{}\"", current_exe.display());
-        let status = Command::new("reg")
-            .args([
-                "add",
-                RUN_KEY,
-                "/v",
-                RUN_VALUE_NAME,
-                "/t",
-                "REG_SZ",
-                "/d",
-                &command_value,
-                "/f",
-            ])
-            .status()?;
-        if !status.success() {
-            return Err(anyhow!("Failed to register Irminsul startup entry"));
-        }
-    } else {
-        let status = Command::new("reg")
-            .args(["delete", RUN_KEY, "/v", RUN_VALUE_NAME, "/f"])
-            .status()?;
-        if !status.success() {
-            return Err(anyhow!("Failed to remove Irminsul startup entry"));
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn set_launch_on_startup(_enabled: bool) -> Result<()> {
-    Err(anyhow!("Start on startup is only supported on Windows"))
 }
 
 /// Decode the bundled icon into the form `tray-icon` wants.
@@ -724,6 +690,10 @@ impl IrminsulApp {
 
         let toasts = Toasts::default().with_anchor(egui_notify::Anchor::BottomLeft);
 
+        // Moves a Run entry left by an older version to a scheduled task, then
+        // reads what Windows will start at sign-in.
+        let startup = Startup::new(&cc.egui_ctx);
+
         // Auto-verify tracker key on startup
         let tracker_verify_rx = if !saved_state.tracker_import_key.is_empty() {
             let key = saved_state.tracker_import_key.clone();
@@ -886,6 +856,7 @@ impl IrminsulApp {
             minimize_modal_open: false,
             minimize_modal_remember: true,
             app_settings_open: false,
+            startup,
             monitor_cancel_token: cancel_token,
             monitor_handle: Some(monitor_handle),
             install_lock,
@@ -1186,6 +1157,11 @@ impl IrminsulApp {
         self.achievements_handle_export(ctx).toast_error(self);
         self.poll_tracker_upload();
         self.poll_tracker_verify();
+        self.startup.poll(
+            ctx,
+            &mut self.saved_state.start_on_startup,
+            &mut self.toasts,
+        );
     }
 
     fn poll_tracker_upload(&mut self) {
@@ -1869,6 +1845,8 @@ impl IrminsulApp {
                 self.automation_settings_open = false;
             }
         }
+        self.startup
+            .modal_ui(ui.ctx(), self.saved_state.start_on_startup);
 
         ui.vertical(|ui| {
             egui::Sides::new().show(
@@ -1880,19 +1858,8 @@ impl IrminsulApp {
             );
 
             ui.add_enabled_ui(true, |ui| {
-                let previous_startup = self.saved_state.start_on_startup;
-                if ui
-                    .checkbox(
-                        &mut self.saved_state.start_on_startup,
-                        "Start Irminsul on startup",
-                    )
-                    .changed()
-                    && let Err(e) = set_launch_on_startup(self.saved_state.start_on_startup)
-                {
-                    self.saved_state.start_on_startup = previous_startup;
-                    tracing::error!("Unable to update startup behavior: {e}");
-                    self.toasts.error("Unable to update startup behavior");
-                }
+                self.startup
+                    .checkbox_ui(ui, &mut self.saved_state.start_on_startup);
                 ui.horizontal(|ui| {
                     ui.checkbox(
                         &mut self.saved_state.save_result_to_file,
