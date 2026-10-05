@@ -18,6 +18,7 @@ use crate::player_data::ExportSettings;
 
 mod admin;
 mod app;
+mod autostart;
 mod capture;
 mod game_watch;
 mod good;
