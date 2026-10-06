@@ -56,6 +56,10 @@ pub const CLEAN_EXIT_MARKER: &str = "[clean-exit]";
 /// it.
 const TAIL_BYTES: u64 = 256 * 1024;
 
+/// How much earlier than the run's first log line a crash report's file time
+/// may be and still belong to that run (see [`classify`]).
+const CLOCK_SLACK: chrono::TimeDelta = chrono::TimeDelta::seconds(2);
+
 struct Paths {
     latest_log: PathBuf,
     crash_log: PathBuf,
@@ -283,8 +287,12 @@ fn classify(head: &str, tail: &str, crash_log_modified: Option<SystemTime>) -> R
     // Backtraces and other multi-line messages put lines without a time at
     // the end; the last line that has one is when the log went quiet.
     let last_line = tail.lines().rev().find_map(line_time).or(started);
+    // File times come from a coarser clock than the log's timestamps and can
+    // land a few milliseconds before the run's first line when the report is
+    // written right after it starts, so allow a little slack. A report from
+    // an earlier run can't be that close to this run's start.
     let reported = match (started, crash_log_modified) {
-        (Some(started), Some(modified)) => DateTime::<Utc>::from(modified) >= started,
+        (Some(started), Some(modified)) => DateTime::<Utc>::from(modified) + CLOCK_SLACK >= started,
         _ => false,
     };
     if reported {
@@ -466,6 +474,14 @@ mod tests {
         let during = started + Duration::from_secs(3600);
         assert_eq!(
             classify(START, tail, Some(during)),
+            RunEnd::Crashed { last_line }
+        );
+
+        // Written right after the start, its file time can read a few
+        // milliseconds before the log's clock: still this run.
+        let just_after_start = started - Duration::from_millis(15);
+        assert_eq!(
+            classify(START, tail, Some(just_after_start)),
             RunEnd::Crashed { last_line }
         );
 
