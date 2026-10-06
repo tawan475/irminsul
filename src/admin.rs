@@ -145,6 +145,7 @@ fn show_packet_capture_permissions_missing_dialog() {
                     |ui| {
                         ui.add_space(10.0); // Small margin from bottom edge
                         if ui.button("OK").clicked() {
+                            crate::crash::mark_clean_exit(PERMISSIONS_MISSING);
                             std::process::exit(1);
                         }
                     },
@@ -153,5 +154,11 @@ fn show_packet_capture_permissions_missing_dialog() {
         },
     );
 
+    crate::crash::mark_clean_exit(PERMISSIONS_MISSING);
     std::process::exit(1);
 }
+
+/// The clean-exit reason when the permissions dialog ends the process; without
+/// a marker the next start would call this exit abrupt.
+#[cfg(unix)]
+const PERMISSIONS_MISSING: &str = "packet capture permissions are missing";

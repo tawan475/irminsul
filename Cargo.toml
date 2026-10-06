@@ -113,7 +113,20 @@ pktmon = { version = "0.6.2", features = ["tokio"] }
 # On Windows pcap is optional (needs the Npcap SDK); pktmon is the default backend.
 pcap = { version = "2.3.0", features = ["capture-stream"], optional = true }
 windows = { version = "0.61.3", features = [
+	# RegisterClassW, for the hidden window that hears Windows end the session
+	# (crash/native.rs); its WNDCLASSW carries a brush type.
+	"Win32_Graphics_Gdi",
+	# CreateThread names a SECURITY_ATTRIBUTES type (crash/native.rs).
+	"Win32_Security",
+	# MiniDumpWriteDump is gated on these three besides Diagnostics_Debug.
+	"Win32_Storage_FileSystem",
 	"Win32_System_Console",
+	# SetUnhandledExceptionFilter and MiniDumpWriteDump (crash/native.rs).
+	"Win32_System_Diagnostics_Debug",
+	"Win32_System_Kernel",
+	# Which module a crash address is in (crash/native.rs).
+	"Win32_System_LibraryLoader",
+	"Win32_System_Memory",
 	"Win32_System_Registry",
 	# SetProcessWorkingSetSize: give back RAM while the window is hidden (app.rs).
 	"Win32_System_Threading",

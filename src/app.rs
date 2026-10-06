@@ -501,6 +501,10 @@ pub struct IrminsulApp {
 
     /// The window background, uploaded once; see [`load_background`].
     background: Option<egui::TextureHandle>,
+
+    /// Said once at startup when the previous run did not exit cleanly (see
+    /// `crash.rs`), until dismissed.
+    previous_run_notice: Option<String>,
 }
 
 trait ToastError<T> {
@@ -757,6 +761,7 @@ impl IrminsulApp {
         capture_backend: capture::BackendType,
         capture_source: capture::CaptureSource,
         restart_requested: Arc<AtomicBool>,
+        previous_run_notice: Option<String>,
     ) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         egui_material_icons::initialize(&cc.egui_ctx);
@@ -961,6 +966,7 @@ impl IrminsulApp {
             app_settings_open: false,
             startup,
             background: load_background(&cc.egui_ctx),
+            previous_run_notice,
             monitor_cancel_token: cancel_token,
             monitor_handle: Some(monitor_handle),
             install_lock,
@@ -1246,6 +1252,7 @@ impl eframe::App for IrminsulApp {
         }
 
         self.toasts.show(ctx);
+        self.previous_run_notice_ui(ctx);
 
         // Push the latest saved state to the background thread
         let _ = self.saved_state_tx.send(self.saved_state.clone());
@@ -1253,6 +1260,44 @@ impl eframe::App for IrminsulApp {
 }
 
 impl IrminsulApp {
+    /// The notice that the previous run did not exit cleanly.
+    ///
+    /// A toast of its own rather than an `egui_notify` one, which cannot hold a
+    /// button, and one that stays until dismissed: Irminsul often starts at
+    /// sign-in, long before anyone looks at it. Top left, over the background
+    /// picture, where it covers nothing and no other toast goes.
+    fn previous_run_notice_ui(&mut self, ctx: &Context) {
+        let Some(notice) = &self.previous_run_notice else {
+            return;
+        };
+        let mut open_logs = false;
+        let mut dismiss = false;
+        egui::Area::new(Id::new("previous_run_notice"))
+            .anchor(egui::Align2::LEFT_TOP, [12.0, 44.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_max_width(320.0);
+                    ui.label(format!(
+                        "{} {notice}",
+                        egui_material_icons::icons::ICON_WARNING
+                    ));
+                    ui.horizontal(|ui| {
+                        open_logs = ui.button("Open log folder").clicked();
+                        dismiss = ui.button("Dismiss").clicked();
+                    });
+                });
+            });
+        if open_logs {
+            thread::spawn(|| {
+                let _ = open_log_dir();
+            });
+        }
+        if open_logs || dismiss {
+            self.previous_run_notice = None;
+        }
+    }
+
     /// Collect everything the background thread has answered since the last
     /// frame. Called once at the top of `update`.
     fn poll_background_results(&mut self, ctx: &Context) {
