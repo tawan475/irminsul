@@ -254,13 +254,21 @@ const PROP_MAX_STAMINA: PlayerProp = PlayerProp {
 ///
 /// `saturated_currency` is deliberately left in the loud bucket: it is real,
 /// rare data loss rather than a structural always-on miss.
+///
+/// It also carries what the export did hold, [`counts`](Self::counts).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ExportReport {
     dropped: BTreeMap<&'static str, usize>,
     degraded: BTreeMap<&'static str, usize>,
+    counts: ExportCounts,
 }
 
 impl ExportReport {
+    /// How many of each thing the export holds.
+    pub fn counts(&self) -> ExportCounts {
+        self.counts
+    }
+
     /// An entity was left out of the export entirely.
     fn record_dropped(&mut self, reason: &'static str) {
         *self.dropped.entry(reason).or_default() += 1;
@@ -416,7 +424,9 @@ fn merge_material(
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// What an export includes: the Genshin Optimizer settings the user edits, or
+/// [`ExportSettings::for_tracker`] for a tracker upload.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ExportSettings {
     pub include_characters: bool,
     pub include_artifacts: bool,
@@ -457,6 +467,105 @@ impl Default for ExportSettings {
             min_weapon_rarity: 3,
         }
     }
+}
+
+impl ExportSettings {
+    /// What a tracker upload exports: the whole account, as captured.
+    ///
+    /// The tracker keeps the account's history; it is not an optimizer's
+    /// input, so none of the Genshin Optimizer settings apply to it. Uploading
+    /// with them kept every 1★ and 2★ artifact and weapon out of the tracker
+    /// (the defaults alone set `min_*_rarity` to 3), and whatever else a user
+    /// filtered out for Genshin Optimizer. Field by field:
+    ///
+    /// * `include_*`: all on. A section left out reads, on the tracker, as an
+    ///   account that owns none of it.
+    /// * `fake_initialize_4th_line`: off. It is a Genshin Optimizer workaround
+    ///   that moves a 5★ three-liner's unactivated substat into `substats` and
+    ///   rewrites the piece to level 4 with 4 rolls. Uploaded, it would store a
+    ///   piece that does not exist, under a content hash the real piece never
+    ///   has.
+    /// * every `min_*`: 0, no minimum. That is below every real value, whether
+    ///   the field counts from 0 (artifact level, ascensions, constellations)
+    ///   or from 1 (character and weapon level, refinement, rarity). Values that
+    ///   cannot be real are still left out, but by the export's own checks
+    ///   (`CHARACTER_LEVEL_RANGE`, an artifact or weapon at level 0, ...), which
+    ///   count them in the [`ExportReport`] instead of dropping them silently.
+    ///
+    /// Written out in full, without `..`, so a new setting does not compile
+    /// until its tracker value has been chosen here.
+    pub fn for_tracker() -> Self {
+        Self {
+            include_characters: true,
+            include_artifacts: true,
+            include_weapons: true,
+            include_materials: true,
+            fake_initialize_4th_line: false,
+            min_character_level: 0,
+            min_character_ascension: 0,
+            min_character_constellation: 0,
+            min_artifact_level: 0,
+            min_artifact_rarity: 0,
+            min_weapon_level: 0,
+            min_weapon_refinement: 0,
+            min_weapon_ascension: 0,
+            min_weapon_rarity: 0,
+        }
+    }
+}
+
+/// How many of each thing an export holds.
+///
+/// For the log and the upload toast, so a user can hold the numbers against
+/// the game's own (the bag says 1,122 weapons; did 1,122 go up?).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExportCounts {
+    pub characters: usize,
+    pub artifacts: usize,
+    pub weapons: usize,
+    pub materials: usize,
+    pub achievements: usize,
+}
+
+impl ExportCounts {
+    fn of(good: &good::Good) -> Self {
+        Self {
+            characters: good.characters.len(),
+            artifacts: good.artifacts.len(),
+            weapons: good.weapons.len(),
+            materials: good.materials.len(),
+            achievements: good.gi_achievements.as_ref().map_or(0, Vec::len),
+        }
+    }
+}
+
+/// e.g. `103 characters, 1,780 artifacts, 1,122 weapons, 1,547 materials,
+/// 1,840 achievements`.
+impl std::fmt::Display for ExportCounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} characters, {} artifacts, {} weapons, {} materials, {} achievements",
+            group_thousands(self.characters),
+            group_thousands(self.artifacts),
+            group_thousands(self.weapons),
+            group_thousands(self.materials),
+            group_thousands(self.achievements),
+        )
+    }
+}
+
+/// `1122` as `1,122`.
+fn group_thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
 }
 
 pub struct PlayerData {
@@ -863,6 +972,7 @@ impl PlayerData {
     pub fn export_at(&self, settings: &ExportSettings, now_ms: u64) -> (good::Good, ExportReport) {
         let mut report = ExportReport::default();
         let good = self.build_good(settings, &mut report, now_ms);
+        report.counts = ExportCounts::of(&good);
 
         if report.has_degradations() {
             tracing::debug!(
@@ -1414,6 +1524,21 @@ impl PlayerData {
                 let level = weapon.level;
                 let ascension = weapon.promote_level;
 
+                // A real weapon is level 1 or more, so 0 is a `Weapon` that
+                // left out its level (the proto3 default). The Genshin
+                // Optimizer minimum, 1 or more, used to drop it in silence; the
+                // tracker's is 0, so drop it here and count it, rather than
+                // upload a level no weapon has.
+                if level == 0 {
+                    tracing::warn!(
+                        item_id = item.item_id,
+                        guid = item.guid,
+                        "weapon reports level 0; dropping it from the export"
+                    );
+                    report.record_dropped("invalid_weapon_level");
+                    return None;
+                }
+
                 if level < settings.min_weapon_level
                     || refinement < settings.min_weapon_refinement
                     || ascension < settings.min_weapon_ascension
@@ -1629,24 +1754,9 @@ mod tests {
         )
     }
 
-    /// Export settings that filter nothing out.
+    /// Export settings that filter nothing out: the tracker's.
     fn settings() -> ExportSettings {
-        ExportSettings {
-            include_characters: true,
-            include_artifacts: true,
-            include_weapons: true,
-            include_materials: true,
-            fake_initialize_4th_line: false,
-            min_character_level: 0,
-            min_character_ascension: 0,
-            min_character_constellation: 0,
-            min_artifact_level: 0,
-            min_artifact_rarity: 0,
-            min_weapon_level: 0,
-            min_weapon_refinement: 0,
-            min_weapon_ascension: 0,
-            min_weapon_rarity: 0,
-        }
+        ExportSettings::for_tracker()
     }
 
     fn character(avatar_id: u32, skill_levels: &[(u32, u32)]) -> AvatarInfo {
@@ -2726,5 +2836,185 @@ mod tests {
             describe_character_extras("HuTao", &extra(Some(10), Some(1_646_092_800))),
             "HuTao friendship 10 obtained 2022-03-01"
         );
+    }
+
+    // -- the tracker's export settings ---------------------------------------------
+
+    fn weapon_item(item_id: u32, guid: u64, level: u32) -> Item {
+        let mut item = Item::new();
+        item.item_id = item_id;
+        item.guid = guid;
+        let mut equip = auto_artifactarium::r#gen::protos::Equip::new();
+        let mut weapon = auto_artifactarium::r#gen::protos::Weapon::new();
+        weapon.level = level;
+        equip.set_weapon(weapon);
+        item.set_equip(equip);
+        item
+    }
+
+    /// An artifact at `wire_level` (1 based: 1 is GOOD level 0).
+    fn artifact_item(
+        item_id: u32,
+        guid: u64,
+        wire_level: u32,
+        substats: &[u32],
+        unactivated: &[u32],
+    ) -> Item {
+        let mut item = Item::new();
+        item.item_id = item_id;
+        item.guid = guid;
+        let mut equip = auto_artifactarium::r#gen::protos::Equip::new();
+        let mut reliquary = auto_artifactarium::r#gen::protos::Reliquary::new();
+        reliquary.level = wire_level;
+        reliquary.main_prop_id = 10001;
+        reliquary.append_prop_id_list = substats.to_vec();
+        reliquary.unactivated_prop_id_list = unactivated.to_vec();
+        equip.set_reliquary(reliquary);
+        item.set_equip(equip);
+        item
+    }
+
+    /// An inventory that every Genshin Optimizer default leaves something out
+    /// of: a 1★ and a 2★ artifact and weapon, all unleveled, and a 5★
+    /// three-liner with its fourth substat still unactivated, which is the
+    /// piece `fake_initialize_4th_line` rewrites.
+    fn low_rarity_inventory() -> PlayerData {
+        let mut data = PlayerData::new(
+            TestGameData {
+                affix_map: r#""501204": {"property": "CritRate", "value": 3.89},
+                              "501234": {"property": "CritDamage", "value": 7.77},
+                              "501024": {"property": "AttackPercent", "value": 5.83},
+                              "501054": {"property": "EnergyRecharge", "value": 6.48}"#,
+                artifact_map: r#""71510": {"set": "Adventurer", "slot": "Flower", "rarity": 1},
+                                 "73510": {"set": "Lucky Dog", "slot": "Flower", "rarity": 2},
+                                 "81524": {"set": "Crimson Witch of Flames", "slot": "Flower", "rarity": 5}"#,
+                property_map: r#""10001": "Hp""#,
+                weapon_map: r#""11101": {"name": "Dull Blade", "rarity": 1},
+                               "11201": {"name": "Silver Sword", "rarity": 2},
+                               "13501": {"name": "Staff of Homa", "rarity": 5}"#,
+                ..Default::default()
+            }
+            .build(),
+        );
+        data.process_items(&[
+            artifact_item(71510, 1, 1, &[], &[]),
+            artifact_item(73510, 2, 1, &[501204], &[]),
+            artifact_item(81524, 3, 1, &[501204, 501234, 501024], &[501054]),
+            weapon_item(11101, 4, 1),
+            weapon_item(11201, 5, 1),
+            weapon_item(13501, 6, 90),
+        ]);
+        data
+    }
+
+    /// The Genshin Optimizer settings a user could have saved: the defaults,
+    /// plus the 4th-line workaround switched on.
+    fn optimizer_settings() -> ExportSettings {
+        ExportSettings {
+            fake_initialize_4th_line: true,
+            ..ExportSettings::default()
+        }
+    }
+
+    #[test]
+    fn the_tracker_export_holds_every_rarity_and_level_and_never_fakes_a_4th_line() {
+        let data = low_rarity_inventory();
+
+        let (good, report) = data.export_at(&ExportSettings::for_tracker(), GOLDEN_TIMESTAMP_MS);
+        assert!(report.is_empty(), "{}", report.summary());
+
+        let mut artifacts: Vec<(u32, u32, usize, u32, usize)> = good
+            .artifacts
+            .iter()
+            .map(|a| {
+                (
+                    a.rarity,
+                    a.level,
+                    a.substats.len(),
+                    a.total_rolls,
+                    a.unactivated_substats.len(),
+                )
+            })
+            .collect();
+        artifacts.sort();
+        // (rarity, level, substats, rolls, unactivated): every piece, at its
+        // real level, and the 5★ still a three-liner with its fourth line
+        // unactivated.
+        assert_eq!(
+            artifacts,
+            [(1, 0, 0, 0, 0), (2, 0, 1, 1, 0), (5, 0, 3, 3, 1)]
+        );
+
+        let mut weapons: Vec<(&str, u32)> = good
+            .weapons
+            .iter()
+            .map(|w| (w.key.as_str(), w.level))
+            .collect();
+        weapons.sort();
+        assert_eq!(
+            weapons,
+            [("DullBlade", 1), ("SilverSword", 1), ("StaffOfHoma", 90)]
+        );
+
+        assert_eq!(report.counts().artifacts, 3);
+        assert_eq!(report.counts().weapons, 3);
+    }
+
+    #[test]
+    fn the_tracker_export_ignores_the_users_optimizer_settings() {
+        let data = low_rarity_inventory();
+
+        // What the Genshin Optimizer file gets is unchanged: 3★ and up, and
+        // the faked fourth line the user asked for.
+        let (optimizer, _) = data.export_at(&optimizer_settings(), GOLDEN_TIMESTAMP_MS);
+        assert_eq!(optimizer.weapons.len(), 1);
+        assert_eq!(optimizer.artifacts.len(), 1);
+        assert_eq!(optimizer.artifacts[0].level, 4);
+        assert_eq!(optimizer.artifacts[0].substats.len(), 4);
+
+        // The tracker's settings are fixed: nothing the user saved reaches
+        // them.
+        let (tracker, _) = data.export_at(&ExportSettings::for_tracker(), GOLDEN_TIMESTAMP_MS);
+        assert_eq!(tracker.weapons.len(), 3);
+        assert_eq!(tracker.artifacts.len(), 3);
+        assert!(tracker.artifacts.iter().all(|a| a.level == 0));
+        let tracker_settings = ExportSettings::for_tracker();
+        assert!(!tracker_settings.fake_initialize_4th_line);
+        assert!(
+            tracker_settings.include_characters
+                && tracker_settings.include_artifacts
+                && tracker_settings.include_weapons
+                && tracker_settings.include_materials
+        );
+    }
+
+    #[test]
+    fn a_weapon_without_a_level_is_counted_instead_of_uploaded_at_level_0() {
+        let mut data = low_rarity_inventory();
+        data.process_items(&[weapon_item(11101, 7, 0)]);
+
+        let (good, report) = data.export_at(&ExportSettings::for_tracker(), GOLDEN_TIMESTAMP_MS);
+        assert_eq!(good.weapons.len(), 3);
+        assert!(good.weapons.iter().all(|w| w.level > 0));
+        assert_eq!(report.summary(), "invalid_weapon_level: 1");
+    }
+
+    #[test]
+    fn export_counts_read_like_the_game_counts() {
+        let counts = ExportCounts {
+            characters: 103,
+            artifacts: 1_780,
+            weapons: 1_122,
+            materials: 1_547,
+            achievements: 1_840,
+        };
+        assert_eq!(
+            counts.to_string(),
+            "103 characters, 1,780 artifacts, 1,122 weapons, 1,547 materials, 1,840 achievements"
+        );
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1_000), "1,000");
+        assert_eq!(group_thousands(1_234_567), "1,234,567");
     }
 }

@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::capture::{self, BackendType, CaptureSource, create_capture};
 use crate::game_watch::{self, GameStatus, GameWatch, SystemProcessDetector};
-use crate::player_data::PlayerData;
+use crate::player_data::{ExportReport, ExportSettings, PlayerData};
 use crate::{AppState, DataUpdated, Message, State};
 
 /// How long the automation trigger waits after the last new data before it
@@ -183,6 +183,44 @@ enum UploadReport {
 /// succeeded, so it doubles as the retry token: clearing it lets the same data
 /// be exported again.
 type AutomationSignature = (Option<Instant>, Option<Instant>, Option<Instant>);
+
+/// What an automated export writes, and with which settings.
+///
+/// The two destinations want different exports. The automation file is a
+/// Genshin Optimizer export and follows the user's settings; the tracker keeps
+/// the account's history and always gets all of it, whatever those settings
+/// filter out ([`ExportSettings::for_tracker`]). They used to share one export
+/// built with the user's settings, so the tracker never saw a 1★ or 2★
+/// artifact or weapon. The trigger and the export both read this, so what the
+/// trigger waits for is what the export writes.
+#[derive(Debug, PartialEq)]
+struct AutomationPlan {
+    /// The automation file's settings, when one is saved.
+    file: Option<ExportSettings>,
+    /// The tracker upload's settings, when one is made.
+    tracker: Option<ExportSettings>,
+}
+
+impl AutomationPlan {
+    fn for_state(state: &crate::app::SavedAppState) -> Self {
+        Self {
+            file: state
+                .save_result_to_file
+                .then(|| state.export_settings.clone()),
+            // The same predicate as the manual upload button.
+            tracker: crate::app::want_tracker_upload(state).then(ExportSettings::for_tracker),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.file.is_none() && self.tracker.is_none()
+    }
+
+    /// Every export the plan builds, by its settings.
+    fn settings(&self) -> impl Iterator<Item = &ExportSettings> {
+        self.file.iter().chain(self.tracker.iter())
+    }
+}
 
 /// What a capture task reports to the monitor.
 ///
@@ -1035,14 +1073,18 @@ impl Monitor {
                 let _ = reply_tx.send(killed);
                 self.ctx.request_repaint();
             }
+            // The UI picks the settings: the user's for a Genshin Optimizer
+            // file or clipboard export, the tracker's for an upload (see
+            // `OptimizerExportTarget::export_settings` in `app.rs`).
             Message::ExportGenshinOptimizer(settings, reply_tx) => {
                 let result = match self
                     .player_data
                     .export_genshin_optimizer_with_report(&settings)
                 {
                     Ok((json, report)) => {
+                        tracing::info!("export requested from the UI: {}", report.counts());
                         self.report_export_gaps(&report);
-                        Ok(json)
+                        Ok((json, report.counts()))
                     }
                     Err(e) => Err(e),
                 };
@@ -1533,13 +1575,12 @@ impl Monitor {
             return;
         }
         let saved_state = self.saved_state_rx.borrow().clone();
-        let want_file = saved_state.save_result_to_file;
-        // The same predicate the manual upload button uses. This used to omit
-        // `tracker_verified`, so a key the dashboard had revoked still got a
-        // POST on every login.
-        let want_tracker = crate::app::want_tracker_upload(&saved_state);
+        // The tracker half uses the same predicate the manual upload button
+        // does. This used to omit `tracker_verified`, so a key the dashboard
+        // had revoked still got a POST on every login.
+        let plan = AutomationPlan::for_state(&saved_state);
 
-        if !want_file && !want_tracker {
+        if plan.is_empty() {
             self.automation_pending_since = None;
             return;
         }
@@ -1549,13 +1590,16 @@ impl Monitor {
         let Some(cycle_started) = self.automation_cycle_started_at else {
             return;
         };
-        // Only the data classes this export will actually write, and all of
-        // them captured since the current capture cycle began. Demanding
-        // achievements as well -- as this and both manual export gates used to
-        // -- meant an account whose achievement packet was never identified got
-        // no automated export at all, not even of the characters and artifacts
-        // it did capture.
-        let classes = crate::app::export_data_classes(&saved_state.export_settings, updated);
+        // Only the data classes the plan's exports will actually write, and
+        // all of them captured since the current capture cycle began.
+        // Demanding achievements as well -- as this and both manual export
+        // gates used to -- meant an account whose achievement packet was never
+        // identified got no automated export at all, not even of the
+        // characters and artifacts it did capture.
+        let classes: Vec<_> = plan
+            .settings()
+            .flat_map(|settings| crate::app::export_data_classes(settings, updated))
+            .collect();
         if classes.is_empty()
             || !classes
                 .iter()
@@ -1596,6 +1640,7 @@ impl Monitor {
         tracing::info!("Executing background automation export!");
         self.automation_pending_since = None;
         let saved_state = self.saved_state_rx.borrow().clone();
+        let plan = AutomationPlan::for_state(&saved_state);
 
         let signature = (
             self.app_state.app_state.updated.items_updated,
@@ -1603,27 +1648,34 @@ impl Monitor {
             self.app_state.app_state.updated.achievements_updated,
         );
 
-        let (json, report) = match self
-            .player_data
-            .export_genshin_optimizer_with_report(&saved_state.export_settings)
-        {
-            Ok(export) => export,
-            Err(e) => {
-                let _ = self
-                    .toast_tx
-                    .send((format!("Failed to generate GO format: {}", e), true));
-                // The signature is deliberately not recorded: a failed export
-                // should be retried when the next data arrives.
+        // Both exports are built before anything is written or sent. The
+        // signature is deliberately not recorded when either fails: a failed
+        // export should be retried when the next data arrives.
+        let mut file_export = None;
+        if let Some(settings) = &plan.file {
+            let Some(export) = self.automation_export(settings, "automation file") else {
                 return;
-            }
-        };
-        self.report_export_gaps(&report);
+            };
+            file_export = Some(export);
+        }
+        let mut tracker_export = None;
+        if let Some(settings) = &plan.tracker {
+            let Some(export) = self.automation_export(settings, "tracker upload") else {
+                return;
+            };
+            tracker_export = Some(export);
+        }
+        // One toast, not one per export: the tracker's export leaves nothing
+        // out by choice, so every gap in the file's is in the tracker's too.
+        if let Some((_, report)) = tracker_export.as_ref().or(file_export.as_ref()) {
+            self.report_export_gaps(report);
+        }
         // Recorded now so a second trigger for the same data cannot start a
         // second export while this one is in flight, and given back below (or
         // by `release_automation_signature`) if any half of it failed.
         self.automation_last_signature = Some(signature);
 
-        if saved_state.save_result_to_file {
+        if let Some((json, _)) = file_export {
             match self.save_to_automation_file(&saved_state, &json) {
                 Ok(path) => {
                     let _ = self
@@ -1639,11 +1691,10 @@ impl Monitor {
             }
         }
 
-        // Same predicate as the trigger above and as the manual button.
-        if crate::app::want_tracker_upload(&saved_state) {
+        if let Some((json, report)) = tracker_export {
             let _ = self
                 .toast_tx
-                .send(("Uploading to Tracker...".to_string(), false));
+                .send((format!("Uploading to Tracker: {}", report.counts()), false));
             self.spawn_tracker_upload(
                 import_url(&saved_state.tracker_api_url),
                 saved_state.tracker_import_key.clone(),
@@ -1661,6 +1712,30 @@ impl Monitor {
         // retransmit, so every segment missed during the restart stalled that
         // direction permanently -- with the UI still showing "Capturing".
         self.ctx.request_repaint();
+    }
+
+    /// Build one of an automation run's exports, or toast why it could not be
+    /// built. `purpose` names it in the log line that gives its counts.
+    fn automation_export(
+        &self,
+        settings: &ExportSettings,
+        purpose: &str,
+    ) -> Option<(String, ExportReport)> {
+        match self
+            .player_data
+            .export_genshin_optimizer_with_report(settings)
+        {
+            Ok((json, report)) => {
+                tracing::info!("{purpose} export: {}", report.counts());
+                Some((json, report))
+            }
+            Err(e) => {
+                let _ = self
+                    .toast_tx
+                    .send((format!("Failed to build the {purpose} export: {e}"), true));
+                None
+            }
+        }
     }
 
     fn save_to_automation_file(
@@ -2015,6 +2090,67 @@ pub(crate) fn load_keys() -> Result<HashMap<u16, Vec<u8>>> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Automation on for both destinations, with Genshin Optimizer settings
+    /// that leave out characters, everything under 5★ and the real 4th line.
+    fn automation_state() -> crate::app::SavedAppState {
+        crate::app::SavedAppState {
+            save_result_to_file: true,
+            auto_export_to_tracker: true,
+            tracker_import_key: "gdt_import_1_abc".to_string(),
+            tracker_verified: true,
+            export_settings: ExportSettings {
+                include_characters: false,
+                fake_initialize_4th_line: true,
+                min_artifact_rarity: 5,
+                min_weapon_rarity: 5,
+                ..ExportSettings::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_automated_upload_exports_with_the_tracker_settings() {
+        let state = automation_state();
+        let plan = AutomationPlan::for_state(&state);
+
+        assert_eq!(plan.tracker, Some(ExportSettings::for_tracker()));
+        // The automation file is a Genshin Optimizer export, and keeps the
+        // user's settings.
+        assert_eq!(plan.file, Some(state.export_settings.clone()));
+    }
+
+    #[test]
+    fn the_automation_plan_follows_what_is_switched_on() {
+        let mut state = automation_state();
+        state.tracker_verified = false;
+        let plan = AutomationPlan::for_state(&state);
+        assert_eq!(plan.tracker, None);
+        assert!(plan.file.is_some());
+
+        state.save_result_to_file = false;
+        assert!(AutomationPlan::for_state(&state).is_empty());
+
+        state.tracker_verified = true;
+        let plan = AutomationPlan::for_state(&state);
+        assert_eq!(plan.file, None);
+        assert_eq!(plan.settings().count(), 1);
+    }
+
+    #[test]
+    fn the_automation_waits_for_what_the_upload_writes() {
+        // Characters are off for the file, but the upload holds them, so the
+        // trigger waits for them too.
+        let plan = AutomationPlan::for_state(&automation_state());
+        let updated = DataUpdated::new();
+        let names: Vec<&str> = plan
+            .settings()
+            .flat_map(|settings| crate::app::export_data_classes(settings, &updated))
+            .map(|class| class.name)
+            .collect();
+        assert!(names.contains(&"character data"), "{names:?}");
+    }
 
     #[test]
     fn a_replayed_recording_never_uploads_or_auto_exports() {

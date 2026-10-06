@@ -39,7 +39,7 @@ use tray_icon::{TrayIcon, TrayIconBuilder};
 use crate::game_watch::{GameStatus, MissedLaunch, Severity};
 use crate::good::GiPlayer;
 use crate::monitor::Monitor;
-use crate::player_data::ExportSettings;
+use crate::player_data::{ExportCounts, ExportSettings};
 use crate::update::{InstallLock, UpdateAnswer, check_for_app_update};
 use crate::{
     AppState, ConfirmationType, DataUpdated, Message, ReloadHandle, State, TracingLevel,
@@ -208,6 +208,22 @@ enum OptimizerExportTarget {
     Clipboard,
     File,
     TrackerManual,
+}
+
+impl OptimizerExportTarget {
+    /// The settings an export for this target is built with.
+    ///
+    /// The clipboard and the file are Genshin Optimizer exports and follow the
+    /// user's settings (`optimizer`). A tracker upload always carries the
+    /// whole account, whatever they filter out: it used to share them, so the
+    /// tracker never saw a 1★ or 2★ artifact or weapon. The automated upload
+    /// in `monitor.rs` makes the same split (`AutomationPlan`).
+    fn export_settings(&self, optimizer: &ExportSettings) -> ExportSettings {
+        match self {
+            Self::TrackerManual => ExportSettings::for_tracker(),
+            Self::None | Self::Clipboard | Self::File => optimizer.clone(),
+        }
+    }
 }
 
 /// The outcome of polling a background reply channel.
@@ -442,7 +458,7 @@ pub struct IrminsulApp {
     automation_folder_dialog: Option<FileDialog>,
 
     optimizer_settings_open: bool,
-    optimizer_export_rx: Option<oneshot::Receiver<Result<String>>>,
+    optimizer_export_rx: Option<oneshot::Receiver<Result<(String, ExportCounts)>>>,
     achievements_export_rx: Option<oneshot::Receiver<Result<Vec<u32>>>>,
     #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
     wish_url_rx_oneshot: Option<oneshot::Receiver<Result<String>>>,
@@ -1931,7 +1947,7 @@ impl IrminsulApp {
     fn genshin_optimizer_request_export(&mut self, target: OptimizerExportTarget) {
         let (tx, rx) = oneshot::channel();
         let _ = self.ui_message_tx.send(Message::ExportGenshinOptimizer(
-            self.saved_state.export_settings.clone(),
+            target.export_settings(&self.saved_state.export_settings),
             tx,
         ));
         self.optimizer_export_target = target;
@@ -2272,7 +2288,8 @@ impl IrminsulApp {
                             // enabled button whose handler then refuses is
                             // exactly what this used to be.
                             let missing = missing_export_data(
-                                &self.saved_state.export_settings,
+                                &OptimizerExportTarget::TrackerManual
+                                    .export_settings(&self.saved_state.export_settings),
                                 &app_state.updated,
                             );
                             ui.add_enabled_ui(
@@ -2502,6 +2519,14 @@ impl IrminsulApp {
     fn optimizer_settings_modal(&mut self, ui: &mut egui::Ui) {
         ui.set_width(300.0);
         ui.heading("Genshin Optimizer Settings");
+        // Kept short; the full reason is `ExportSettings::for_tracker`.
+        ui.label(
+            RichText::new(
+                "For file and clipboard exports. Tracker uploads always include everything.",
+            )
+            .small()
+            .color(Color32::GRAY),
+        );
         ui.separator();
         ui.checkbox(
             &mut self.saved_state.export_settings.include_characters,
@@ -2634,8 +2659,8 @@ impl IrminsulApp {
                 ));
             }
         };
-        let json = match json {
-            Ok(json) => json,
+        let (json, counts) = match json {
+            Ok(export) => export,
             Err(e) => {
                 self.optimizer_export_target = OptimizerExportTarget::None;
                 return Err(e);
@@ -2670,7 +2695,7 @@ impl IrminsulApp {
                             .warning(uid_mismatch_message(account, captured))
                             .duration(Some(Duration::from_secs(15)));
                     }
-                    self.tracker_upload_json(json);
+                    self.tracker_upload_json(json, counts);
                 } else if !self.saved_state.tracker_import_key.is_empty() {
                     self.toasts
                         .error("Tracker key not verified. Open settings to re-link.");
@@ -2705,7 +2730,7 @@ impl IrminsulApp {
         Ok(())
     }
 
-    fn tracker_upload_json(&mut self, json: String) {
+    fn tracker_upload_json(&mut self, json: String, counts: ExportCounts) {
         let key = self.saved_state.tracker_import_key.clone();
         let base_url = self.saved_state.tracker_api_url.clone();
         let url = format!(
@@ -2713,7 +2738,7 @@ impl IrminsulApp {
             base_url.trim_end_matches('/')
         );
 
-        self.toasts.info("Starting upload to Tracker...");
+        self.toasts.info(format!("Uploading to Tracker: {counts}"));
 
         let (tx, rx) = oneshot::channel();
         let _ = self
@@ -3115,6 +3140,91 @@ mod tests {
         assert_eq!(missing.len(), 1, "{missing:?}");
         assert!(missing[0].contains("inventory"), "{missing:?}");
         assert!(!missing_export_data_toast(&missing).contains("character"));
+    }
+
+    /// Genshin Optimizer settings that leave out all they can: no characters,
+    /// 5★ gear only, and the faked 4th line.
+    fn narrow_optimizer_settings() -> ExportSettings {
+        ExportSettings {
+            include_characters: false,
+            fake_initialize_4th_line: true,
+            min_artifact_level: 20,
+            min_artifact_rarity: 5,
+            min_weapon_level: 90,
+            min_weapon_rarity: 5,
+            ..ExportSettings::default()
+        }
+    }
+
+    #[test]
+    fn a_manual_tracker_upload_exports_with_the_tracker_settings() {
+        let optimizer = narrow_optimizer_settings();
+
+        assert_eq!(
+            OptimizerExportTarget::TrackerManual.export_settings(&optimizer),
+            ExportSettings::for_tracker()
+        );
+        // The Genshin Optimizer exports keep the user's settings.
+        for target in [
+            OptimizerExportTarget::File,
+            OptimizerExportTarget::Clipboard,
+        ] {
+            assert_eq!(target.export_settings(&optimizer), optimizer);
+        }
+    }
+
+    #[test]
+    fn the_upload_button_waits_for_what_the_upload_writes() {
+        // Characters are off for Genshin Optimizer, but the upload holds them,
+        // so the button waits for them too.
+        let optimizer = narrow_optimizer_settings();
+        let mut updated = DataUpdated::new();
+        updated.items_updated = Some(Instant::now());
+
+        assert!(missing_export_data(&optimizer, &updated).is_empty());
+        assert_eq!(
+            missing_export_data(
+                &OptimizerExportTarget::TrackerManual.export_settings(&optimizer),
+                &updated
+            ),
+            vec!["character data"]
+        );
+    }
+
+    /// The call sites, held to the two mappings the tests above pin: the UI's
+    /// one export request passes its target's settings, and the automation in
+    /// `monitor.rs` plans its trigger and its export with `AutomationPlan`
+    /// and never exports with the user's settings directly.
+    #[test]
+    fn both_tracker_upload_paths_take_their_settings_from_the_split() {
+        fn code(source: &'static str) -> &'static str {
+            source
+                .split("#[cfg(test)]")
+                .next()
+                .expect("the code comes first")
+        }
+        let app = code(include_str!("app.rs"));
+        let monitor = code(include_str!("monitor.rs"));
+
+        let request = app
+            .split("fn genshin_optimizer_request_export")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n").next())
+            .expect("app.rs has genshin_optimizer_request_export");
+        assert!(
+            request.contains("target.export_settings(&self.saved_state.export_settings)"),
+            "{request}"
+        );
+        assert_eq!(app.matches("Message::ExportGenshinOptimizer(").count(), 1);
+
+        assert_eq!(
+            monitor
+                .matches("AutomationPlan::for_state(&saved_state)")
+                .count(),
+            2,
+            "the automation trigger and the automation export"
+        );
+        assert!(!monitor.contains("_with_report(&saved_state.export_settings"));
     }
 
     #[test]
