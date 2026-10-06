@@ -1,7 +1,7 @@
 name: Create Release
 # Press "Run workflow" on main. The version is not typed: next_version.py takes
 # the base from Cargo.toml and appends the next -T-N from the existing tags
-# (v0.2.2-T-1, v0.2.2-T-2 -> 0.2.2-T-3; bumping Cargo.toml to 0.2.3 -> 0.2.3-T-1).
+# (v0.2.3-T.1, v0.2.3-T.2 -> 0.2.3-T.3; bumping Cargo.toml to 0.2.4 -> 0.2.4-T.1).
 # Nothing is committed to main (it's protected): the version is set only in the
 # build, and the release tag points at the commit that was built.
 on:
