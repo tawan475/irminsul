@@ -738,23 +738,49 @@ const CAPTURE_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30
 /// traffic without reporting an error.
 const CAPTURE_SILENCE_LIMIT: Duration = Duration::from_secs(60);
 
-/// Whether a capture that is up has gone silent on a running game.
+/// How long the capture has gone without a frame, counted only while the game
+/// runs.
 ///
-/// `last_frame` is when the current capture last delivered a frame, `None` if
-/// it has delivered none since it started. Only a capture that *was*
-/// delivering counts: a game on its title screen sends nothing, and restarting
-/// a capture that never heard anything would only open more blind windows --
-/// including right after this watchdog's own restart, which therefore happens
-/// at most once per silence.
-fn capture_stalled(
-    game_running: bool,
-    capturing: bool,
-    last_frame: Option<Instant>,
-    now: Instant,
-) -> bool {
-    game_running
-        && capturing
-        && last_frame.is_some_and(|at| now.saturating_duration_since(at) >= CAPTURE_SILENCE_LIMIT)
+/// Only a capture that *was* delivering during this game session counts: a
+/// game on its title screen sends nothing, and restarting a capture that never
+/// heard anything would only open more blind windows -- including right after
+/// this watchdog's own restart, which therefore happens at most once per
+/// silence.
+#[derive(Debug, Default)]
+struct CaptureSilence {
+    /// When the current capture last delivered a frame while the game ran;
+    /// `None` until it has.
+    last_frame_at: Option<Instant>,
+}
+
+impl CaptureSilence {
+    fn note_frame(&mut self, now: Instant) {
+        self.last_frame_at = Some(now);
+    }
+
+    /// A capture (re)started: it has heard nothing yet.
+    fn capture_started(&mut self) {
+        self.last_frame_at = None;
+    }
+
+    /// Checked on every game poll. `Some(silence)` when a capture that is up
+    /// has gone quiet on a running game for [`CAPTURE_SILENCE_LIMIT`] and
+    /// should be restarted.
+    ///
+    /// While the game is not running the count is dropped, not paused: the
+    /// quiet then is the game's absence, not the capture's fault. Carrying it
+    /// over is what restarted capture the moment Genshin started on
+    /// 2026-10-06 (`silent_secs=37116`, the whole night it had been closed),
+    /// opening a blind window at exactly the moment the login it needs is
+    /// about to go by.
+    fn stalled(&mut self, game_running: bool, capturing: bool, now: Instant) -> Option<Duration> {
+        if !game_running {
+            self.last_frame_at = None;
+            return None;
+        }
+        let silence = now.saturating_duration_since(self.last_frame_at?);
+        (capturing && silence >= CAPTURE_SILENCE_LIMIT).then_some(silence)
+    }
 }
 
 /// How long to let a killed game process actually exit before re-deriving the
@@ -787,9 +813,8 @@ pub struct Monitor {
     capture_retry_at: Option<Instant>,
     /// Consecutive capture failures, for the backoff.
     capture_failures: u32,
-    /// When the current capture last delivered a frame; `None` until it has.
-    /// See [`capture_stalled`].
-    last_frame_at: Option<Instant>,
+    /// The watchdog's view of the current capture; see [`CaptureSilence`].
+    capture_silence: CaptureSilence,
     game_watch: GameWatch,
     game_detector: SystemProcessDetector,
     game_poll: tokio::time::Interval,
@@ -893,7 +918,7 @@ impl Monitor {
             capture_source,
             capture_retry_at: None,
             capture_failures: 0,
-            last_frame_at: None,
+            capture_silence: CaptureSilence::default(),
             game_watch: GameWatch::default(),
             game_detector: SystemProcessDetector::new(),
             game_poll,
@@ -1066,7 +1091,7 @@ impl Monitor {
         ));
         self.capture_cancel_token = Some(cancel_token);
         self.capture_handle = Some(capture_handle);
-        self.last_frame_at = None;
+        self.capture_silence.capture_started();
         self.automation_cycle_started_at = Some(Instant::now());
         // Not `true`: everything that can fail -- no elevation, no such device,
         // an ETW session already owned by a previous process -- fails inside the
@@ -1108,19 +1133,15 @@ impl Monitor {
     /// stays up and silently stops delivering -- its packet stream still open,
     /// nothing in it -- looks healthy to everything else in this app.
     async fn watch_capture_silence(&mut self) {
-        let now = Instant::now();
-        if !capture_stalled(
+        let Some(silence) = self.capture_silence.stalled(
             self.game_watch.game_running(),
             self.app_state.app_state.capturing,
-            self.last_frame_at,
-            now,
-        ) {
+            Instant::now(),
+        ) else {
             return;
-        }
+        };
         tracing::warn!(
-            silent_secs = self
-                .last_frame_at
-                .map(|at| now.saturating_duration_since(at).as_secs()),
+            silent_secs = silence.as_secs(),
             "no packets captured for a minute while the game is running; restarting capture"
         );
         self.start_capture().await;
@@ -1169,7 +1190,7 @@ impl Monitor {
                 tracing::debug!("ignoring a start report from a capture that already stopped");
             }
             CaptureEvent::Packet(packet) => {
-                self.last_frame_at = Some(Instant::now());
+                self.capture_silence.note_frame(Instant::now());
                 self.handle_packet(packet);
             }
             CaptureEvent::Failed(e) => {
@@ -2292,35 +2313,90 @@ pub(crate) mod tests {
 
     // -- capture watchdog --------------------------------------------------------
 
+    /// A watchdog whose capture last heard a frame at `at`, during a game.
+    fn heard_at(at: Instant) -> CaptureSilence {
+        let mut silence = CaptureSilence::default();
+        silence.note_frame(at);
+        silence
+    }
+
     #[test]
     fn a_capture_that_went_silent_on_a_running_game_is_restarted() {
-        let now = Instant::now();
-        let Some(long_ago) = now.checked_sub(CAPTURE_SILENCE_LIMIT) else {
-            return;
-        };
-        assert!(capture_stalled(true, true, Some(long_ago), now));
+        let start = Instant::now();
+        let mut silence = heard_at(start);
+        let later = start + CAPTURE_SILENCE_LIMIT;
+        assert_eq!(
+            silence.stalled(true, true, later),
+            Some(CAPTURE_SILENCE_LIMIT)
+        );
     }
 
     #[test]
     fn the_watchdog_leaves_everything_else_alone() {
-        let now = Instant::now();
-        let Some(long_ago) = now.checked_sub(CAPTURE_SILENCE_LIMIT) else {
-            return;
-        };
-        let recent = now
-            .checked_sub(CAPTURE_SILENCE_LIMIT - Duration::from_secs(1))
-            .unwrap_or(now);
+        let start = Instant::now();
+        let long_after = start + CAPTURE_SILENCE_LIMIT;
 
         // Not silent long enough.
-        assert!(!capture_stalled(true, true, Some(recent), now));
+        let soon = start + CAPTURE_SILENCE_LIMIT - Duration::from_secs(1);
+        assert_eq!(heard_at(start).stalled(true, true, soon), None);
         // No game to hear from.
-        assert!(!capture_stalled(false, true, Some(long_ago), now));
+        assert_eq!(heard_at(start).stalled(false, true, long_after), None);
         // Capture is not up; the supervisor owns that case.
-        assert!(!capture_stalled(true, false, Some(long_ago), now));
+        assert_eq!(heard_at(start).stalled(true, false, long_after), None);
         // Nothing has arrived since this capture started -- a game sitting on
         // the title screen, or the capture the watchdog itself just restarted.
         // Restarting again would only open more blind windows.
-        assert!(!capture_stalled(true, true, None, now));
+        let mut restarted = heard_at(start);
+        restarted.capture_started();
+        assert_eq!(restarted.stalled(true, true, long_after), None);
+    }
+
+    #[test]
+    fn silence_while_the_game_was_closed_is_not_held_against_the_next_session() {
+        // 2026-10-05/06: the game closed at 19:30 and started again at 05:48;
+        // the watchdog restarted capture the moment it saw the game, calling
+        // the whole night (37116 s) silence.
+        let closed = Instant::now();
+        let mut silence = heard_at(closed);
+
+        // Every poll while the game is closed.
+        for minutes in [1, 60, 600] {
+            let at = closed + Duration::from_secs(minutes * 60);
+            assert_eq!(silence.stalled(false, true, at), None);
+        }
+
+        // Genshin starts: no restart, however long the night was ...
+        let started = closed + Duration::from_secs(37_116);
+        assert_eq!(silence.stalled(true, true, started), None);
+        // ... nor while it sits on the title screen, sending nothing.
+        let title_screen = started + 10 * CAPTURE_SILENCE_LIMIT;
+        assert_eq!(silence.stalled(true, true, title_screen), None);
+
+        // Once this session's traffic flows, its silence counts as before.
+        let login = title_screen + Duration::from_secs(5);
+        silence.note_frame(login);
+        assert_eq!(
+            silence.stalled(true, true, login + Duration::from_secs(30)),
+            None
+        );
+        assert_eq!(
+            silence.stalled(true, true, login + CAPTURE_SILENCE_LIMIT),
+            Some(CAPTURE_SILENCE_LIMIT)
+        );
+    }
+
+    #[test]
+    fn a_game_seen_closed_for_one_poll_forgets_the_silence_before_it() {
+        let start = Instant::now();
+        let mut silence = heard_at(start);
+        let later = start + CAPTURE_SILENCE_LIMIT;
+        // The scan missed the game once (it restarted, or a poll raced its
+        // exit): the next running poll starts counting afresh.
+        assert_eq!(silence.stalled(false, true, later), None);
+        assert_eq!(
+            silence.stalled(true, true, later + CAPTURE_SILENCE_LIMIT),
+            None
+        );
     }
 
     // -- the sniffer's stats line ----------------------------------------------
