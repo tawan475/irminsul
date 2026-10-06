@@ -10,7 +10,9 @@
 //! dispatch keys, so the session key is recovered from the recorded login;
 //! [`monitor::classify_commands`]; the [`DataReplacement`] rules for
 //! reconnects; [`monitor::apply_commands`] into a [`PlayerData`] -- and the
-//! state at the end of the recording is exported with the default settings.
+//! state at the end of the recording is exported as a tracker upload would be
+//! ([`ExportSettings::for_tracker`]: everything, whatever the Genshin
+//! Optimizer settings filter out).
 //!
 //! What a replay must never do, whatever the recording holds: upload anything
 //! or ask the tracker about a key (the data is old, and would be filed under
@@ -489,20 +491,24 @@ impl Replay {
                 );
                 chrono::Utc::now().timestamp_millis() as u64
             });
+        // What a tracker upload of this data would hold. The replay reads no
+        // saved settings, so the Genshin Optimizer ones would only ever have
+        // been their defaults, which leave 1★ and 2★ gear out.
         let (good, report) = self
             .player_data
-            .export_at(&ExportSettings::default(), now_ms);
+            .export_at(&ExportSettings::for_tracker(), now_ms);
 
+        let counts = report.counts();
         tracing::info!(
-            characters = good.characters.len(),
-            artifacts = good.artifacts.len(),
-            weapons = good.weapons.len(),
-            materials = good.materials.len(),
-            achievements = good.gi_achievements.as_ref().map_or(0, Vec::len),
+            characters = counts.characters,
+            artifacts = counts.artifacts,
+            weapons = counts.weapons,
+            materials = counts.materials,
+            achievements = counts.achievements,
             uid = ?good.gi_player.as_ref().and_then(|player| player.uid),
             data = %describe(self.captured),
             stamped = %when(Some(now_ms.saturating_mul(1_000_000))),
-            "export built with the default export settings"
+            "export built with the tracker's export settings (nothing filtered out)"
         );
         if !self.captured.items {
             tracing::warn!("no inventory was decoded: artifacts, weapons and materials are empty");

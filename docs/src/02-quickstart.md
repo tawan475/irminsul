@@ -89,6 +89,8 @@ Once the data has been captured, you can export:
 - To a file by clicking on the download icon.
 
 Which data gets exported can be controlled by clicking on the settings icon.
+These settings shape the Genshin Optimizer exports (clipboard, file and the
+automation file) only; a tracker upload always carries the whole account.
 
 ## Upload to a Genshin Data Tracker
 
@@ -99,6 +101,12 @@ tracker at <https://genshin-tracker.475.dev>:
 1. In the tracker dashboard, generate an **Import Key** for the Genshin account you want to fill.
 2. In Irminsul, click the gear icon in the "Tracker" section, paste the key, and click "Save & Close". Irminsul verifies the key and shows the account name, UID and server it belongs to.
 3. With a capture completed, click the cloud upload icon to send the current data. Tick "Auto export to tracker" in the same section to upload every completed capture automatically.
+
+An upload holds everything the capture saw -- every character, every artifact
+and weapon of any rarity and level, all materials and achievements -- whatever
+the Genshin Optimizer export settings leave out, and it never fakes an
+artifact's fourth line. The toast names the counts it sent (for example
+"1,122 weapons"), so you can hold them against the game's own.
 
 The same modal has a **Tracker API base URL** field, so a self-hosted tracker
 needs no rebuild -- point it at your backend's API base and click "Save &
