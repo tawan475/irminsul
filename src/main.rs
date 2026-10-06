@@ -14,7 +14,7 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, reload};
 
 use crate::game_watch::GameStatus;
-use crate::player_data::ExportSettings;
+use crate::player_data::{ExportCounts, ExportSettings};
 
 mod admin;
 mod app;
@@ -63,7 +63,11 @@ pub enum Message {
     StartCapture,
     StopCapture,
     ClearData,
-    ExportGenshinOptimizer(ExportSettings, oneshot::Sender<Result<String>>),
+    /// Build a GOOD export with these settings; the answer carries its counts.
+    ExportGenshinOptimizer(
+        ExportSettings,
+        oneshot::Sender<Result<(String, ExportCounts)>>,
+    ),
     ExportAchievements(oneshot::Sender<Result<Vec<u32>>>),
     /// Only sent by the wish UI, which exists on Windows and on Linux (through
     /// a Proton/Wine prefix) — the platforms where the game writes the
@@ -176,8 +180,9 @@ struct Args {
                      is needed to read it. It is decoded the way live capture decodes: the \
                      session key is recovered from the login in the recording, and a reconnect or \
                      a second login replaces the earlier data once it delivers its own. The state \
-                     at the end is exported with the default export settings (pretty-printed, \
-                     gi_* extras included) and stamped with the time its data was captured.\n\n\
+                     at the end is exported as a tracker upload would be: everything, whatever \
+                     the Genshin Optimizer export settings filter out (pretty-printed, gi_* \
+                     extras included), stamped with the time its data was captured.\n\n\
                      Nothing is uploaded, no key is verified, no automation file is saved, no \
                      update is checked for, no settings are read or written, nothing under \
                      Irminsul's data directory is touched, and the single-instance lock is not \
