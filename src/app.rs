@@ -1779,7 +1779,6 @@ impl IrminsulApp {
         // `egui::Sides` hands a `&mut Ui` to two closures at once, so neither
         // may borrow `self`. Decide here, act after.
         enum Choice {
-            CloseIrminsul,
             KillGame,
             Dismiss,
         }
@@ -1791,16 +1790,9 @@ impl IrminsulApp {
         egui::Sides::new().show(
             ui,
             |ui| {
-                if ui
-                    .button("Close Irminsul")
-                    .on_hover_text(
-                        "Start Irminsul before Genshin next time.",
-                    )
-                    .clicked()
-                {
-                    choice.set(Some(Choice::CloseIrminsul));
-                }
-
+                // No "quit Irminsul" here: next to a dismiss button it was
+                // clicked by mistake, and quitting doesn't fix a missed
+                // login anyway (entering the world again does).
                 ui.add_enabled_ui(!kill_pending, |ui| {
                     if ui
                         .button("Close Genshin")
@@ -1815,7 +1807,7 @@ impl IrminsulApp {
             },
             |ui| {
                 if ui
-                    .button("Close")
+                    .button(RichText::new("OK").strong())
                     .on_hover_text(
                         "Dismiss this. The game status line stays red until a session Irminsul watched start.",
                     )
@@ -1832,12 +1824,6 @@ impl IrminsulApp {
         self.game_missed_modal_open = false;
 
         match choice {
-            Choice::CloseIrminsul => {
-                // The ordinary close path, so the monitor and capture backend
-                // are torn down the way a window close tears them down rather
-                // than abandoned.
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-            }
             Choice::KillGame => {
                 let (tx, rx) = oneshot::channel();
                 if let Err(e) = self.ui_message_tx.send(Message::KillGame(tx)) {
