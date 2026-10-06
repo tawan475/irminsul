@@ -479,6 +479,12 @@ pub struct IrminsulApp {
     /// game session started while capture was off -- raises it again.
     game_missed_modal_shown_for: Option<MissedLaunch>,
     game_kill_rx: Option<oneshot::Receiver<usize>>,
+    /// The start-up memory release has been scheduled.
+    #[cfg(windows)]
+    startup_memory_released: bool,
+    /// The game status the last session memory release looked at.
+    #[cfg(windows)]
+    memory_release_status: GameStatus,
 
     #[allow(dead_code)]
     tray_icon: Option<TrayIcon>,
@@ -588,6 +594,52 @@ fn release_memory_once_hidden() {
     if let Err(e) = spawned {
         tracing::warn!("could not start the thread that releases hidden memory: {e}");
     }
+}
+
+/// How long after start-up its one-off memory is handed back: by then the
+/// first frames are drawn and the game data, fonts and TLS are set up.
+#[cfg(windows)]
+const RELEASE_STARTUP_MEMORY_DELAY: Duration = Duration::from_secs(10);
+
+/// How long after a game session starts decoding its login burst (the whole
+/// inventory, roster and achievements at once) is handed back.
+#[cfg(windows)]
+const RELEASE_SESSION_MEMORY_DELAY: Duration = Duration::from_secs(20);
+
+/// Hand back memory a one-off burst of work touched and won't touch again.
+///
+/// A never-minimized window was measured holding 435 MB of private working set
+/// for good, while the same window needed about 11 MB after one minimize and
+/// restore: start-up (the graphics driver's first frames and shader compiles
+/// above all) touches hundreds of MB once. Trimming after start-up and after a
+/// session's login burst does what that minimize did, without the minimize;
+/// pages still in use are simply read back in. Unlike
+/// [`release_memory_once_hidden`] this runs whether or not the window shows.
+#[cfg(windows)]
+fn release_memory_after(delay: Duration, what: &'static str) {
+    let spawned = thread::Builder::new()
+        .name("release-settled-memory".into())
+        .spawn(move || {
+            thread::sleep(delay);
+            match trim_working_set() {
+                Ok(()) => tracing::info!("{what}: released memory it no longer touches"),
+                Err(e) => tracing::warn!("could not release the memory {what} used: {e}"),
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("could not start the thread that releases settled memory: {e}");
+    }
+}
+
+/// Which releases [`IrminsulApp::release_settled_memory`] starts this frame:
+/// (start-up, game session). The start-up one once; the session one each time
+/// the game status turns to decoding.
+#[cfg(any(windows, test))]
+fn memory_release_due(startup_released: bool, last: GameStatus, now: GameStatus) -> (bool, bool) {
+    (
+        !startup_released,
+        now == GameStatus::Decoding && last != GameStatus::Decoding,
+    )
 }
 
 /// Remove as many pages as possible from this process's working set.
@@ -933,6 +985,10 @@ impl IrminsulApp {
             game_missed_modal_open: false,
             game_missed_modal_shown_for: None,
             game_kill_rx: None,
+            #[cfg(windows)]
+            startup_memory_released: false,
+            #[cfg(windows)]
+            memory_release_status: GameStatus::default(),
             log_packets_tx,
             saved_state_tx,
             tracing_reload_handle,
@@ -1033,6 +1089,8 @@ impl eframe::App for IrminsulApp {
         // the widget code, which froze the whole window for the length of an
         // export or an HTTPS round trip.
         self.poll_background_results(ctx);
+        #[cfg(windows)]
+        self.release_settled_memory();
 
         let minimize_modal_open = self.minimize_modal_open;
         if minimize_modal_open {
@@ -1359,6 +1417,26 @@ impl IrminsulApp {
     /// menu is a one-way trip: the window disappears with no restore and no
     /// quit, and "Remember my choice" puts the next launch one click from the
     /// same trap.
+    /// Schedule the start-up and game-session memory releases (see
+    /// [`release_memory_after`]); cheap to call every frame.
+    #[cfg(windows)]
+    fn release_settled_memory(&mut self) {
+        let now = self.state_rx.borrow().game_status;
+        let (startup, session) = memory_release_due(
+            self.startup_memory_released,
+            self.memory_release_status,
+            now,
+        );
+        if startup {
+            self.startup_memory_released = true;
+            release_memory_after(RELEASE_STARTUP_MEMORY_DELAY, "start-up");
+        }
+        if session {
+            release_memory_after(RELEASE_SESSION_MEMORY_DELAY, "the game session's login");
+        }
+        self.memory_release_status = now;
+    }
+
     fn minimize(&self, ctx: &Context, to_tray: bool) {
         #[cfg(windows)]
         release_memory_once_hidden();
@@ -2879,6 +2957,32 @@ mod tests {
     fn the_working_set_can_be_trimmed() {
         // Harmless to the test process: the pages fault back in when touched.
         trim_working_set().unwrap();
+    }
+
+    #[test]
+    fn settled_memory_is_released_after_start_up_and_each_session_start() {
+        use GameStatus::{Decoding, LaunchCaptured, NotRunning};
+        // The first frame schedules the start-up release, once.
+        assert_eq!(
+            memory_release_due(false, NotRunning, NotRunning),
+            (true, false)
+        );
+        assert_eq!(
+            memory_release_due(true, NotRunning, NotRunning),
+            (false, false)
+        );
+        // A session that starts decoding schedules one release...
+        assert_eq!(
+            memory_release_due(true, LaunchCaptured, Decoding),
+            (false, true)
+        );
+        // ...not one per frame while it keeps decoding...
+        assert_eq!(memory_release_due(true, Decoding, Decoding), (false, false));
+        // ...and again for the next session.
+        assert_eq!(
+            memory_release_due(true, NotRunning, Decoding),
+            (false, true)
+        );
     }
 
     /// The test process has no window, so whatever "Irminsul" windows exist on
