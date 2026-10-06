@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
-"""Print the next release version: the Cargo.toml base plus the next -T-N.
+"""Print the next release version: the Cargo.toml base plus the next -T.N.
 
-Irminsul's releases are `<base>-T-<n>` (e.g. `0.2.2-T-3`): `<base>` is the
+Irminsul's releases are `<base>-T.<n>` (e.g. `0.2.3-T.3`): `<base>` is the
 `package.version` in Cargo.toml and `<n>` counts this fork's releases of that
 base. The release workflow runs this to name a release, so nobody types a
 version and the counter can't be skipped or reused:
 
-    v0.2.2-T-1, v0.2.2-T-2 exist  ->  0.2.2-T-3
-    Cargo.toml bumped to 0.2.3    ->  0.2.3-T-1
+    v0.2.3-T.1, v0.2.3-T.2 exist  ->  0.2.3-T.3
+    Cargo.toml bumped to 0.2.4    ->  0.2.4-T.1
+
+Why `T.<n>` and not the older `T-<n>`: semver compares a pre-release part
+that holds letters as text, so `0.2.2-T-10` sorted BELOW `0.2.2-T-9` and the
+updater (`self_update::version::bump_is_greater`) never offered T-10 to T-9.
+In `T.<n>` the number is its own dot-separated part and compares as a number.
+Old `-T-<n>` tags still count towards the counter of their base.
 
 Cargo.toml on main keeps the bare base version. That matters for updates:
-`<base>` is a stable semver and every `-T-N` is a pre-release of it, so a
+`<base>` is a stable semver and every `-T.N` is a pre-release of it, so a
 local build never offers itself a release (src/update.rs only walks builds
 that are already pre-releases onto pre-releases).
 
@@ -28,7 +34,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 BASE = re.compile(r"\d+\.\d+\.\d+")
-FORK_SUFFIX = re.compile(r"-T-\d+$")
+FORK_SUFFIX = re.compile(r"-T[-.]\d+$")
 
 
 def base_version(version: str) -> str:
@@ -40,11 +46,11 @@ def base_version(version: str) -> str:
 
 
 def next_version(cargo_version: str, tags: list[str]) -> str:
-    """The next `<base>-T-<n>` given the repository's existing tags."""
+    """The next `<base>-T.<n>` given the repository's existing tags."""
     base = base_version(cargo_version)
-    taken = re.compile(rf"v{re.escape(base)}-T-(\d+)")
+    taken = re.compile(rf"v{re.escape(base)}-T[-.](\d+)")
     used = [int(m.group(1)) for tag in tags if (m := taken.fullmatch(tag.strip()))]
-    return f"{base}-T-{max(used, default=0) + 1}"
+    return f"{base}-T.{max(used, default=0) + 1}"
 
 
 def cargo_version(manifest: Path = ROOT / "Cargo.toml") -> str:

@@ -946,6 +946,7 @@ mod tests {
         assert!(!is_prerelease("0.2.1"));
         assert!(!is_prerelease("1.0.0+build-7"));
         assert!(is_prerelease("0.2.1-T-1"));
+        assert!(is_prerelease("0.2.3-T.1"));
         assert!(is_prerelease("1.0.0-rc.1"));
         assert!(is_prerelease("1.0.0-rc.1+build-7"));
     }
@@ -970,6 +971,29 @@ mod tests {
 
         let best = best_release(&releases, "0.2.1-T-1").expect("0.3.0-rc.1 is newer");
         assert_eq!(best.version, "0.3.0-rc.1");
+    }
+
+    #[test]
+    fn release_numbers_past_nine_are_offered() {
+        // `-T-<n>` is one pre-release part holding letters, compared as text:
+        // 0.2.2-T-10 sorts below 0.2.2-T-9, so T-9 was never offered T-10.
+        let dashed = [
+            release("0.2.2-T-10", PUBLISHED_ASSETS),
+            release("0.2.2-T-9", PUBLISHED_ASSETS),
+        ];
+        assert!(best_release(&dashed, "0.2.2-T-9").is_none());
+
+        // A new base outranks every 0.2.2-T-<n> already installed...
+        let next = [release("0.2.3-T.1", PUBLISHED_ASSETS)];
+        for installed in ["0.2.2-T-9", "0.2.2-T-10"] {
+            let best = best_release(&next, installed).expect("0.2.3-T.1 is newer");
+            assert_eq!(best.version, "0.2.3-T.1");
+        }
+
+        // ...and in `-T.<n>` the number is its own part, compared as a number.
+        let later = [release("0.2.3-T.10", PUBLISHED_ASSETS)];
+        let best = best_release(&later, "0.2.3-T.9").expect("T.10 is newer than T.9");
+        assert_eq!(best.version, "0.2.3-T.10");
     }
 
     #[test]
