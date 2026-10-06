@@ -20,6 +20,7 @@ mod admin;
 mod app;
 mod autostart;
 mod capture;
+mod crash;
 mod game_watch;
 mod good;
 mod monitor;
@@ -284,7 +285,7 @@ fn main() -> eframe::Result {
         std::process::exit(1);
     }
 
-    let (_guard, reload_handle) = tracing_init().unwrap();
+    let (_guard, reload_handle, previous_run_notice) = tracing_init().unwrap();
 
     if !args.no_admin && !args.read_from_file {
         #[cfg(any(windows, unix))]
@@ -334,15 +335,27 @@ fn main() -> eframe::Result {
                 capture_backend,
                 capture_source,
                 app_restart_requested,
+                previous_run_notice,
             )))
         }),
     );
+
+    // Every orderly way out -- the close button, the tray's Quit, "Close
+    // Irminsul" in the missed-launch modal, the update relaunch -- closes the
+    // window and comes back here, so this is the one place the clean exit is
+    // marked. Before the relaunch: the replacement reads this log at startup.
+    let restart = restart_requested.load(Ordering::SeqCst);
+    match &result {
+        Err(e) => crash::mark_clean_exit(&format!("the window could not run: {e}")),
+        Ok(()) if restart => crash::mark_clean_exit("restarting after an update"),
+        Ok(()) => crash::mark_clean_exit("window closed"),
+    }
 
     // Release the single-instance mutex before the replacement tries to take
     // it.
     drop(instance);
 
-    if restart_requested.load(Ordering::SeqCst) {
+    if restart {
         // The command line is reproduced as faithfully as it can be. argv[0]
         // is deliberately *not* reused: it is whatever the launcher passed,
         // which can be a bare name or a path relative to a working directory
@@ -429,25 +442,44 @@ fn open_log_dir() -> Result<()> {
 /// How many rotated files to keep, per kind.
 const LOG_RETENTION: usize = 6;
 
-/// Move `latest.<extension>` aside, renamed after its modification time.
-fn rotate_latest(log_dir: &Path, extension: &str) {
+/// How many logs of runs that did not exit cleanly (`*-abrupt.log`,
+/// `*-crashed.log`) to keep, on a budget of their own: six ordinary restarts
+/// must not be enough to delete the one log that shows what went wrong.
+const KEPT_LOG_RETENTION: usize = 4;
+
+/// Move `latest.<extension>` aside, renamed after its modification time with
+/// `suffix` appended, and return where it went.
+fn rotate_latest(log_dir: &Path, extension: &str, suffix: &str) -> Option<PathBuf> {
     let latest_path = log_dir.join(format!("latest.{extension}"));
     let Ok(modified) = std::fs::metadata(&latest_path).and_then(|metadata| metadata.modified())
     else {
         // Missing (first run) or unreadable: nothing to rotate either way.
-        return;
+        return None;
     };
 
     let dt: chrono::DateTime<chrono::Local> = modified.into();
-    let new_path = log_dir.join(format!("{}.{extension}", dt.format("%Y-%m-%d_%H-%M-%S")));
-    let _ = std::fs::rename(&latest_path, &new_path);
+    let new_path = log_dir.join(format!(
+        "{}{suffix}.{extension}",
+        dt.format("%Y-%m-%d_%H-%M-%S")
+    ));
+    std::fs::rename(&latest_path, &new_path).ok()?;
+    Some(new_path)
 }
 
-/// Delete all but the newest [`LOG_RETENTION`] rotated `*.<extension>` files.
+/// Whether `name` is a log kept for a run that did not exit cleanly.
+fn is_kept_log(name: &str, extension: &str) -> bool {
+    [crash::KEPT_ABRUPT_SUFFIX, crash::KEPT_CRASHED_SUFFIX]
+        .iter()
+        .any(|suffix| name.ends_with(&format!("{suffix}.{extension}")))
+}
+
+/// Delete all but the newest [`LOG_RETENTION`] rotated `*.<extension>` files,
+/// and all but the newest [`KEPT_LOG_RETENTION`] kept ones.
 ///
 /// Each extension gets its own budget. Sharing one between `.log` and `.pcapng`
 /// roughly halved the log history in debug builds — exactly when a developer
-/// wants to compare several runs.
+/// wants to compare several runs. `latest.*` is live, and `crash.log` is not a
+/// rotated log at all.
 fn prune_rotated(log_dir: &Path, extension: &str) {
     let latest_name = format!("latest.{extension}");
 
@@ -455,29 +487,42 @@ fn prune_rotated(log_dir: &Path, extension: &str) {
         return;
     };
 
-    let mut entries = Vec::new();
+    let mut rotated = Vec::new();
+    let mut kept = Vec::new();
     for entry in dir.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some(extension) {
             continue;
         }
-        if path.file_name().and_then(|n| n.to_str()) == Some(latest_name.as_str()) {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name == latest_name || name == crash::CRASH_LOG {
             continue;
         }
         let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
             continue;
         };
-        entries.push((path, modified));
+        if is_kept_log(name, extension) {
+            kept.push((path, modified));
+        } else {
+            rotated.push((path, modified));
+        }
     }
 
-    entries.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
-    for (path, _) in entries.into_iter().skip(LOG_RETENTION) {
-        let _ = std::fs::remove_file(path);
+    for (mut entries, retention) in [(rotated, LOG_RETENTION), (kept, KEPT_LOG_RETENTION)] {
+        entries.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
+        for (path, _) in entries.into_iter().skip(retention) {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
-fn rotate_logs(log_dir: &Path) {
-    rotate_latest(log_dir, "log");
+/// Rotate and prune everything under the log directories. `log_suffix` goes on
+/// the rotated `latest.log` (see [`crash::RunEnd::kept_suffix`]); returns
+/// where that log went.
+fn rotate_logs(log_dir: &Path, log_suffix: &str) -> Option<PathBuf> {
+    let rotated_log = rotate_latest(log_dir, "log", log_suffix);
     prune_rotated(log_dir, "log");
 
     // Not under `log_dir`, and nothing else sweeps it at startup. Keep the same
@@ -492,49 +537,27 @@ fn rotate_logs(log_dir: &Path) {
     // delete captures left over from debug runs that a developer was keeping.
     #[cfg(debug_assertions)]
     {
-        rotate_latest(log_dir, "pcapng");
+        rotate_latest(log_dir, "pcapng", "");
         prune_rotated(log_dir, "pcapng");
     }
+
+    rotated_log
 }
 
-/// Route panics into the log file.
-///
-/// Release builds set `windows_subsystem = "windows"`, so the default hook's
-/// stderr goes nowhere and every panic in this app is invisible — including
-/// panics inside egui's own update loop, which take the window with them.
-fn install_panic_hook() {
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let thread = std::thread::current();
-        let thread_name = thread.name().unwrap_or("<unnamed>");
-        // `PanicHookInfo::payload_as_str` would do this, but it is only stable
-        // from 1.91 and this crate supports 1.88.
-        let payload = info.payload();
-        let message = payload
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("<non-string panic payload>");
-        let location = match info.location() {
-            Some(location) => location.to_string(),
-            None => "<unknown location>".to_string(),
-        };
-        let backtrace = std::backtrace::Backtrace::force_capture();
-
-        tracing::error!("panic in thread '{thread_name}' at {location}: {message}\n{backtrace}");
-
-        // Debug builds keep their console, so leave the usual output in place.
-        default_hook(info);
-    }));
-}
-
-fn tracing_init() -> Result<(tracing_appender::non_blocking::WorkerGuard, ReloadHandle)> {
+/// Set up logging and crash reporting. Also returns the notice for the UI
+/// when the previous run did not exit cleanly (see `crash.rs`).
+fn tracing_init() -> Result<(
+    tracing_appender::non_blocking::WorkerGuard,
+    ReloadHandle,
+    Option<String>,
+)> {
     let dir = log_dir()?;
     std::fs::create_dir_all(&dir)?;
-    rotate_logs(&dir);
+    // Before rotation moves it: how did the run that wrote latest.log end?
+    let previous_run = crash::examine_previous_run(&dir);
+    let rotated_log = rotate_logs(&dir, previous_run.kept_suffix());
 
-    let latest_path = dir.join("latest.log");
-    let file = std::fs::File::create(&latest_path)?;
+    let file = crash::create_run_log(&dir)?;
     let (non_blocking_appender, guard) = tracing_appender::non_blocking(file);
 
     let filter = EnvFilter::new(TracingLevel::default().get_filter());
@@ -546,10 +569,11 @@ fn tracing_init() -> Result<(tracing_appender::non_blocking::WorkerGuard, Reload
         .with(filter)
         .with(writer)
         .init();
-    install_panic_hook();
+    crash::install(&dir);
     tracing::info!("Tracing initialized and logging to file.");
+    let notice = crash::report_previous_run(&previous_run, rotated_log.as_deref());
 
-    Ok((guard, ReloadHandle(reload_handle)))
+    Ok((guard, ReloadHandle(reload_handle), notice))
 }
 
 #[cfg(test)]
@@ -734,13 +758,68 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         // No latest.log yet: the first run must not fail or invent a file.
-        rotate_latest(dir.path(), "log");
+        assert_eq!(rotate_latest(dir.path(), "log", ""), None);
         assert!(names_with_extension(dir.path(), "log").is_empty());
 
         write_aged(dir.path(), "latest.log", 0);
-        rotate_latest(dir.path(), "log");
+        let rotated = rotate_latest(dir.path(), "log", "").unwrap();
 
         assert!(!dir.path().join("latest.log").exists());
         assert_eq!(names_with_extension(dir.path(), "log").len(), 1);
+        assert!(rotated.exists());
+    }
+
+    #[test]
+    fn the_log_of_a_run_that_ended_abruptly_is_rotated_under_its_own_name() {
+        let dir = tempfile::tempdir().unwrap();
+        write_aged(dir.path(), "latest.log", 0);
+
+        let rotated = rotate_latest(dir.path(), "log", crash::KEPT_ABRUPT_SUFFIX).unwrap();
+
+        let name = rotated.file_name().unwrap().to_str().unwrap();
+        assert!(name.ends_with("-abrupt.log"), "{name}");
+        assert!(is_kept_log(name, "log"));
+        assert!(!is_kept_log("2026-10-06_14-39-41.log", "log"));
+    }
+
+    #[test]
+    fn kept_logs_and_crash_log_outlive_ordinary_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // The run that went wrong, then ten ordinary ones after it.
+        write_aged(dir.path(), "2026-10-06_14-39-41-abrupt.log", 100);
+        write_aged(dir.path(), crash::CRASH_LOG, 200);
+        for i in 0..10u64 {
+            write_aged(dir.path(), &format!("log-{i}.log"), i);
+        }
+
+        prune_rotated(dir.path(), "log");
+
+        assert!(dir.path().join("2026-10-06_14-39-41-abrupt.log").exists());
+        assert!(dir.path().join(crash::CRASH_LOG).exists());
+        assert_eq!(
+            names_with_extension(dir.path(), "log").len(),
+            LOG_RETENTION + 2
+        );
+    }
+
+    #[test]
+    fn kept_logs_have_a_budget_of_their_own() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..10u64 {
+            let suffix = if i % 2 == 0 {
+                crash::KEPT_ABRUPT_SUFFIX
+            } else {
+                crash::KEPT_CRASHED_SUFFIX
+            };
+            write_aged(dir.path(), &format!("kept-{i}{suffix}.log"), i);
+        }
+
+        prune_rotated(dir.path(), "log");
+
+        let kept = names_with_extension(dir.path(), "log");
+        assert_eq!(kept.len(), KEPT_LOG_RETENTION, "{kept:?}");
+        assert!(kept.contains(&"kept-0-abrupt.log".to_string()), "{kept:?}");
+        assert!(kept.contains(&"kept-3-crashed.log".to_string()), "{kept:?}");
     }
 }
