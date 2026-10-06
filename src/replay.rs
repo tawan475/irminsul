@@ -48,7 +48,7 @@ use crate::recording::{LINKTYPE_ETHERNET, RecordedFrame, Recording};
 pub fn run(recording: &Path, out: &Path) -> i32 {
     let log_path = log_path_for(out);
     init_tracing(&log_path);
-    crate::install_panic_hook();
+    crate::crash::install_panic_hook();
 
     let code = match replay_to_file(recording, out) {
         Ok(()) => 0,
