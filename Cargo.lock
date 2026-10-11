@@ -591,6 +591,7 @@ dependencies = [
  "base64",
  "clap",
  "etherparse",
+ "flate2",
  "kcp",
  "protobuf",
  "protobuf-codegen",

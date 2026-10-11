@@ -65,3 +65,32 @@ pub(crate) fn logged(level: Level, f: impl FnOnce()) -> Vec<String> {
     tracing::subscriber::with_default(capture, f);
     seen.lock().unwrap().clone()
 }
+
+/// The messages of one Oodle test vector stream in
+/// `tests/data/oodle/<name>.ontv.gz`, each as (decompressed, as sent). The
+/// format is described in `tests/oodle_vectors.rs`.
+pub(crate) fn oodle_vectors(name: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    use std::io::Read;
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data/oodle")
+        .join(format!("{name}.ontv.gz"));
+    let mut data = Vec::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(path).unwrap())
+        .read_to_end(&mut data)
+        .unwrap();
+
+    let word = |at: usize| u32::from_le_bytes(data[at..at + 4].try_into().unwrap()) as usize;
+    assert_eq!(&data[..4], b"ONTV");
+    let count = word(16);
+    let mut at = 20;
+    (0..count)
+        .map(|_| {
+            let (raw_len, sent_len) = (word(at), word(at + 4));
+            let raw = data[at + 8..at + 8 + raw_len].to_vec();
+            let sent = data[at + 8 + raw_len..at + 8 + raw_len + sent_len].to_vec();
+            at += 8 + raw_len + sent_len;
+            (raw, sent)
+        })
+        .collect()
+}
