@@ -997,6 +997,26 @@ mod tests {
     }
 
     #[test]
+    fn dashed_release_numbers_continue_from_t_dot_one() {
+        // Releases are `-T-<n>` again with one running count (the user's call,
+        // 2026-10-12), so 0.2.3-T.1 is followed by 0.2.3-T-11. Compared as
+        // text, "T" sorts below "T-11", so it is offered...
+        let next = [release("0.2.3-T-11", PUBLISHED_ASSETS)];
+        let best = best_release(&next, "0.2.3-T.1").expect("T-11 is newer than T.1");
+        assert_eq!(best.version, "0.2.3-T-11");
+
+        // ...and two-digit numbers order correctly among themselves.
+        let after = [release("0.2.3-T-12", PUBLISHED_ASSETS)];
+        let best = best_release(&after, "0.2.3-T-11").expect("T-12 is newer than T-11");
+        assert_eq!(best.version, "0.2.3-T-12");
+
+        // The limit of comparing as text: T-100 sorts below T-99, so a T-99
+        // install is never offered T-100. Bump the base before release 100.
+        let hundred = [release("0.2.3-T-100", PUBLISHED_ASSETS)];
+        assert!(best_release(&hundred, "0.2.3-T-99").is_none());
+    }
+
+    #[test]
     fn downgrades_are_never_offered() {
         // The old check was `releases.first().version != current`, so a fork or
         // local build one version ahead was told to "update" backwards.
