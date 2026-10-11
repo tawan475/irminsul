@@ -62,7 +62,16 @@ pub(crate) fn logged(level: Level, f: impl FnOnce()) -> Vec<String> {
         level,
         seen: Arc::clone(&seen),
     };
-    tracing::subscriber::with_default(capture, f);
+    tracing::subscriber::with_default(capture, || {
+        // `tracing` caches, per call site and for every thread at once,
+        // whether anyone listens. Tests capture in parallel on many threads,
+        // and a call site first reached while no capture was registered can
+        // stay cached as unheard, so a warning this test logs goes missing
+        // (seen on CI as a flaky count of 0). Rebuilding the cache with this
+        // capture registered makes every call site ask it again.
+        tracing::callsite::rebuild_interest_cache();
+        f();
+    });
     seen.lock().unwrap().clone()
 }
 
