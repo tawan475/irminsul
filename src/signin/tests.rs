@@ -1175,6 +1175,22 @@ fn a_deleted_upload_target_reads_as_not_chosen() {
 }
 
 #[test]
+fn an_account_without_a_name_is_called_by_its_uid() {
+    // What the tracker answers for an account it made for a new UID
+    // (seen against a real tracker: `src/signin/e2e.rs`).
+    let mut json = whoami_json("account");
+    json["accountName"] = serde_json::Value::Null;
+    json["uid"] = serde_json::json!("812345678");
+    let whoami = parse_whoami(&json).unwrap();
+    assert_eq!(whoami.target_label(), "UID 812345678");
+    json["accountName"] = serde_json::json!("Main");
+    assert_eq!(
+        parse_whoami(&json).unwrap().target_label(),
+        "Main (UID 812345678)"
+    );
+}
+
+#[test]
 fn a_failed_request_says_the_trackers_own_sentence() {
     let body = r#"{"error":{"code":"upload_target_missing","message":"The account this PC uploads to was deleted."}}"#;
     assert_eq!(

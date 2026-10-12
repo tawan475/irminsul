@@ -581,13 +581,14 @@ impl Whoami {
             UploadScope::Account if self.account_id.is_none() && self.account_name.is_none() => {
                 "Not chosen".to_string()
             }
-            UploadScope::Account => {
-                let name = self.account_name.as_deref().unwrap_or("an account");
-                match &self.uid {
-                    Some(uid) => format!("{name} (UID {uid})"),
-                    None => name.to_string(),
-                }
-            }
+            // An account the tracker made for a new UID has no name; the
+            // website calls it by its UID then, and so does this.
+            UploadScope::Account => match (&self.account_name, &self.uid) {
+                (Some(name), Some(uid)) => format!("{name} (UID {uid})"),
+                (Some(name), None) => name.clone(),
+                (None, Some(uid)) => format!("UID {uid}"),
+                (None, None) => "an account".to_string(),
+            },
         }
     }
 }
@@ -1647,3 +1648,7 @@ async fn revoke(client: &reqwest::Client, discovery: &Discovery, refresh_token: 
 
 #[cfg(test)]
 mod tests;
+
+/// Against a real local tracker; ignored unless asked for (`tests/e2e/`).
+#[cfg(test)]
+mod e2e;
