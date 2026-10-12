@@ -616,10 +616,6 @@ mod tests {
     fn every_http_client_is_built_through_the_shared_builder() {
         for (name, source) in [
             ("monitor.rs", include_str!("monitor.rs")),
-            (
-                "wish_history/cache.rs",
-                include_str!("wish_history/cache.rs"),
-            ),
             ("wish_history/sync.rs", include_str!("wish_history/sync.rs")),
             ("update.rs", include_str!("update.rs")),
             ("app.rs", include_str!("app.rs")),

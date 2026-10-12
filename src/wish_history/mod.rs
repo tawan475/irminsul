@@ -12,9 +12,8 @@
 //! * a key is bound to that login's UID; the sync sends nothing until the UID
 //!   is known, and refuses records of any other UID.
 //!
-//! The game's web cache also holds the game's link, but the cache is the
-//! PC's, not the login's: it is never a key for the sync, only what Copy wish
-//! URL falls back on while no key of this login is held (see [`cache`]).
+//! Nothing else is a key source: the game's web cache is the PC's, not the
+//! login's, and is never read.
 //!
 //! From the key irminsul
 //!
@@ -32,7 +31,6 @@
 //! The monitor's only hooks are [`take_wish_events`] and [`WishHub::forward`];
 //! the UI reads a [`WishView`].
 
-mod cache;
 mod gacha_log;
 mod run;
 #[cfg(test)]
@@ -48,8 +46,6 @@ use std::time::Instant;
 use auto_artifactarium::{CommandMatch, GachaAuthKey, GachaRecordLink, GachaWish};
 use tokio::sync::{mpsc, watch};
 
-pub(crate) use self::cache::CacheSource;
-use self::cache::{CacheReply, CacheState};
 use self::gacha_log::LinkParts;
 pub(crate) use self::gacha_log::WishKey;
 pub(crate) use self::sync::{SyncStatus, WishSync};
@@ -219,8 +215,6 @@ pub(crate) struct Seen {
     pub(crate) other_keys: u32,
     /// The client's version, from its login.
     pub(crate) client_version: bool,
-    /// What the game's web cache showed last.
-    pub(crate) cached_link: CacheState,
 }
 
 /// Asks the UI to repaint: what the monitor hands on changes what it shows.
@@ -397,13 +391,6 @@ impl WishHub {
             tracing::info!("captured a wish history key; its account's UID is not known yet");
         }
     }
-
-    /// Record what the game's web cache showed.
-    pub(crate) fn see_cache(&self, state: CacheState) {
-        if self.see(|seen| std::mem::replace(&mut seen.cached_link, state) != state) {
-            (self.notify)();
-        }
-    }
 }
 
 /// The UI's end.
@@ -411,8 +398,6 @@ pub(crate) struct WishView {
     key_rx: watch::Receiver<Option<WishKey>>,
     status_rx: watch::Receiver<SyncStatus>,
     seen_rx: watch::Receiver<Seen>,
-    /// Asks the cache source to look now.
-    cache_tx: mpsc::UnboundedSender<CacheReply>,
 }
 
 impl WishView {
@@ -428,16 +413,6 @@ impl WishView {
     /// The URL to copy: the game's link for this login's key.
     pub(crate) fn wish_url(&self, now: Instant) -> Option<String> {
         self.key(now).map(|key| key.wish_url())
-    }
-
-    /// Read the link in the game's web cache now (for Copy while no key is
-    /// held; it may be another account's): answered with it, or why there
-    /// is none.
-    pub(crate) fn look_in_cache(&self) -> tokio::sync::oneshot::Receiver<Result<String, String>> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        // A closed channel drops `tx`, which the caller sees as no answer.
-        let _ = self.cache_tx.send(tx);
-        rx
     }
 
     /// The section's status line and its tooltip, by what is really the
@@ -519,11 +494,6 @@ pub(crate) fn seen_summary(seen: &Seen, uid_known: bool) -> String {
         format!("{} wish key from the game", mark(seen.wish_key)),
         format!("{} client version", mark(seen.client_version)),
         format!("{} UID", mark(uid_known)),
-        format!(
-            "{} cached link: {}",
-            mark(seen.cached_link == CacheState::Found),
-            seen.cached_link.label()
-        ),
     ];
     if seen.other_keys > 0 {
         lines.push(format!(
@@ -540,11 +510,9 @@ pub(crate) struct WishChannels {
     pub(crate) hub: WishHub,
     pub(crate) view: WishView,
     pub(crate) sync: WishSync,
-    pub(crate) cache: CacheSource,
 }
 
-/// Build the hub, the view, the sync task and the cache source (neither
-/// running yet).
+/// Build the hub, the view and the sync task (not yet running).
 pub(crate) fn channels(
     saved_state_rx: watch::Receiver<SavedAppState>,
     toast_tx: mpsc::UnboundedSender<(String, bool)>,
@@ -558,7 +526,6 @@ pub(crate) fn channels(
     let (seen_tx, seen_rx) = watch::channel(Seen::default());
     let repaint = ctx.clone();
     let notify: Notify = Arc::new(move || repaint.request_repaint());
-    let (cache_tx, cache_rx) = mpsc::unbounded_channel();
     let (login_tx, login_rx) = watch::channel(0);
     let sync = WishSync::new(
         trigger_rx,
@@ -580,13 +547,11 @@ pub(crate) fn channels(
         notify,
     };
     WishChannels {
-        cache: CacheSource::new(hub.clone(), cache_rx),
         hub,
         view: WishView {
             key_rx,
             status_rx,
             seen_rx,
-            cache_tx,
         },
         sync,
     }
@@ -654,7 +619,6 @@ mod tests {
                 wish_key: false,
                 other_keys: 2,
                 client_version: true,
-                cached_link: CacheState::None,
             }
         );
         assert_eq!(repaints.load(Ordering::SeqCst), 1, "one repaint per batch");
@@ -736,36 +700,18 @@ mod tests {
             wish_key: false,
             other_keys: 1,
             client_version: true,
-            cached_link: CacheState::None,
         };
         assert_eq!(
             seen_summary(&seen, false),
             format!(
                 "Seen this session:\n{ICON_CHECK} banner list (Wish screen)\n\
                  {ICON_CLOSE} wish key from the game\n{ICON_CHECK} client version\n\
-                 {ICON_CLOSE} UID\n{ICON_CLOSE} cached link: none\n1 other web key ignored"
+                 {ICON_CLOSE} UID\n1 other web key ignored"
             )
         );
         assert!(!seen_summary(&Seen::default(), true).contains("ignored"));
         assert!(seen_summary(&Seen::default(), true).contains(&format!("{ICON_CHECK} UID")));
-        for (state, label) in [
-            (CacheState::None, "none"),
-            (CacheState::Found, "found (may be another account)"),
-        ] {
-            let seen = Seen {
-                cached_link: state,
-                ..Seen::default()
-            };
-            let mark = if state == CacheState::Found {
-                ICON_CHECK
-            } else {
-                ICON_CLOSE
-            };
-            assert!(
-                seen_summary(&seen, true).ends_with(&format!("{mark} cached link: {label}")),
-                "{state:?}"
-            );
-        }
+        assert!(seen_summary(&Seen::default(), true).ends_with(&format!("{ICON_CHECK} UID")));
     }
 
     fn authkey(app: &str, key: &str) -> GachaAuthKey {
@@ -808,7 +754,6 @@ mod tests {
             UID,
         );
         assert_eq!(triggers.try_recv(), Ok(Trigger::NewKey));
-        hub.see_cache(CacheState::Found);
 
         hub.new_login();
         assert!(key_rx.borrow().is_none());
@@ -972,12 +917,10 @@ mod tests {
         let (key_tx, key_rx) = watch::channel(None);
         let (_status_tx, status_rx) = watch::channel(SyncStatus::default());
         let (_seen_tx, seen_rx) = watch::channel(Seen::default());
-        let (cache_tx, _cache_rx) = mpsc::unbounded_channel();
         let view = WishView {
             key_rx,
             status_rx,
             seen_rx,
-            cache_tx,
         };
         let status = |at| view.status(at, GameStatus::Decoding, true).text;
         let now = Instant::now();
@@ -1004,26 +947,6 @@ mod tests {
         let later = now + gacha_log::KEY_LIFETIME;
         assert_eq!(view.wish_url(later), None);
         assert_eq!(status(later), "No wish key yet");
-    }
-
-    #[test]
-    fn looking_in_the_cache_without_a_cache_source_is_no_answer() {
-        let (_key_tx, key_rx) = watch::channel(None);
-        let (_status_tx, status_rx) = watch::channel(SyncStatus::default());
-        let (_seen_tx, seen_rx) = watch::channel(Seen::default());
-        let (cache_tx, cache_rx) = mpsc::unbounded_channel();
-        drop(cache_rx);
-        let view = WishView {
-            key_rx,
-            status_rx,
-            seen_rx,
-            cache_tx,
-        };
-        let mut answer = view.look_in_cache();
-        assert!(matches!(
-            answer.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
-        ));
     }
 
     #[test]

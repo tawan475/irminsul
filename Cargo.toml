@@ -48,7 +48,6 @@ tokio = { workspace = true, features = ["net", "io-util", "time"] }
 
 anyhow = "1.0.99"
 async-trait = "0.1.89"
-async-watcher = "0.3.0"
 # Default features only: the library's `cli` feature is for its own binary.
 auto-artifactarium = { path = "crates/auto-artifactarium" }
 base64 = "0.22.1"
@@ -79,11 +78,7 @@ getrandom = "0.3.4"
 futures-util = "0.3.31"
 indexmap = "2.11.1"
 log = "0.4.27"
-# NOTE: `notify` is used only through `async-watcher`'s re-export
-# (`async_watcher::notify::…`), so it is deliberately not a direct dependency:
-# a direct entry here would pull in a second, independently versioned copy.
 open = "5.3.2"
-regex = "1.11.2"
 # The rustls features are for memory: every client irminsul builds selects
 # rustls (see `http_client_builder` in `src/main.rs`), because the default
 # native-tls is SChannel on Windows, and its first HTTPS request leaves about
