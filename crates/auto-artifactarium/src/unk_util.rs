@@ -211,6 +211,56 @@ const MAX_ACHIEVEMENT_STATUS: u64 = 3;
 /// unlocked this one achievement exported nothing at all, ever.
 const SENTINEL_ACHIEVEMENT_ID: u64 = 80014;
 
+/// Where the game's achievement ids live: 80001 to 87007 through 7.1 (2012
+/// achievements, `AchievementExcelConfigData`), with room for many patches
+/// more. A property of the game, not of an account, so it is fair evidence.
+///
+/// Without it any list of `{timestamp, small value, unique id}` entries passed
+/// for achievements: 7.1's `BeyondCosmeticDataNotify` (cmd 23484) carries one,
+/// with six-digit cosmetic ids, and was read as an achievement list.
+const ACHIEVEMENT_ID_RANGE: RangeInclusive<u64> = 80_000..=99_999;
+
+/// Share, in percent, of a field's values that must agree with what is known
+/// about achievements (ids in [`ACHIEVEMENT_ID_RANGE`]; a finish timestamp
+/// only on a finished achievement) before the list is read as one. Not 100,
+/// so one odd entry cannot cost the whole export.
+const MIN_AGREEING_PERCENT: usize = 90;
+
+/// `part` is at least [`MIN_AGREEING_PERCENT`] of a non-empty `whole`.
+fn mostly(part: usize, whole: usize) -> bool {
+    whole != 0 && part * 100 >= whole * MIN_AGREEING_PERCENT
+}
+
+/// Do the values of `tag` look like achievement ids?
+fn values_are_achievement_ids(entries: &[Entry], tag: u32) -> bool {
+    let values: Vec<u64> = entries
+        .iter()
+        .filter_map(|entry| entry.get(&tag).copied())
+        .collect();
+    let in_range = values
+        .iter()
+        .filter(|value| ACHIEVEMENT_ID_RANGE.contains(value))
+        .count();
+    mostly(in_range, values.len())
+}
+
+/// Do the entries that carry a finish timestamp carry a finished status
+/// (`FINISHED` or `REWARD_TAKEN`) too?
+///
+/// Only this direction holds: pre-1.0 accounts have finished achievements
+/// with no timestamp, but nothing unfinished has one.
+fn timestamps_mark_finished(entries: &[Entry], status: u32, finish_timestamp: u32) -> bool {
+    let timestamped: Vec<&Entry> = entries
+        .iter()
+        .filter(|entry| entry.contains_key(&finish_timestamp))
+        .collect();
+    let finished = timestamped
+        .iter()
+        .filter(|entry| entry.get(&status).is_some_and(|&v| v >= 2))
+        .count();
+    mostly(finished, timestamped.len())
+}
+
 /// Outcome of inspecting one top-level length-delimited field.
 enum SubMessage {
     /// A submessage of two or more varint fields — a possible achievement.
@@ -433,9 +483,16 @@ fn identify_achievement_tags(entries: &[Entry]) -> Option<AchievementTags> {
     let status = best_by(&status_candidates, |tag| {
         status_correlation(entries, tag, finish_timestamp) as u64
     })?;
+    if !timestamps_mark_finished(entries, status, finish_timestamp) {
+        tracing::debug!(
+            "field {finish_timestamp} holds timestamps on entries that are not finished; not an \
+             achievement list"
+        );
+        return None;
+    }
 
-    // Id: present everywhere, never status-sized, never the timestamp, and
-    // unique across the list.
+    // Id: present everywhere, never status-sized, never the timestamp, unique
+    // across the list, and in the game's achievement id range.
     let sentinel_tags: Vec<u32> = all
         .iter()
         .copied()
@@ -445,12 +502,14 @@ fn identify_achievement_tags(entries: &[Entry]) -> Option<AchievementTags> {
                 .iter()
                 .any(|entry| entry.get(tag) == Some(&SENTINEL_ACHIEVEMENT_ID))
         })
+        .filter(|&tag| values_are_achievement_ids(entries, tag))
         .collect();
     let id_candidates: Vec<u32> = common
         .iter()
         .copied()
         .filter(|&tag| tag != finish_timestamp && !small_valued.contains(&tag))
         .filter(|&tag| values_are_unique(entries, tag))
+        .filter(|&tag| values_are_achievement_ids(entries, tag))
         .collect();
     let id = match id_candidates.as_slice() {
         [tag] => *tag,
@@ -1103,6 +1162,149 @@ mod tests {
             classify_submessage(&field_bytes(3, b"nested")),
             SubMessage::NotAnEntry
         ));
+    }
+
+    /// The layout 7.1's `AchievementAllDataNotify` has: status on 3, a
+    /// progress counter on 10, the id on 11, a second counter on 12 that only
+    /// some entries carry, and the finish timestamp on 14. Synthetic values.
+    fn achievement_entry_7_1(id: u64, status: u64, progress: u64, ts: Option<u64>) -> Vec<u8> {
+        let mut out = field_varint(3, status);
+        out.extend(field_varint(10, progress));
+        out.extend(field_varint(11, id));
+        if progress > 5 {
+            out.extend(field_varint(12, progress * 3));
+        }
+        if let Some(ts) = ts {
+            out.extend(field_varint(14, ts));
+        }
+        out
+    }
+
+    #[test]
+    fn decodes_the_7_1_layout() {
+        let entries: Vec<Vec<u8>> = (0..200u64)
+            .map(|i| {
+                let finished = i % 40 != 0;
+                achievement_entry_7_1(
+                    81_001 + i,
+                    if finished { 2 + i % 2 } else { 1 },
+                    i % 9,
+                    finished.then_some(1_700_000_000 + i * 60),
+                )
+            })
+            .collect();
+        let data = packet(
+            &entries
+                .iter()
+                .map(|entry| field_bytes(6, entry))
+                .collect::<Vec<_>>(),
+        );
+
+        let achievements = matches_achievement_all_data_notify(&data).expect("should match");
+        assert_eq!(ids(&achievements), (81_001..81_201).collect::<Vec<u32>>());
+        assert_eq!(achievements[0].status, 1);
+        assert_eq!(achievements[0].finish_timestamp, None);
+        assert_eq!(achievements[1].status, 3);
+        assert_eq!(achievements[1].finish_timestamp, Some(1_700_000_060));
+    }
+
+    /// One `BeyondCosmeticDataNotify` entry as 7.1 sends it (cmd 23484, list
+    /// on field 12): obtain time on 2, a constant 1 on 7, a six-digit cosmetic
+    /// id on 10. Synthetic values.
+    fn cosmetic_entry(id: u64, flag: u64, obtained: u64) -> Vec<u8> {
+        packet(&[
+            field_varint(2, obtained),
+            field_varint(7, flag),
+            field_varint(10, id),
+        ])
+    }
+
+    /// A payload shaped like 7.1's `BeyondCosmeticDataNotify`: the cosmetic
+    /// list next to two smaller lists and a few scalars.
+    fn cosmetic_payload(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut fields = vec![field_varint(2, 7)];
+        for i in 0..40u64 {
+            let other = packet(&[
+                field_varint(5, 1_700_000_000 + i * 3_600),
+                field_varint(13, 330_001 + i),
+            ]);
+            fields.push(field_bytes(7, &other));
+        }
+        fields.push(field_varint(8, 1));
+        fields.extend(entries.iter().map(|entry| field_bytes(12, entry)));
+        for i in 0..24u64 {
+            let other = packet(&[
+                field_varint(12, 340_001 + i),
+                field_varint(15, 1_700_000_000 + i * 7_200),
+            ]);
+            fields.push(field_bytes(13, &other));
+        }
+        packet(&fields)
+    }
+
+    /// The false positive: every cosmetic entry has a timestamp, a small
+    /// constant and a unique id, which is all the structural test asked for.
+    #[test]
+    fn rejects_the_beyond_cosmetic_data_notify_shape() {
+        let entries: Vec<Vec<u8>> = (0..128u64)
+            .map(|i| cosmetic_entry(270_002 + i, 1, 1_700_000_000 + (i % 21) * 86_400))
+            .collect();
+        let data = cosmetic_payload(&entries);
+        assert!(data.len() >= MIN_ACHIEVEMENT_PAYLOAD_LEN);
+
+        assert_eq!(
+            try_match_achievement_all_data_notify(&data),
+            Err(AchievementMatchError::UnidentifiedFields)
+        );
+        assert!(matches_achievement_all_data_notify(&data).is_none());
+    }
+
+    /// Either guard alone rejects it: ids outside the achievement range even
+    /// when the small field reads as "finished"...
+    #[test]
+    fn rejects_ids_outside_the_achievement_range() {
+        let entries: Vec<Vec<u8>> = (0..128u64)
+            .map(|i| cosmetic_entry(270_002 + i, 3, 1_700_000_000 + i))
+            .collect();
+        assert_eq!(
+            try_match_achievement_all_data_notify(&cosmetic_payload(&entries)),
+            Err(AchievementMatchError::UnidentifiedFields)
+        );
+    }
+
+    /// ...and timestamps on entries whose status says "unfinished", even with
+    /// ids that could be achievements.
+    #[test]
+    fn rejects_timestamps_on_unfinished_entries() {
+        let entries: Vec<Vec<u8>> = (0..128u64)
+            .map(|i| cosmetic_entry(80_001 + i, 1, 1_700_000_000 + i))
+            .collect();
+        assert_eq!(
+            try_match_achievement_all_data_notify(&cosmetic_payload(&entries)),
+            Err(AchievementMatchError::UnidentifiedFields)
+        );
+    }
+
+    /// The guards ask for most entries, not all: a few odd ones do not cost
+    /// the list, and are exported as they are.
+    #[test]
+    fn a_few_odd_entries_do_not_cost_the_list() {
+        let mut entries = achievement_entries(80001, 120);
+        for i in 0..5 {
+            // An id past the range, and a timestamp on an unfinished entry.
+            entries[2 * i] = achievement_entry(200_000 + i as u64, 3, 1, Some(1_600_000_000));
+            entries[2 * i + 1] = achievement_entry(80_500 + i as u64, 1, 5, Some(1_600_000_001));
+        }
+        let data = packet(
+            &entries
+                .iter()
+                .map(|entry| field_bytes(TAG_LIST, entry))
+                .collect::<Vec<_>>(),
+        );
+
+        let achievements = matches_achievement_all_data_notify(&data).expect("should match");
+        assert_eq!(achievements.len(), 120);
+        assert_eq!(achievements[0].id, 200_000);
     }
 
     #[test]
