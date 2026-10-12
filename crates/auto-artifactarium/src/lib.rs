@@ -66,6 +66,11 @@ use rsa::pkcs1::DecodeRsaPrivateKey;
 use tracing::{debug, info, info_span, instrument, trace, warn};
 
 use crate::Key::Dispatch;
+pub use crate::anecdotes::{
+    ANECDOTE_AREA_IDS, ANECDOTE_FINISHED_STATE, ANECDOTE_IDS, Anecdote, AnecdoteData,
+    AnecdoteReward, AnecdoteWish, MAX_ANECDOTE_FINISH_COUNT, MAX_ANECDOTE_STATE, MAX_ANECDOTES,
+    matches_anecdote_get_data_rsp,
+};
 use crate::connection::parse_frame;
 use crate::crypto::{bruteforce, decrypt_command, guess, lookup_initial_key};
 use crate::r#gen::protos::{AvatarInfo, Item, PacketHead, PropValue, Unk, prop_value};
@@ -86,6 +91,7 @@ fn bytes_as_hex(bytes: &[u8]) -> String {
 
 pub mod r#gen;
 
+mod anecdotes;
 mod connection;
 mod crypto;
 mod cs_rand;
@@ -250,6 +256,7 @@ static ITEM_DEL_NOTIFY_LOGGED: AtomicBool = AtomicBool::new(false);
 static PROPERTY_NOTIFY_LOGGED: AtomicBool = AtomicBool::new(false);
 static AVATAR_NOTIFY_LOGGED: AtomicBool = AtomicBool::new(false);
 static ACHIEVEMENT_NOTIFY_LOGGED: AtomicBool = AtomicBool::new(false);
+static ANECDOTE_RSP_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// `true` the first time it is called for a given flag.
 fn first_time(flag: &AtomicBool) -> bool {
@@ -1431,6 +1438,8 @@ pub enum CommandMatch {
     Properties(HashMap<u32, u64>),
     Avatars(Vec<AvatarInfo>),
     Achievements(Vec<Achievement>),
+    /// The Travel Accounts book, in full: see [`matches_anecdote_packet`].
+    Anecdotes(AnecdoteData),
     /// Guids the game says are gone. Candidates, not gospel -- see
     /// [`matches_item_del_packet`] for why the caller must intersect them with
     /// an inventory it actually holds.
@@ -1445,6 +1454,7 @@ impl CommandMatch {
             Self::Properties(_) => "properties",
             Self::Avatars(_) => "avatars",
             Self::Achievements(_) => "achievements",
+            Self::Anecdotes(_) => "anecdotes",
             Self::DeletedItems(_) => "deleted items",
         }
     }
@@ -1455,7 +1465,7 @@ impl CommandMatch {
 /// The individual `matches_*_packet` functions stay available, but a caller that
 /// tries them in an `else if` chain can never notice that two of them claimed the
 /// same command -- which is exactly how a shape collision turns into silently
-/// missing data. This runs all four and logs when more than one claims a command,
+/// missing data. This runs them all and logs when more than one claims a command,
 /// then returns the first claim in the historical priority order.
 pub fn classify_command(game_command: &GameCommand) -> Option<CommandMatch> {
     let mut claims = Vec::new();
@@ -1470,6 +1480,9 @@ pub fn classify_command(game_command: &GameCommand) -> Option<CommandMatch> {
     }
     if let Some(achievements) = matches_achievement_packet(game_command) {
         claims.push(CommandMatch::Achievements(achievements));
+    }
+    if let Some(anecdotes) = matches_anecdote_packet(game_command) {
+        claims.push(CommandMatch::Anecdotes(anecdotes));
     }
     // Last on purpose. Its shape -- one packed uint64 list beside a scalar or
     // two -- is the least specific of the five, so anything another matcher can
@@ -1506,6 +1519,35 @@ pub fn matches_achievement_packet(game_command: &GameCommand) -> Option<Vec<Achi
         );
     }
     Some(achievements)
+}
+
+/// Recover the Travel Accounts book from an `AnecdoteGetDataRsp`, or `None` if
+/// this is not one.
+///
+/// Observed command id: 28234 in 7.1, kept as documentation only. The
+/// message is recognised by shape (see [`matches_anecdote_get_data_rsp`]), and
+/// the first match logs the command id, so a patch that moves it shows up in
+/// the log rather than as missing anecdotes.
+pub fn matches_anecdote_packet(game_command: &GameCommand) -> Option<AnecdoteData> {
+    let data = matches_anecdote_get_data_rsp(&game_command.proto_data)?;
+
+    if first_time(&ANECDOTE_RSP_LOGGED) {
+        info!(
+            command_id = game_command.command_id,
+            count = data.anecdotes.len(),
+            areas = data.unlocked_areas.len(),
+            reward = data.reward.is_some(),
+            wish = data.wish.is_some(),
+            "discovered AnecdoteGetDataRsp"
+        );
+    } else {
+        debug!(
+            command_id = game_command.command_id,
+            count = data.anecdotes.len(),
+            "anecdote packet"
+        );
+    }
+    Some(data)
 }
 
 /// Recover the achievement list from a command, reporting why it did not match.
@@ -1553,7 +1595,7 @@ pub fn matches_item_packet(game_command: &GameCommand) -> Option<Vec<Item>> {
 /// Requires the buffer to be consumed exactly: a trailing partial varint means
 /// this blob is a submessage or a string that happened to start with
 /// varint-shaped bytes, not a packed list.
-fn decode_packed_varints(bytes: &[u8]) -> Option<Vec<u64>> {
+pub(crate) fn decode_packed_varints(bytes: &[u8]) -> Option<Vec<u64>> {
     let mut values = Vec::new();
     let mut offset = 0usize;
 

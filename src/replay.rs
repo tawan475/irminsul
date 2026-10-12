@@ -505,6 +505,7 @@ impl Replay {
             weapons = counts.weapons,
             materials = counts.materials,
             achievements = counts.achievements,
+            anecdotes = good.gi_anecdotes.as_ref().map_or(0, |book| book.anecdotes.len()),
             uid = ?good.gi_player.as_ref().and_then(|player| player.uid),
             data = %describe(self.captured),
             stamped = %when(Some(now_ms.saturating_mul(1_000_000))),
@@ -590,6 +591,7 @@ fn describe(applied: AppliedData) -> String {
         (applied.characters, "characters"),
         (applied.achievements, "achievements"),
         (applied.properties, "player properties"),
+        (applied.anecdotes, "anecdotes"),
     ]
     .into_iter()
     .filter_map(|(present, name)| present.then_some(name))

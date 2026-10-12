@@ -6,6 +6,10 @@ use anime_game_data::{AnimeGameData, Property, SkillType};
 use anyhow::Result;
 pub use auto_artifactarium::Achievement;
 pub use auto_artifactarium::r#gen::protos::{AvatarInfo, Item, PropValue};
+use auto_artifactarium::{
+    ANECDOTE_AREA_IDS, ANECDOTE_IDS, AnecdoteData, MAX_ANECDOTE_FINISH_COUNT, MAX_ANECDOTE_STATE,
+    MAX_ANECDOTES,
+};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
@@ -587,6 +591,10 @@ pub struct PlayerData {
     /// count does.
     items: HashMap<(u32, u64), Item>,
     properties: HashMap<u32, u64>,
+    /// The Travel Accounts book as the game last sent it in full. The game
+    /// re-sends the whole book each time it is asked for it, so the newest
+    /// copy replaces the old one rather than merging into it.
+    anecdotes: Option<AnecdoteData>,
 
     character_equip_guid_map: HashMap<u64, u32>,
 
@@ -602,6 +610,7 @@ impl PlayerData {
             characters: HashMap::new(),
             items: HashMap::new(),
             properties: HashMap::new(),
+            anecdotes: None,
             character_equip_guid_map: HashMap::new(),
             game_data_sha: None,
         }
@@ -628,6 +637,7 @@ impl PlayerData {
         self.characters.clear();
         self.items.clear();
         self.properties.clear();
+        self.anecdotes = None;
         self.character_equip_guid_map.clear();
     }
 
@@ -638,6 +648,7 @@ impl PlayerData {
             && self.characters.is_empty()
             && self.items.is_empty()
             && self.properties.is_empty()
+            && self.anecdotes.is_none()
     }
 
     pub fn process_achievements(&mut self, achievements: &[Achievement]) {
@@ -645,6 +656,12 @@ impl PlayerData {
             self.achievements
                 .insert(achievement.id, achievement.clone());
         }
+    }
+
+    /// Keep the Travel Accounts book from an `AnecdoteGetDataRsp`, replacing
+    /// any earlier copy: each one is the whole book.
+    pub fn process_anecdotes(&mut self, data: &AnecdoteData) {
+        self.anecdotes = Some(data.clone());
     }
 
     pub fn process_properties(&mut self, new_props: &HashMap<u32, u64>) {
@@ -791,6 +808,79 @@ impl PlayerData {
             );
         }
         times
+    }
+
+    /// `gi_anecdotes`, per the tracker contract (`GI_ANECDOTES.md`), or `None`
+    /// when the book was not captured.
+    ///
+    /// The matcher only accepts a book whose every value is within the
+    /// contract's ranges; they are checked again here because the tracker
+    /// drops anything outside them and this is the last place to notice. A
+    /// wish time outside [`plausible_time`]'s window leaves out the wish.
+    fn export_anecdotes(&self, now_secs: u64) -> Option<good::GiAnecdotes> {
+        let book = self.anecdotes.as_ref()?;
+
+        let anecdotes: BTreeMap<u32, good::GiAnecdote> = book
+            .anecdotes
+            .iter()
+            .filter(|entry| {
+                ANECDOTE_IDS.contains(&entry.id)
+                    && entry.state <= MAX_ANECDOTE_STATE
+                    && entry.finish_count <= MAX_ANECDOTE_FINISH_COUNT
+            })
+            .map(|entry| {
+                (
+                    entry.id,
+                    good::GiAnecdote {
+                        state: entry.state,
+                        finish_count: entry.finish_count,
+                    },
+                )
+            })
+            .collect();
+        if anecdotes.len() != book.anecdotes.len() || anecdotes.len() > MAX_ANECDOTES {
+            tracing::warn!(
+                captured = book.anecdotes.len(),
+                kept = anecdotes.len(),
+                "anecdote entries outside the contract's ranges; not exporting gi_anecdotes"
+            );
+            return None;
+        }
+
+        let mut unlocked_areas: Vec<u32> = book
+            .unlocked_areas
+            .iter()
+            .copied()
+            .filter(|area| ANECDOTE_AREA_IDS.contains(area))
+            .collect();
+        unlocked_areas.sort_unstable();
+        unlocked_areas.dedup();
+
+        let wish = book.wish.and_then(|wish| {
+            if plausible_time(u64::from(wish.last_wish_time), now_secs) {
+                Some(good::GiAnecdoteWish {
+                    npc_id: wish.npc_id,
+                    last_wish_time: wish.last_wish_time,
+                })
+            } else {
+                tracing::warn!(
+                    time = wish.last_wish_time,
+                    "anecdote wish time outside 2020-09-15..now; leaving out the wish"
+                );
+                None
+            }
+        });
+
+        Some(good::GiAnecdotes {
+            anecdotes,
+            unlocked_areas,
+            reward: book.reward.map(|reward| good::GiAnecdoteReward {
+                index: reward.index,
+                progress: reward.progress,
+                target: reward.target,
+            }),
+            wish,
+        })
     }
 
     /// A captured player property, if it lies in the range a real one can.
@@ -1061,6 +1151,8 @@ impl PlayerData {
                 .filter(|times| !times.is_empty()),
             // Filled in with the characters below.
             gi_characters: None,
+            // Omitted when the book was not captured, like the keys above.
+            gi_anecdotes: self.export_anecdotes(now_ms / 1000),
         };
 
         if settings.include_characters {
@@ -2511,6 +2603,27 @@ mod tests {
                 (10027, 3),
                 (10039, 9),
             ]));
+            data.process_anecdotes(&AnecdoteData {
+                anecdotes: vec![
+                    auto_artifactarium::Anecdote {
+                        id: 100_001,
+                        state: 3,
+                        finish_count: 1,
+                    },
+                    auto_artifactarium::Anecdote {
+                        id: 101_604,
+                        state: 0,
+                        finish_count: 3,
+                    },
+                ],
+                unlocked_areas: vec![1, 2],
+                reward: Some(auto_artifactarium::AnecdoteReward {
+                    index: 0,
+                    progress: 1,
+                    target: 10,
+                }),
+                wish: None,
+            });
         }
         data
     }
@@ -2544,7 +2657,10 @@ mod tests {
         r#""storyKeys":3,"maxStamina":24000,"#,
         r#""gameData":"792978e5503ecfba73dcb3562ed44a0d35a2abe2"},"#,
         r#""gi_achievement_times":{"80014":1650000000},"#,
-        r#""gi_characters":{"HuTao":{"friendship":10,"obtainedAt":1646092800}}}"#,
+        r#""gi_characters":{"HuTao":{"friendship":10,"obtainedAt":1646092800}},"#,
+        r#""gi_anecdotes":{"anecdotes":{"100001":{"state":3,"finishCount":1},"#,
+        r#""101604":{"state":0,"finishCount":3}},"unlockedAreas":[1,2],"#,
+        r#""reward":{"index":0,"progress":1,"target":10}}}"#,
     );
 
     #[test]
@@ -2570,16 +2686,128 @@ mod tests {
         assert!(good.gi_player.is_some());
         assert!(good.gi_achievement_times.is_some());
         assert!(good.gi_characters.is_some());
+        assert!(good.gi_anecdotes.is_some());
         let with = serde_json::to_string(&good).unwrap();
 
         good.gi_player = None;
         good.gi_achievement_times = None;
         good.gi_characters = None;
+        good.gi_anecdotes = None;
         let without = serde_json::to_string(&good).unwrap();
 
         let good_part = without.strip_suffix('}').unwrap();
         assert!(with.starts_with(good_part), "{with}\n{without}");
         assert!(with[good_part.len()..].starts_with(r#","gi_player":"#));
+    }
+
+    // -- gi_anecdotes ----------------------------------------------------------------
+
+    fn book() -> AnecdoteData {
+        let entry = |id: u32, state: u32, finish_count: u32| auto_artifactarium::Anecdote {
+            id,
+            state,
+            finish_count,
+        };
+        AnecdoteData {
+            anecdotes: vec![
+                entry(100_001, 3, 1),
+                entry(101_604, 0, 2),
+                entry(107_302, 2, 0),
+            ],
+            unlocked_areas: vec![3, 1, 2],
+            reward: Some(auto_artifactarium::AnecdoteReward {
+                index: 12,
+                progress: 4,
+                target: 10,
+            }),
+            wish: Some(auto_artifactarium::AnecdoteWish {
+                npc_id: Some(9801),
+                last_wish_time: 1_790_000_000,
+            }),
+        }
+    }
+
+    #[test]
+    fn the_book_is_exported_as_the_contract_writes_it() {
+        let mut data = player_data();
+        data.process_anecdotes(&book());
+
+        let good = data.export_at(&settings(), NOW_SECS * 1000).0;
+        let json = serde_json::to_value(&good).unwrap();
+        assert_eq!(
+            json["gi_anecdotes"],
+            serde_json::json!({
+                "anecdotes": {
+                    "100001": { "state": 3, "finishCount": 1 },
+                    "101604": { "state": 0, "finishCount": 2 },
+                    "107302": { "state": 2, "finishCount": 0 },
+                },
+                "unlockedAreas": [1, 2, 3],
+                "reward": { "index": 12, "progress": 4, "target": 10 },
+                "wish": { "npcId": 9801, "lastWishTime": 1_790_000_000 },
+            })
+        );
+    }
+
+    #[test]
+    fn no_book_captured_means_no_gi_anecdotes_key() {
+        let mut data = player_data();
+        data.process_properties(&login_properties());
+        let json = serde_json::to_value(data.export_at(&settings(), NOW_SECS * 1000).0).unwrap();
+        assert!(json.as_object().unwrap().get("gi_anecdotes").is_none());
+    }
+
+    #[test]
+    fn a_newer_book_replaces_the_old_one() {
+        let mut data = player_data();
+        data.process_anecdotes(&book());
+        let mut newer = book();
+        newer.anecdotes.truncate(1);
+        newer.reward = None;
+        newer.wish = None;
+        data.process_anecdotes(&newer);
+
+        let exported = data.export_anecdotes(NOW_SECS).unwrap();
+        assert_eq!(
+            exported.anecdotes.keys().copied().collect::<Vec<_>>(),
+            [100_001]
+        );
+        assert_eq!(exported.reward, None);
+        assert_eq!(exported.wish, None);
+    }
+
+    #[test]
+    fn reset_forgets_the_book() {
+        let mut data = player_data();
+        data.process_anecdotes(&book());
+        assert!(!data.is_empty());
+        data.reset();
+        assert!(data.is_empty());
+        assert_eq!(data.export_anecdotes(NOW_SECS), None);
+    }
+
+    #[test]
+    fn an_implausible_wish_time_leaves_out_only_the_wish() {
+        let mut data = player_data();
+        let mut stale = book();
+        stale.wish = Some(auto_artifactarium::AnecdoteWish {
+            npc_id: None,
+            last_wish_time: (NOW_SECS + CLOCK_SLACK_SECS + 1) as u32,
+        });
+        data.process_anecdotes(&stale);
+
+        let exported = data.export_anecdotes(NOW_SECS).unwrap();
+        assert_eq!(exported.wish, None);
+        assert_eq!(exported.anecdotes.len(), 3);
+    }
+
+    #[test]
+    fn a_book_with_values_outside_the_contract_is_not_exported() {
+        let mut data = player_data();
+        let mut bad = book();
+        bad.anecdotes[0].state = MAX_ANECDOTE_STATE + 1;
+        data.process_anecdotes(&bad);
+        assert_eq!(data.export_anecdotes(NOW_SECS), None);
     }
 
     // -- gi_achievement_times ------------------------------------------------------
