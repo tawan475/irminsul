@@ -317,6 +317,164 @@ pub fn matches_do_gacha_rsp(data: &[u8]) -> Option<GachaWish> {
     })
 }
 
+/// The most banners believed in one banner list.
+const MAX_BANNERS: usize = 64;
+
+/// The longest record link query believed.
+const MAX_RECORD_QUERY_LEN: usize = 1024;
+
+/// One banner's wish history link, from `GetGachaInfoRsp`.
+///
+/// The server sends every banner a link to its history page
+/// (`https://…/index.html?win_mode=fullscreen&…&init_type=301&gacha_id=…&timestamp=…`).
+/// When the player opens the history, the game adds its own parameters and
+/// the key to that link's query and calls the wish history API with it; this
+/// is the query, verbatim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GachaRecordLink {
+    /// The banner, one of [`GACHA_TYPES`]; `None` when it could not be told.
+    pub gacha_type: Option<u32>,
+    /// The link's query, as the server sent it (no leading `?`).
+    pub query: String,
+}
+
+/// The query of a history page link, if `s` is one: an http(s) URL whose
+/// query names the wish web view and an `init_type` (the history category),
+/// made of nothing but plain URL characters. Event banners' links also name
+/// a `gacha_id`; the Beginners' banner's does not.
+fn record_link_query(s: &str) -> Option<&str> {
+    if !(s.starts_with("https://") || s.starts_with("http://")) {
+        return None;
+    }
+    let (_, query) = s.split_once('?')?;
+    let plain = query
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'=' | b'&' | b'_' | b'-' | b'.'));
+    let has = |name: &str| query.split('&').any(|pair| pair.starts_with(name));
+    (plain
+        && query.len() <= MAX_RECORD_QUERY_LEN
+        && query
+            .split('&')
+            .any(|pair| pair == "auth_appid=webview_gacha")
+        && has("init_type="))
+    .then_some(query)
+}
+
+/// Read one entry of the banner list (`GachaInfo`): its history link and its
+/// banner type.
+fn read_gacha_info(bytes: &[u8]) -> Option<GachaRecordLink> {
+    let msg = Unk::parse_from_bytes(bytes).ok()?;
+    let mut query = None;
+    let mut types = Vec::new();
+    for (_, value) in msg.unknown_fields().iter() {
+        match value {
+            Varint(value) => {
+                if let Ok(value) = u32::try_from(value)
+                    && GACHA_TYPES.contains(&value)
+                    && !types.contains(&value)
+                {
+                    types.push(value);
+                }
+            }
+            LengthDelimited(bytes) => {
+                // The link appears more than once (the global and the
+                // overseas copy); they are the same.
+                if query.is_none()
+                    && let Ok(s) = std::str::from_utf8(bytes)
+                {
+                    query = record_link_query(s).map(str::to_owned);
+                }
+            }
+            Fixed32(_) | Fixed64(_) => {}
+        }
+    }
+    Some(GachaRecordLink {
+        gacha_type: match types.as_slice() {
+            [one] => Some(*one),
+            _ => None,
+        },
+        query: query?,
+    })
+}
+
+/// Recover every banner's history link from a `GetGachaInfoRsp` payload, or
+/// `None` if it is not one.
+///
+/// The shape: one repeated submessage field (the banner list, 1 to 64
+/// entries) beside scalars, every entry carrying a history
+/// page link of the wish web view. No other message carries those links.
+pub fn matches_get_gacha_info_rsp(data: &[u8]) -> Option<Vec<GachaRecordLink>> {
+    let msg = Unk::parse_from_bytes(data).ok()?;
+    let mut lists: BTreeMap<u32, Vec<&[u8]>> = BTreeMap::new();
+    for (tag, value) in msg.unknown_fields().iter() {
+        match value {
+            LengthDelimited(bytes) => lists.entry(tag).or_default().push(bytes),
+            Varint(_) => {}
+            Fixed32(_) | Fixed64(_) => return None,
+        }
+    }
+    let mut lists = lists.into_values();
+    let (Some(entries), None) = (lists.next(), lists.next()) else {
+        return None;
+    };
+    if entries.len() > MAX_BANNERS {
+        return None;
+    }
+    entries.iter().map(|entry| read_gacha_info(entry)).collect()
+}
+
+/// Whether `s` is a full client version (`OSRELWin7.1.0_R11111111_S22222222_D33333333`):
+/// a release name -- capitals, the platform, a dotted version -- then at least
+/// two `_<capital><digits>` build numbers.
+fn is_client_version(s: &str) -> bool {
+    if s.len() > 96 {
+        return false;
+    }
+    let mut parts = s.split('_');
+    let Some(release) = parts.next() else {
+        return false;
+    };
+    let builds: Vec<&str> = parts.collect();
+    let capitals = release.bytes().take_while(u8::is_ascii_uppercase).count();
+    let rest = &release[capitals..];
+    let letters = rest.bytes().take_while(u8::is_ascii_alphabetic).count();
+    let version = &rest[letters..];
+    let dotted = version.split('.').collect::<Vec<_>>();
+    capitals >= 2
+        && letters >= 1
+        && dotted.len() == 3
+        && dotted
+            .iter()
+            .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        && builds.len() >= 2
+        && builds.iter().all(|build| {
+            let bytes = build.as_bytes();
+            bytes.len() >= 2
+                && bytes[0].is_ascii_uppercase()
+                && bytes[1..].iter().all(u8::is_ascii_digit)
+        })
+}
+
+/// Recover the client's full version string from a payload that carries it
+/// as a top-level string (the client's `GetPlayerTokenReq` at login), or
+/// `None`. The wish history link names it (`game_version`).
+pub fn matches_client_version(data: &[u8]) -> Option<String> {
+    let msg = Unk::parse_from_bytes(data).ok()?;
+    let mut found = None;
+    for (_, value) in msg.unknown_fields().iter() {
+        if let LengthDelimited(bytes) = value
+            && let Ok(s) = std::str::from_utf8(bytes)
+            && is_client_version(s)
+        {
+            if found.as_deref().is_some_and(|other| other != s) {
+                return None;
+            }
+            found = Some(s.to_owned());
+        }
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -745,6 +903,192 @@ mod tests {
         assert_eq!(matches_get_authkey_rsp(&wish), None);
     }
 
+    // -- GetGachaInfoRsp -----------------------------------------------------
+
+    const RECORD_QUERY: &str = "win_mode=fullscreen&no_joypad_close=1&authkey_ver=1&sign_type=2\
+         &auth_appid=webview_gacha&init_type=301&gacha_id=0123456789abcdef0123456789abcdef01234567\
+         &timestamp=1790000000";
+
+    fn record_url(init_type: Option<u32>, gacha_id: &str) -> String {
+        let init = init_type
+            .map(|t| format!("&init_type={t}"))
+            .unwrap_or_default();
+        format!(
+            "https://example.invalid/genshin/event/gacha/index.html?win_mode=fullscreen\
+             &no_joypad_close=1&authkey_ver=1&sign_type=2&auth_appid=webview_gacha{init}\
+             &gacha_id={gacha_id}&timestamp=1790000000"
+        )
+    }
+
+    /// One `GachaInfo` with the 7.1 field numbers: the record link (twice),
+    /// the details link (no `init_type`), names, times, costs.
+    fn gacha_info(gacha_type: u64, init_type: u32, gacha_id: &str) -> Vec<u8> {
+        [
+            field_varint(1, 3923),
+            field_varint(2, gacha_type),
+            field_varint(3, 1_791_885_540),
+            field_varint(4, 10),
+            field_varint(5, u64::from(u32::MAX)),
+            field_varint(6, 1_790_000_000),
+            field_bytes(7, record_url(Some(init_type), gacha_id).as_bytes()),
+            field_varint(8, 223),
+            field_bytes(9, record_url(None, gacha_id).as_bytes()),
+            field_bytes(10, b"UI_Tab_GachaShowPanel_A001"),
+            field_varint(11, 9998),
+            field_bytes(15, b"GachaShowPanel_A001"),
+            field_bytes(600, record_url(Some(init_type), gacha_id).as_bytes()),
+            field_bytes(2032, b"UI_GACHA_SHOW_PANEL_A001_TITLE"),
+        ]
+        .concat()
+    }
+
+    fn gacha_info_rsp(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = field_varint(11, 0x5f3a_91c2);
+        for entry in entries {
+            out.extend(field_bytes(14, entry));
+        }
+        out
+    }
+
+    const ID_301: &str = "0123456789abcdef0123456789abcdef01234567";
+    const ID_400: &str = "76543210fedcba9876543210fedcba9876543210";
+
+    #[test]
+    fn every_banners_history_link_is_read_verbatim() {
+        let payload = gacha_info_rsp(&[
+            gacha_info(200, 200, ID_301),
+            gacha_info(301, 301, ID_301),
+            gacha_info(400, 301, ID_400),
+        ]);
+        let links = matches_get_gacha_info_rsp(&payload).unwrap();
+        assert_eq!(links.len(), 3);
+        assert_eq!(links[1].gacha_type, Some(301));
+        assert_eq!(links[1].query, RECORD_QUERY);
+        assert_eq!(links[2].gacha_type, Some(400));
+        assert!(links[2].query.contains("init_type=301&gacha_id=7654"));
+        assert!(links[0].query.contains("init_type=200&"));
+    }
+
+    #[test]
+    fn the_beginners_banner_link_has_no_gacha_id_and_is_still_read() {
+        let link = "https://example.invalid/index.html?win_mode=fullscreen&no_joypad_close=1&authkey_ver=1&sign_type=2&auth_appid=webview_gacha&init_type=100&timestamp=1780000000";
+        let details = "https://example.invalid/index.html?win_mode=fullscreen&auth_appid=webview_gacha&timestamp=1780000000#/newbiegacha";
+        let entry = [
+            field_varint(2, 100),
+            field_bytes(7, link.as_bytes()),
+            field_bytes(9, details.as_bytes()),
+        ]
+        .concat();
+        let links =
+            matches_get_gacha_info_rsp(&gacha_info_rsp(&[gacha_info(301, 301, ID_301), entry]))
+                .unwrap();
+        assert_eq!(links[1].gacha_type, Some(100));
+        assert!(
+            links[1]
+                .query
+                .ends_with("init_type=100&timestamp=1780000000")
+        );
+    }
+
+    #[test]
+    fn the_banner_list_is_classified_as_such_and_nothing_else() {
+        let payload = gacha_info_rsp(&[gacha_info(301, 301, ID_301)]);
+        match classify_command(&command(29811, &payload)) {
+            Some(CommandMatch::GachaInfo(links)) => assert_eq!(links.len(), 1),
+            other => panic!("expected the banner list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_banner_list_without_history_links_is_not_read() {
+        // Only the details link (no init_type): nothing to build from.
+        let entry = [
+            field_varint(2, 301),
+            field_bytes(9, record_url(None, ID_301).as_bytes()),
+        ]
+        .concat();
+        assert_eq!(matches_get_gacha_info_rsp(&gacha_info_rsp(&[entry])), None);
+        // A link with characters a plain query does not have.
+        let odd = record_url(Some(301), ID_301).replace("timestamp=", "timestamp=%3C");
+        let entry = [field_varint(2, 301), field_bytes(7, odd.as_bytes())].concat();
+        assert_eq!(matches_get_gacha_info_rsp(&gacha_info_rsp(&[entry])), None);
+        // A link to another web view.
+        let other = record_url(Some(301), ID_301).replace("webview_gacha", "webview_other");
+        let entry = [field_varint(2, 301), field_bytes(7, other.as_bytes())].concat();
+        assert_eq!(matches_get_gacha_info_rsp(&gacha_info_rsp(&[entry])), None);
+        // Not a list at all, or two lists.
+        assert_eq!(matches_get_gacha_info_rsp(&field_varint(11, 1)), None);
+        let mut two = gacha_info_rsp(&[gacha_info(301, 301, ID_301)]);
+        two.extend(field_bytes(15, &gacha_info(302, 302, ID_400)));
+        assert_eq!(matches_get_gacha_info_rsp(&two), None);
+    }
+
+    #[test]
+    fn the_other_wish_messages_are_not_a_banner_list() {
+        assert_eq!(
+            matches_get_gacha_info_rsp(&do_gacha_rsp(301, &ten_pull())),
+            None
+        );
+        let key = authkey_rsp("webview_gacha", "hk4e_global", &synthetic_authkey());
+        assert_eq!(matches_get_gacha_info_rsp(&key), None);
+        let list = gacha_info_rsp(&[gacha_info(301, 301, ID_301)]);
+        assert_eq!(matches_do_gacha_rsp(&list), None);
+        assert_eq!(matches_get_authkey_rsp(&list), None);
+    }
+
+    // -- the client version --------------------------------------------------
+
+    const VERSION: &str = "OSRELWin7.1.0_R11111111_S22222222_D33333333";
+
+    /// A `GetPlayerTokenReq`-like message: the version among other strings.
+    fn token_req(version: &str) -> Vec<u8> {
+        [
+            field_varint(1, 1),
+            field_bytes(3, b"v2_SyNtHeTiC-account-token"),
+            field_bytes(9, b"Windows 11  (10.0.10000) 64bit"),
+            field_bytes(11, version.as_bytes()),
+            field_bytes(1206, b"OSRELWin7.1.0"),
+            field_varint(1440, 33_333_333),
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn the_client_version_is_read_from_the_token_request() {
+        assert_eq!(
+            matches_client_version(&token_req(VERSION)).as_deref(),
+            Some(VERSION)
+        );
+        assert_eq!(
+            matches_client_version(&token_req("CNRELWin7.1.0_R1_S2_D3")).as_deref(),
+            Some("CNRELWin7.1.0_R1_S2_D3")
+        );
+        match classify_command(&command(9282, &token_req(VERSION))) {
+            Some(CommandMatch::ClientVersion(version)) => assert_eq!(version, VERSION),
+            other => panic!("expected the client version, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strings_that_only_look_like_a_version_are_not_one() {
+        for not_version in [
+            "OSRELWin7.1.0",
+            "OSRELWin7.1_R1_S2",
+            "osrelwin7.1.0_R1_S2",
+            "OSRELWin7.1.0_R1",
+            "OSRELWin7.1.0_R1_Sx",
+            "OSREL7.1.0_R1_S2",
+            "UI_GACHA_SHOW_PANEL_A001_TITLE",
+            "hk4e_global",
+        ] {
+            assert!(!is_client_version(not_version), "{not_version}");
+        }
+        // Two different versions: nothing to tell apart.
+        let mut two = token_req(VERSION);
+        two.extend(field_bytes(12, b"OSRELWin7.2.0_R1_S2_D3"));
+        assert_eq!(matches_client_version(&two), None);
+    }
+
     #[test]
     fn garbage_is_neither() {
         for payload in [
@@ -755,6 +1099,8 @@ mod tests {
         ] {
             assert_eq!(matches_get_authkey_rsp(payload), None);
             assert_eq!(matches_do_gacha_rsp(payload), None);
+            assert_eq!(matches_get_gacha_info_rsp(payload), None);
+            assert_eq!(matches_client_version(payload), None);
         }
     }
 }

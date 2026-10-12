@@ -74,8 +74,9 @@ pub use crate::anecdotes::{
 use crate::connection::parse_frame;
 use crate::crypto::{bruteforce, decrypt_command, guess, lookup_initial_key};
 pub use crate::gacha::{
-    GACHA_TYPES, GachaAuthKey, GachaWish, WISH_CURRENCY_IDS, matches_do_gacha_rsp,
-    matches_get_authkey_rsp,
+    GACHA_TYPES, GachaAuthKey, GachaRecordLink, GachaWish, WISH_CURRENCY_IDS,
+    matches_client_version, matches_do_gacha_rsp, matches_get_authkey_rsp,
+    matches_get_gacha_info_rsp,
 };
 use crate::r#gen::protos::{AvatarInfo, Item, PacketHead, PropValue, Unk, prop_value};
 use crate::kcp::{KcpSniffer, SegmentHead, segment_head};
@@ -264,6 +265,8 @@ static ACHIEVEMENT_NOTIFY_LOGGED: AtomicBool = AtomicBool::new(false);
 static ANECDOTE_RSP_LOGGED: AtomicBool = AtomicBool::new(false);
 static AUTHKEY_RSP_LOGGED: AtomicBool = AtomicBool::new(false);
 static GACHA_RSP_LOGGED: AtomicBool = AtomicBool::new(false);
+static GACHA_INFO_RSP_LOGGED: AtomicBool = AtomicBool::new(false);
+static CLIENT_VERSION_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// `true` the first time it is called for a given flag.
 fn first_time(flag: &AtomicBool) -> bool {
@@ -1457,6 +1460,12 @@ pub enum CommandMatch {
     /// A wish was made (`DoGachaRsp`): see [`matches_gacha_packet`]. Not
     /// account data.
     Wish(GachaWish),
+    /// Every banner's wish history link (`GetGachaInfoRsp`): see
+    /// [`matches_gacha_info_packet`]. Not account data.
+    GachaInfo(Vec<GachaRecordLink>),
+    /// The client's full version string (`GetPlayerTokenReq`): see
+    /// [`matches_client_version_packet`]. Not account data.
+    ClientVersion(String),
 }
 
 impl CommandMatch {
@@ -1471,7 +1480,18 @@ impl CommandMatch {
             Self::DeletedItems(_) => "deleted items",
             Self::AuthKey(_) => "auth key",
             Self::Wish(_) => "wish",
+            Self::GachaInfo(_) => "banner list",
+            Self::ClientVersion(_) => "client version",
         }
+    }
+
+    /// Whether this is the account's data (what an export or upload holds),
+    /// as opposed to what only the wish history uses.
+    pub fn is_account_data(&self) -> bool {
+        !matches!(
+            self,
+            Self::AuthKey(_) | Self::Wish(_) | Self::GachaInfo(_) | Self::ClientVersion(_)
+        )
     }
 }
 
@@ -1504,6 +1524,12 @@ pub fn classify_command(game_command: &GameCommand) -> Option<CommandMatch> {
     }
     if let Some(wish) = matches_gacha_packet(game_command) {
         claims.push(CommandMatch::Wish(wish));
+    }
+    if let Some(links) = matches_gacha_info_packet(game_command) {
+        claims.push(CommandMatch::GachaInfo(links));
+    }
+    if let Some(version) = matches_client_version_packet(game_command) {
+        claims.push(CommandMatch::ClientVersion(version));
     }
     // Last on purpose. Its shape -- one packed uint64 list beside a scalar or
     // two -- is the least specific of the five, so anything another matcher can
@@ -1621,6 +1647,50 @@ pub fn matches_gacha_packet(game_command: &GameCommand) -> Option<GachaWish> {
         );
     }
     Some(wish)
+}
+
+/// Recover every banner's wish history link from a `GetGachaInfoRsp`, or
+/// `None` if this is not one.
+///
+/// Observed command id: 29811 in 7.1, kept as documentation only. The message
+/// is recognised by shape (see [`matches_get_gacha_info_rsp`]), and the first
+/// match logs the command id.
+pub fn matches_gacha_info_packet(game_command: &GameCommand) -> Option<Vec<GachaRecordLink>> {
+    let links = matches_get_gacha_info_rsp(&game_command.proto_data)?;
+
+    if first_time(&GACHA_INFO_RSP_LOGGED) {
+        info!(
+            command_id = game_command.command_id,
+            banners = links.len(),
+            "discovered GetGachaInfoRsp"
+        );
+    } else {
+        debug!(
+            command_id = game_command.command_id,
+            banners = links.len(),
+            "banner list packet"
+        );
+    }
+    Some(links)
+}
+
+/// Recover the client's full version string from a command carrying it (the
+/// client's `GetPlayerTokenReq`), or `None`.
+///
+/// Observed command id: 9282 in 7.1, kept as documentation only. The string
+/// is recognised by its own shape (see [`matches_client_version`]), and the
+/// first match logs the command id and the version (not secret).
+pub fn matches_client_version_packet(game_command: &GameCommand) -> Option<String> {
+    let version = matches_client_version(&game_command.proto_data)?;
+
+    if first_time(&CLIENT_VERSION_LOGGED) {
+        info!(
+            command_id = game_command.command_id,
+            version = %version,
+            "discovered the client version"
+        );
+    }
+    Some(version)
 }
 
 /// Recover the achievement list from a command, reporting why it did not match.
