@@ -167,6 +167,35 @@ The gear icon opens the tracker window. Under **Advanced**:
   Irminsul's saved state on your machine and never expires, which is why
   signing in is the recommended way; "Clear key" removes it.
 
+## Wish history
+
+Open **Wish → History** in game while Irminsul is running. The game then
+fetches a key for its wish history page, and Irminsul picks it up from the
+traffic; the "Wish History" section says "Wish key valid about 24 h" (keys
+last about a day; open the history again for a new one).
+
+- **Copy wish URL** (the clipboard icon) copies the wish URL built from that
+  key. Paste it into [paimon.moe](https://paimon.moe/wish/import) ("Manual"
+  import) or [StarDB](https://stardb.gg/en/genshin/wish-import); the
+  "Open Paimon.moe" and "Open StarDB" links copy it and open the page in one
+  go. Until a key has been captured, Irminsul falls back to looking for the
+  URL in the game's web cache, as older versions did.
+- **Sync to the tracker**: when Irminsul uploads to a Genshin Data Tracker by
+  itself -- signed in (or with a verified import key) and "Auto export to
+  tracker" ticked -- a new key also sends your wish history there. It asks the
+  tracker which wishes it already has, then reads only the newest page of each
+  banner and goes further back only while the wishes are new, at a gentle pace
+  (a second between pages). A wish you make in game sends that banner's new
+  wishes about 20 seconds later. Nothing is fetched otherwise. The section shows
+  the last sync ("Synced 21:04 · added 37") or why it did not happen (for
+  example "the upload target no longer exists; choose one with Configure on
+  the tracker").
+
+The key works like a password for your wish history while it lasts: Irminsul
+keeps it in memory only, never writes it to its log or settings, and sends it
+only to the game's own wish history server -- never to the tracker, which
+only receives the wishes themselves.
+
 ## Start Irminsul when you sign in (Windows)
 
 Tick "Start Irminsul on startup" in the "Automation" section. Irminsul then
