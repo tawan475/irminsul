@@ -14,6 +14,7 @@ use super::gacha_log::{LogClient, Pacing, Sleeper, WishKey};
 use super::run::{Partial, Run, RunError, RunReport};
 use super::test_server::{Reply, Request, TestServer};
 use super::tracker::{Tracker, TrackerCredential};
+use crate::signin::{MemoryStore, TrackerAuth};
 
 const AUTHKEY: &str = "SyNtHeTiCwIsHkEy+0123456789/abcdefghij==";
 const IMPORT_KEY: &str = "gdt_uk_synthetic";
@@ -49,6 +50,14 @@ struct World {
     cursor_reply: Option<Reply>,
     import_status: u16,
     log_requests: usize,
+    /// The server's own address, for the sign-in discovery.
+    base: String,
+    /// Whether the wish routes want the sign-in's bearer token.
+    bearer: bool,
+    /// Access tokens issued (`at-<n>`); only the newest is accepted.
+    issued: u32,
+    /// One-off answers for tracker routes, by path.
+    tracker_faults: Vec<(&'static str, Reply)>,
 }
 
 impl World {
@@ -69,6 +78,10 @@ impl World {
             cursor_reply: None,
             import_status: 200,
             log_requests: 0,
+            base: String::new(),
+            bearer: false,
+            issued: 0,
+            tracker_faults: Vec::new(),
         }
     }
 
@@ -98,6 +111,54 @@ impl World {
                     "page": request.param("page").unwrap(), "size": size.to_string(),
                     "region": "os_asia", "list": list,
                 }})
+                .to_string(),
+            );
+        }
+        if request.path.starts_with("/api/wishes/") {
+            if let Some(at) = self
+                .tracker_faults
+                .iter()
+                .position(|(path, _)| *path == request.path)
+            {
+                return self.tracker_faults.remove(at).1;
+            }
+            if self.bearer {
+                let expected = format!("Bearer at-{}", self.issued);
+                if request.header("authorization") != Some(expected.as_str()) {
+                    return Reply::json(401, r#"{"error":{"code":"token_expired"}}"#);
+                }
+            }
+        }
+        if request.path == "/api/oauth/irminsul" {
+            let base = &self.base;
+            return Reply::json(
+                200,
+                json!({
+                    "authorize_url": format!("{base}/link"),
+                    "token_url": format!("{base}/api/oauth/token"),
+                    "revoke_url": format!("{base}/api/oauth/revoke"),
+                    "client_id": "irminsul", "version": 1,
+                })
+                .to_string(),
+            );
+        }
+        if request.path == "/api/oauth/token" {
+            self.issued += 1;
+            let n = self.issued;
+            return Reply::json(
+                200,
+                json!({
+                    "token_type": "Bearer", "access_token": format!("at-{n}"), "expires_in": 900,
+                    "refresh_token": format!("rt-{n}"), "refresh_expires_in": 2_592_000,
+                })
+                .to_string(),
+            );
+        }
+        if request.path == "/api/irminsul/whoami" {
+            return Reply::json(
+                200,
+                json!({"scope": "uid", "user": "player01", "accountId": null,
+                       "dashboardUrl": format!("{}/app", self.base)})
                 .to_string(),
             );
         }
@@ -169,6 +230,8 @@ struct Fixture {
     sleeper: RecordingSleeper,
     partials: BTreeMap<Banner, Partial>,
     page_cap: u32,
+    /// `None`: the import key.
+    credential: Option<TrackerCredential>,
 }
 
 impl Fixture {
@@ -182,7 +245,40 @@ impl Fixture {
             sleeper: RecordingSleeper::default(),
             partials: BTreeMap::new(),
             page_cap: super::run::PAGES_PER_RUN,
+            credential: None,
         }
+    }
+
+    /// A fixture whose wish routes want the sign-in, and a sign-in that has
+    /// read its saved refresh token (and so holds access token `at-1`).
+    async fn signed_in(mut world: World) -> (Self, TrackerAuth) {
+        world.bearer = true;
+        let mut fixture = Self::new(world);
+        let base = fixture.server.base.clone();
+        fixture.world().base = base.clone();
+        let api = format!("{base}/api");
+        let store = Arc::new(MemoryStore::default());
+        store
+            .tokens
+            .lock()
+            .unwrap()
+            .insert(base.clone(), "rt-0".to_owned());
+        let auth = TrackerAuth::new(
+            &api,
+            store,
+            "TEST-PC".to_owned(),
+            Arc::new(|_| {}),
+            Arc::new(|| {}),
+        );
+        auth.load(&crate::http_client_builder().build().unwrap())
+            .await;
+        assert!(auth.status().borrow().is_signed_in());
+        assert_eq!(fixture.world().issued, 1);
+        fixture.credential = Some(TrackerCredential::SignedIn {
+            auth: auth.clone(),
+            base: api,
+        });
+        (fixture, auth)
     }
 
     fn world(&self) -> std::sync::MutexGuard<'_, World> {
@@ -206,7 +302,10 @@ impl Fixture {
         let tracker = Tracker {
             http,
             base_url: format!("{}/api/", self.server.base),
-            credential: TrackerCredential::ImportKey(IMPORT_KEY.to_owned()),
+            credential: self
+                .credential
+                .clone()
+                .unwrap_or_else(|| TrackerCredential::ImportKey(IMPORT_KEY.to_owned())),
         };
         let progress = |_: Banner, _: u32| {};
         let report = Run::new(&mut log, &tracker, &progress, self.page_cap)
@@ -576,7 +675,7 @@ async fn a_tracker_refusal_stops_the_run_with_its_code() {
     assert_eq!(
         report.error,
         Some(RunError::Tracker(
-            "tracker: HTTP 409 uid_mismatch (This key is for another UID)".to_owned()
+            "tracker: the tracker account uploads go to has another UID".to_owned()
         ))
     );
     assert_eq!(fixture.log_requests(), vec![(301, 1, 0)]);
@@ -593,7 +692,7 @@ async fn a_failed_import_keeps_nothing_it_did_not_send() {
     let report = fixture.run(&[301, 302]).await;
 
     assert!(
-        matches!(&report.error, Some(RunError::Tracker(why)) if why.contains("daily_upload_limit")),
+        matches!(&report.error, Some(RunError::Tracker(why)) if why.contains("upload limit")),
         "{report:?}"
     );
     // 301 stopped at the cap; with the import of 302 refused, the run keeps no
@@ -615,4 +714,107 @@ async fn more_than_one_import_request_of_records_is_chunked_oldest_first() {
     assert_eq!(imports[1]["records"].as_array().unwrap().len(), 50);
     let ids = fixture.imported_ids();
     assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+}
+
+// -- signed in -----------------------------------------------------------------
+
+#[tokio::test]
+async fn signed_in_the_wish_routes_get_the_sessions_bearer_token() {
+    let (mut fixture, _auth) = Fixture::signed_in(World::new(&[(301, 3)])).await;
+
+    let report = fixture.run(&[301]).await;
+
+    assert_eq!(report.error, None);
+    assert_eq!(report.sent, 3);
+    for path in ["/api/wishes/cursor", "/api/wishes/import"] {
+        let request = &fixture.requests(path)[0];
+        assert_eq!(
+            request.header("authorization"),
+            Some("Bearer at-1"),
+            "{path}"
+        );
+        assert_eq!(request.header("x-import-key"), None, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn an_expired_access_token_is_refreshed_once_and_the_request_retried() {
+    let (mut fixture, _auth) = Fixture::signed_in(World::new(&[(301, 3)])).await;
+    // The tracker moved on: `at-1` is no longer accepted.
+    fixture.world().issued += 1;
+
+    let report = fixture.run(&[301]).await;
+
+    assert_eq!(report.error, None);
+    assert_eq!(report.sent, 3);
+    // One refresh (through the sign-in, under its lock), then the retry.
+    assert_eq!(fixture.requests("/api/oauth/token").len(), 2);
+    let cursors = fixture.requests("/api/wishes/cursor");
+    assert_eq!(cursors.len(), 2);
+    assert_eq!(cursors[1].header("authorization"), Some("Bearer at-3"));
+}
+
+#[tokio::test]
+async fn a_revoked_session_signs_out_and_ends_the_run() {
+    let (mut fixture, auth) = Fixture::signed_in(World::new(&[(301, 3)])).await;
+    fixture.world().tracker_faults.push((
+        "/api/wishes/cursor",
+        Reply::json(401, r#"{"error":{"code":"session_revoked"}}"#),
+    ));
+
+    let report = fixture.run(&[301]).await;
+
+    assert_eq!(
+        report.error,
+        Some(RunError::Tracker(
+            "tracker: signed out of the tracker; sign in again".to_owned()
+        ))
+    );
+    assert!(!auth.status().borrow().is_signed_in());
+    assert!(fixture.imports().is_empty());
+}
+
+#[tokio::test]
+async fn the_trackers_refusals_end_the_run_in_words() {
+    for (path, status, code, said) in [
+        (
+            "/api/wishes/import",
+            409,
+            "upload_target_missing",
+            "tracker: the upload target no longer exists; choose one with Configure on the tracker",
+        ),
+        (
+            "/api/wishes/cursor",
+            409,
+            "uid_mismatch",
+            "tracker: the tracker account uploads go to has another UID",
+        ),
+        (
+            "/api/wishes/cursor",
+            403,
+            "uploads_blocked",
+            "tracker: uploads are blocked for this tracker account",
+        ),
+        (
+            "/api/wishes/import",
+            429,
+            "rate_limited",
+            "tracker: the tracker is busy; the next key or wish tries again",
+        ),
+    ] {
+        let (mut fixture, auth) = Fixture::signed_in(World::new(&[(301, 3)])).await;
+        fixture.world().tracker_faults.push((
+            path,
+            Reply::json(status, json!({"error": {"code": code}}).to_string()),
+        ));
+
+        let report = fixture.run(&[301]).await;
+
+        assert_eq!(
+            report.error,
+            Some(RunError::Tracker(said.to_owned())),
+            "{code}"
+        );
+        assert!(auth.status().borrow().is_signed_in(), "{code}");
+    }
 }

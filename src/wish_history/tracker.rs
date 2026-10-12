@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::Banner;
 use super::gacha_log::ApiRecord;
+use crate::signin::{AuthError, TrackerAuth};
 
 /// Records per import request: the tracker's limit.
 pub(crate) const MAX_RECORDS_PER_IMPORT: usize = 2_000;
@@ -15,38 +16,26 @@ pub(crate) const MAX_RECORDS_PER_IMPORT: usize = 2_000;
 /// The language the records are fetched in (the URL's `lang`).
 pub(crate) const RECORD_LANG: &str = "en-us";
 
-/// How irminsul proves who it uploads for.
-///
-/// Both routes accept either kind and resolve it to an owner exactly like a
-/// snapshot upload does.
-#[derive(Clone, PartialEq, Eq)]
+/// How irminsul proves who it uploads for: the same choice as a snapshot
+/// upload (`app::upload_credential`). Both routes accept either kind and
+/// resolve it to an owner exactly like a snapshot upload does.
+#[derive(Clone)]
 pub(crate) enum TrackerCredential {
     /// The import key from Settings (`gdt_import_…` / `gdt_uk_…`), sent as
-    /// `x-import-key`.
+    /// `x-import-key`. Used only while not signed in.
     ImportKey(String),
-    // SIGN-IN: when "Sign in with the tracker" lands, add
-    //
-    //     /// An irminsul access token, sent as `Authorization: Bearer`.
-    //     Bearer(String),
-    //
-    // send it in `apply` below with `request.bearer_auth(token)`, and have
-    // `credential_for` (in `mod.rs`) return it in place of the import key
-    // while signed in. The access token lasts 15 minutes: hand the sync a
-    // fresh one per run, and refresh and retry once on a 401 `token_expired`.
-}
-
-impl TrackerCredential {
-    fn apply(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match self {
-            Self::ImportKey(key) => request.header("x-import-key", key),
-        }
-    }
+    /// The tracker sign-in: a bearer token from [`TrackerAuth`], which
+    /// refreshes it (under its own lock) and retries once on a 401, and ends
+    /// the sign-in on `session_revoked`. `base` is the address the token must
+    /// belong to.
+    SignedIn { auth: TrackerAuth, base: String },
 }
 
 impl fmt::Debug for TrackerCredential {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ImportKey(_) => f.write_str("ImportKey(<redacted>)"),
+            Self::SignedIn { base, .. } => write!(f, "SignedIn({base})"),
         }
     }
 }
@@ -159,8 +148,10 @@ impl Tracker {
 
     /// `GET /wishes/cursor?uid=`.
     pub(crate) async fn cursor(&self, uid: &str) -> Result<Cursor, String> {
-        let request = self.http.get(self.url("cursor")).query(&[("uid", uid)]);
-        let body = self.send(request).await?;
+        let url = self.url("cursor");
+        let body = self
+            .send(|| self.http.get(&url).query(&[("uid", uid)]))
+            .await?;
         let answer: CursorAnswer = serde_json::from_str(&body)
             .map_err(|e| format!("the tracker's wish cursor was unreadable: {e}"))?;
         let mut cursor = Cursor::default();
@@ -193,8 +184,8 @@ impl Tracker {
                 timezone: region_timezone(region),
                 records: chunk.iter().map(ImportRecord::from).collect(),
             };
-            let request = self.http.post(self.url("import")).json(&body);
-            let answer = self.send(request).await?;
+            let url = self.url("import");
+            let answer = self.send(|| self.http.post(&url).json(&body)).await?;
             let answer: ImportAnswer = serde_json::from_str(&answer)
                 .map_err(|e| format!("the tracker's import answer was unreadable: {e}"))?;
             total.added += answer.added;
@@ -203,33 +194,72 @@ impl Tracker {
         Ok(total)
     }
 
-    async fn send(&self, request: reqwest::RequestBuilder) -> Result<String, String> {
-        let response = self
-            .credential
-            .apply(request)
-            .send()
-            .await
-            .map_err(|e| format!("could not reach the tracker: {}", e.without_url()))?;
+    /// Send the request `build` makes with the credential; the body of a
+    /// success, else what to tell the user. `build` may run twice (a
+    /// signed-in retry after a refresh).
+    async fn send(&self, build: impl Fn() -> reqwest::RequestBuilder) -> Result<String, String> {
+        let response =
+            match &self.credential {
+                TrackerCredential::ImportKey(key) => build()
+                    .header("x-import-key", key)
+                    .send()
+                    .await
+                    .map_err(|e| format!("could not reach the tracker: {}", e.without_url()))?,
+                TrackerCredential::SignedIn { auth, base } => auth
+                    .send_signed_in(&self.http, base, |token| build().bearer_auth(token))
+                    .await
+                    .map_err(|error| match error {
+                        AuthError::SignedOut => describe_failure(401, "session_revoked", ""),
+                        AuthError::Http { status, body } => failure(status.as_u16(), &body),
+                        other => format!("tracker: {other}"),
+                    })?,
+            };
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if status.is_success() {
             return Ok(body);
         }
-        Err(match serde_json::from_str::<ErrorAnswer>(&body) {
-            Ok(ErrorAnswer { error }) if !error.code.is_empty() => {
-                if error.message.is_empty() {
-                    format!("tracker: HTTP {} {}", status.as_u16(), error.code)
-                } else {
-                    format!(
-                        "tracker: HTTP {} {} ({})",
-                        status.as_u16(),
-                        error.code,
-                        truncate(&error.message, 160)
-                    )
-                }
-            }
-            _ => format!("tracker: HTTP {}", status.as_u16()),
-        })
+        Err(failure(status.as_u16(), &body))
+    }
+}
+
+/// What to say about a refused tracker request.
+fn failure(status: u16, body: &str) -> String {
+    match serde_json::from_str::<ErrorAnswer>(body) {
+        Ok(ErrorAnswer { error }) => describe_failure(status, &error.code, &error.message),
+        Err(_) => describe_failure(status, "", ""),
+    }
+}
+
+/// The status line's words for the tracker's error codes (the ones
+/// `/irminsul/import` uses, which the wish routes share), else the code and
+/// the tracker's own sentence.
+fn describe_failure(status: u16, code: &str, message: &str) -> String {
+    let known = match code {
+        // Only after the refresh and retry did not help.
+        "token_expired" => "the sign-in expired; sign in again",
+        "session_revoked" => "signed out of the tracker; sign in again",
+        "upload_target_missing" => {
+            "the upload target no longer exists; choose one with Configure on the tracker"
+        }
+        "uid_mismatch" => "the tracker account uploads go to has another UID",
+        "uploads_blocked" => "uploads are blocked for this tracker account",
+        "account_suspended" => "this tracker account is suspended",
+        "rate_limited" => "the tracker is busy; the next key or wish tries again",
+        "daily_upload_limit" => "today's upload limit on the tracker is reached",
+        "storage_quota" => "the tracker storage is full",
+        _ => "",
+    };
+    if !known.is_empty() {
+        return format!("tracker: {known}");
+    }
+    match (code.is_empty(), message.is_empty()) {
+        (true, _) if status == 429 => {
+            "tracker: busy (HTTP 429); the next key or wish tries again".to_owned()
+        }
+        (true, _) => format!("tracker: HTTP {status}"),
+        (false, true) => format!("tracker: HTTP {status} {code}"),
+        (false, false) => format!("tracker: HTTP {status} {code} ({})", truncate(message, 160)),
     }
 }
 
@@ -257,6 +287,56 @@ mod tests {
     fn the_credential_never_shows_in_debug_output() {
         let rendered = format!("{:?}", TrackerCredential::ImportKey("gdt_uk_secret".into()));
         assert!(!rendered.contains("secret"), "{rendered}");
+    }
+
+    #[test]
+    fn the_trackers_error_codes_read_as_sentences() {
+        let says = |status, code: &str| {
+            failure(
+                status,
+                &serde_json::json!({ "error": { "code": code } }).to_string(),
+            )
+        };
+        assert_eq!(
+            says(409, "upload_target_missing"),
+            "tracker: the upload target no longer exists; choose one with Configure on the tracker"
+        );
+        assert_eq!(
+            says(409, "uid_mismatch"),
+            "tracker: the tracker account uploads go to has another UID"
+        );
+        assert_eq!(
+            says(403, "uploads_blocked"),
+            "tracker: uploads are blocked for this tracker account"
+        );
+        assert_eq!(
+            says(403, "account_suspended"),
+            "tracker: this tracker account is suspended"
+        );
+        assert_eq!(
+            says(429, "rate_limited"),
+            "tracker: the tracker is busy; the next key or wish tries again"
+        );
+        assert_eq!(
+            says(401, "session_revoked"),
+            "tracker: signed out of the tracker; sign in again"
+        );
+        assert_eq!(
+            says(401, "token_expired"),
+            "tracker: the sign-in expired; sign in again"
+        );
+        assert_eq!(
+            failure(429, "busy"),
+            "tracker: busy (HTTP 429); the next key or wish tries again"
+        );
+        assert_eq!(failure(404, "<html>"), "tracker: HTTP 404");
+        assert_eq!(
+            failure(
+                400,
+                r#"{"error":{"code":"bad_records","message":"No records"}}"#
+            ),
+            "tracker: HTTP 400 bad_records (No records)"
+        );
     }
 
     #[test]

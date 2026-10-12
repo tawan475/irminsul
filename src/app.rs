@@ -881,6 +881,7 @@ fn start_async_runtime(
         saved_state_rx.clone(),
         toast_tx.clone(),
         egui_ctx.clone(),
+        tracker_auth.clone(),
     );
     let mut updater_state_rx = state_rx.clone();
     let updater_ctx = egui_ctx.clone();

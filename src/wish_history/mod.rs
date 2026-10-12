@@ -36,6 +36,7 @@ pub(crate) use self::gacha_log::WishKey;
 pub(crate) use self::sync::{SyncStatus, WishSync};
 use self::tracker::TrackerCredential;
 use crate::app::SavedAppState;
+use crate::signin::{TrackerAuth, UploadCredential};
 
 /// A banner as the wish history API and the tracker number it (UIGF): 301
 /// is both character event banners (its records say 301 or 400).
@@ -53,26 +54,37 @@ pub(crate) fn banner_for_gacha_type(gacha_type: u32) -> Option<Banner> {
     }
 }
 
-/// The credential a sync uses, or `None` when it must not run.
+/// The API base and credential a sync uses, or `None` when it must not run.
 ///
-/// The same gate as automated snapshot uploads
-/// ([`crate::app::want_tracker_upload`]): a verified key and uploads on.
-// SIGN-IN: once "Sign in with the tracker" lands, return
-// `TrackerCredential::Bearer(<a fresh access token>)` here while signed in
-// (and gate on its own "uploads on" switch); the import key is only for
-// installs that are not signed in.
-fn credential_for(state: &SavedAppState) -> Option<(String, TrackerCredential)> {
-    crate::app::want_tracker_upload(state).then(|| {
-        (
+/// The same gate and the same choice as automated snapshot uploads: uploads
+/// on ([`crate::app::want_tracker_upload`]), then the sign-in while signed
+/// in, else a saved and verified import key
+/// ([`crate::app::upload_credential`]).
+fn credential_for(
+    state: &SavedAppState,
+    auth: &TrackerAuth,
+) -> Option<(String, TrackerCredential)> {
+    if !crate::app::want_tracker_upload(state) {
+        return None;
+    }
+    Some(match crate::app::upload_credential(state)? {
+        UploadCredential::SignedIn { base } => (
+            base.clone(),
+            TrackerCredential::SignedIn {
+                auth: auth.clone(),
+                base,
+            },
+        ),
+        UploadCredential::ImportKey { key, .. } => (
             state.tracker_api_url.clone(),
-            TrackerCredential::ImportKey(state.tracker_import_key.clone()),
-        )
+            TrackerCredential::ImportKey(key),
+        ),
     })
 }
 
 /// Whether a captured key would be synced to the tracker.
 pub(crate) fn sync_enabled(state: &SavedAppState) -> bool {
-    credential_for(state).is_some()
+    crate::app::want_tracker_upload(state)
 }
 
 /// What the monitor saw that concerns wish history.
@@ -227,6 +239,7 @@ pub(crate) fn channels(
     saved_state_rx: watch::Receiver<SavedAppState>,
     toast_tx: mpsc::UnboundedSender<(String, bool)>,
     ctx: egui::Context,
+    auth: TrackerAuth,
 ) -> WishChannels {
     let (key_tx, key_rx) = watch::channel(None);
     let key_tx = Arc::new(key_tx);
@@ -239,6 +252,7 @@ pub(crate) fn channels(
         saved_state_rx,
         toast_tx,
         ctx,
+        auth,
     );
     WishChannels {
         hub: WishHub { key_tx, trigger_tx },
@@ -375,18 +389,56 @@ mod tests {
     }
 
     #[test]
-    fn syncing_is_gated_like_automated_uploads() {
+    fn syncing_is_gated_and_authenticated_like_automated_uploads() {
+        use crate::app::TrackerSignIn;
+
+        let auth = TrackerAuth::new(
+            "https://tracker.invalid/api",
+            Arc::new(crate::signin::MemoryStore::default()),
+            "TEST-PC".to_owned(),
+            Arc::new(|_| {}),
+            Arc::new(|| {}),
+        );
         let mut state = SavedAppState {
             auto_export_to_tracker: true,
+            tracker_api_url: "https://tracker.invalid/api".to_owned(),
             tracker_import_key: "gdt_uk_test".to_owned(),
             tracker_verified: true,
+            tracker_sign_in: TrackerSignIn::SignedOut,
             ..Default::default()
         };
+        let credential = |state: &SavedAppState| {
+            credential_for(state, &auth).map(|(base, credential)| (base, format!("{credential:?}")))
+        };
+
+        // Not signed in: the verified import key.
         assert!(sync_enabled(&state));
+        assert_eq!(
+            credential(&state),
+            Some((
+                "https://tracker.invalid/api".to_owned(),
+                "ImportKey(<redacted>)".to_owned()
+            ))
+        );
+        state.tracker_verified = false;
+        assert_eq!(credential(&state), None);
+
+        // Signed in: the sign-in, whatever the key says.
+        state.tracker_sign_in = TrackerSignIn::SignedIn;
+        assert_eq!(
+            credential(&state),
+            Some((
+                "https://tracker.invalid/api".to_owned(),
+                "SignedIn(https://tracker.invalid/api)".to_owned()
+            ))
+        );
+
+        // Uploads off, or the sign-in not read yet: nothing syncs.
         state.auto_export_to_tracker = false;
         assert!(!sync_enabled(&state));
+        assert_eq!(credential(&state), None);
         state.auto_export_to_tracker = true;
-        state.tracker_verified = false;
-        assert!(!sync_enabled(&state));
+        state.tracker_sign_in = TrackerSignIn::Unknown;
+        assert_eq!(credential(&state), None);
     }
 }

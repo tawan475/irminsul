@@ -1517,6 +1517,32 @@ impl TrackerAuth {
         }
     }
 
+    /// Send another feature's request (the wish sync's routes) with this
+    /// session's bearer token, for the address the caller meant: the rules
+    /// of [`Self::upload`] -- refresh (under the session lock) and retry once
+    /// on a 401, sign out on `session_revoked`, refuse when the session
+    /// belongs to another address. `build` is called once per attempt with
+    /// the token to send.
+    pub(crate) async fn send_signed_in<F>(
+        &self,
+        client: &reqwest::Client,
+        expected_base: &str,
+        build: F,
+    ) -> Result<reqwest::Response, AuthError>
+    where
+        F: Fn(&str) -> reqwest::RequestBuilder,
+    {
+        let expected_base = normalize_base(expected_base);
+        self.authorized(client, |grant| {
+            if grant.base != expected_base {
+                return Err("The tracker address changed".to_string());
+            }
+            Ok(build(&grant.token))
+        })
+        .await
+        .map(|(response, _)| response)
+    }
+
     /// Upload a GOOD snapshot with this session (contract section 6). The
     /// error has the key path's `HTTP {status} - {body}` shape.
     pub async fn upload(

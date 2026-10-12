@@ -11,6 +11,7 @@ use super::run::{PAGES_PER_RUN, Partial, Run, RunError, RunReport};
 use super::tracker::Tracker;
 use super::{BANNERS, Banner, Trigger, credential_for};
 use crate::app::SavedAppState;
+use crate::signin::TrackerAuth;
 
 /// How long after a wish its banner is synced. The history shows a wish a
 /// little after it was made, and a run of single wishes then costs one sync.
@@ -168,6 +169,8 @@ pub(crate) struct WishSync {
     saved_state_rx: watch::Receiver<SavedAppState>,
     toast_tx: mpsc::UnboundedSender<(String, bool)>,
     ctx: egui::Context,
+    /// The tracker sign-in, for runs while signed in.
+    auth: TrackerAuth,
     log_http: reqwest::Client,
     tracker_http: reqwest::Client,
     schedule: Schedule,
@@ -182,6 +185,7 @@ impl WishSync {
         saved_state_rx: watch::Receiver<SavedAppState>,
         toast_tx: mpsc::UnboundedSender<(String, bool)>,
         ctx: egui::Context,
+        auth: TrackerAuth,
     ) -> Self {
         // `build` only fails if the TLS backend cannot initialise, which is
         // exactly when every other HTTP request irminsul makes fails too.
@@ -199,6 +203,7 @@ impl WishSync {
             saved_state_rx,
             toast_tx,
             ctx,
+            auth,
             log_http: client(LOG_REQUEST_TIMEOUT),
             tracker_http: client(TRACKER_REQUEST_TIMEOUT),
             schedule: Schedule::default(),
@@ -258,7 +263,7 @@ impl WishSync {
             return;
         };
         let state = self.saved_state_rx.borrow().clone();
-        let Some((base_url, credential)) = credential_for(&state) else {
+        let Some((base_url, credential)) = credential_for(&state, &self.auth) else {
             self.schedule.clear();
             return;
         };
@@ -389,6 +394,59 @@ mod tests {
         schedule.on_unfinished(now, &[301, 200]);
         assert_eq!(schedule.take_due(now + WISH_DELAY), vec![301]);
         assert_eq!(schedule.take_due(now + CONTINUE_DELAY), vec![200]);
+    }
+
+    #[test]
+    fn a_tracker_failure_keeps_the_key_and_an_expired_key_drops_it() {
+        use auto_artifactarium::GachaAuthKey;
+
+        use super::super::WishEvent;
+
+        let (_url_tx, url_rx) = watch::channel(None);
+        let (_state_tx, state_rx) = watch::channel(SavedAppState::default());
+        let (toast_tx, _toast_rx) = mpsc::unbounded_channel();
+        let auth = TrackerAuth::new(
+            "https://tracker.invalid/api",
+            Arc::new(crate::signin::MemoryStore::default()),
+            "TEST-PC".to_owned(),
+            Arc::new(|_| {}),
+            Arc::new(|| {}),
+        );
+        let channels =
+            super::super::channels(url_rx, state_rx, toast_tx, egui::Context::default(), auth);
+        channels.hub.forward(vec![WishEvent::Key(GachaAuthKey::new(
+            "GGGG",
+            "webview_gacha",
+            "hk4e_global",
+        ))]);
+        let now = Instant::now();
+        let key = channels.view.key(now).expect("the key was captured");
+        let mut sync = channels.sync;
+
+        for error in [
+            RunError::Tracker("tracker: signed out of the tracker; sign in again".to_owned()),
+            RunError::Tracker("tracker: uploads are blocked for this tracker account".to_owned()),
+            RunError::Api("the wish history API answered HTTP 502 Bad Gateway".to_owned()),
+        ] {
+            let report = RunReport {
+                error: Some(error.clone()),
+                ..RunReport::default()
+            };
+            sync.finish(&key, report, now);
+            assert!(
+                channels.view.key(now).is_some(),
+                "{error:?} dropped the key"
+            );
+            let line = channels.view.sync_line().unwrap();
+            assert!(line.contains(&error.to_string()), "{line}");
+        }
+
+        let report = RunReport {
+            error: Some(RunError::KeyExpired),
+            ..RunReport::default()
+        };
+        sync.finish(&key, report, now);
+        assert!(channels.view.key(now).is_none());
     }
 
     #[test]
