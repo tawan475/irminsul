@@ -1,12 +1,19 @@
 //! One sync run: page the wish history down to what the tracker already
 //! holds, then import what is new.
 //!
-//! The rule (the user's): ask the tracker for its newest record id per banner
-//! (the cursor), then for each banner read page 1; if its newest record is one
-//! the tracker has, that banner is done after one request. Otherwise keep the
-//! records newer than the cursor and read the next page (`end_id` = the last
+//! The rule (the user's): ask the tracker what it holds per banner (the
+//! cursor: its newest real record id, and the time of its newest wish), then
+//! for each banner read page 1; if its newest record is one the tracker has,
+//! that banner is done after one request. Otherwise keep the records the
+//! tracker does not have and read the next page (`end_id` = the last
 //! record's id) until a record the tracker has, an empty page, an expired
 //! key, or the per-run page cap.
+//!
+//! A record the tracker has: its id is at most the newest real id, or its
+//! time is before the newest wish's time ([`Known`]). The time is what stops
+//! a history the tracker got from a paimon.moe backup, which has no real ids;
+//! records of that very second are still sent (a ten-pull can straddle it,
+//! and the tracker dedupes them).
 //!
 //! ## No gaps
 //!
@@ -23,7 +30,7 @@ use std::collections::BTreeMap;
 
 use super::Banner;
 use super::gacha_log::{ApiRecord, FetchError, LogClient, Sleeper};
-use super::tracker::{Cursor, Imported, Tracker};
+use super::tracker::{Cursor, Imported, Known, Tracker};
 
 /// Pages read per banner per run, beyond which the run stops that banner and
 /// a later one carries on.
@@ -35,9 +42,8 @@ pub(crate) const PAGES_PER_RUN: u32 = 50;
 pub(crate) struct Partial {
     /// Whose history this is.
     uid: String,
-    /// The tracker's newest id when the pass began; records at or below it
-    /// are known.
-    floor: Option<u64>,
+    /// What the tracker had when the pass began.
+    floor: Known,
     /// The newest record read.
     top: u64,
     /// The last (oldest) record read: where the pass carries on.
@@ -93,13 +99,13 @@ pub(crate) struct RunReport {
 }
 
 /// Where a pass stops reading.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Floor {
-    /// The tracker's newest id for the banner (the cursor, read when first
+    /// What the tracker has of the banner (the cursor, read when first
     /// needed).
     Cursor,
-    /// A fixed id: a [`Partial`]'s.
-    Fixed(Option<u64>),
+    /// A fixed floor: a [`Partial`]'s.
+    Fixed(Known),
 }
 
 /// How a pass ended.
@@ -115,13 +121,14 @@ enum PassEnd {
 }
 
 /// A banner's complete records and what is left for later; or why the run
-/// ends, and what is left for later.
-type BannerResult = Result<(Vec<ApiRecord>, Option<Partial>), (RunError, Option<Partial>)>;
+/// ends, and what is left for later (boxed: a [`Partial`] is large, and errors
+/// are rare).
+type BannerResult = Result<(Vec<ApiRecord>, Option<Partial>), Box<(RunError, Option<Partial>)>>;
 
 struct Pass {
     records: BTreeMap<u64, ApiRecord>,
-    /// The floor it used, once known.
-    floor: Option<u64>,
+    /// The floor it used (empty if it never got to read the cursor).
+    floor: Known,
     end: PassEnd,
 }
 
@@ -178,7 +185,8 @@ impl<'a, S: Sleeper> Run<'a, S> {
                         staged.insert(banner, partial);
                     }
                 }
-                Err((error, partial)) => {
+                Err(failed) => {
+                    let (error, partial) = *failed;
                     if let Some(partial) = partial {
                         staged.insert(banner, partial);
                     }
@@ -217,13 +225,13 @@ impl<'a, S: Sleeper> Run<'a, S> {
     /// One banner: the records it completed, and what is left for later.
     async fn banner(&mut self, banner: Banner, partial: Option<Partial>) -> BannerResult {
         let head_floor = match &partial {
-            Some(partial) => Floor::Fixed(Some(partial.top)),
+            Some(partial) => Floor::Fixed(Known::by_id(Some(partial.top))),
             None => Floor::Cursor,
         };
         let head = self
             .pass(banner, 0, 1, head_floor)
             .await
-            .map_err(|error| (error, partial.clone()))?;
+            .map_err(|error| Box::new((error, partial.clone())))?;
 
         let Some(mut partial) = partial else {
             return self.fresh(head);
@@ -242,7 +250,7 @@ impl<'a, S: Sleeper> Run<'a, S> {
                 let head = self
                     .pass(banner, 0, 1, Floor::Cursor)
                     .await
-                    .map_err(|error| (error, None))?;
+                    .map_err(|error| Box::new((error, None)))?;
                 return self.fresh(head);
             }
             None => return Ok((Vec::new(), None)),
@@ -259,7 +267,7 @@ impl<'a, S: Sleeper> Run<'a, S> {
                 "new wishes did not yet join up with the unfinished sync"
             );
             return match error {
-                Some(error) => Err((error, Some(partial))),
+                Some(error) => Err(Box::new((error, Some(partial)))),
                 None => Ok((Vec::new(), Some(partial))),
             };
         }
@@ -275,12 +283,12 @@ impl<'a, S: Sleeper> Run<'a, S> {
                 banner,
                 partial.end_id,
                 partial.next_page,
-                Floor::Fixed(partial.floor),
+                Floor::Fixed(partial.floor.clone()),
             )
             .await
         {
             Ok(tail) => tail,
-            Err(error) => return Err((error, Some(partial))),
+            Err(error) => return Err(Box::new((error, Some(partial)))),
         };
         partial.records.extend(tail.records);
         match tail.end {
@@ -293,7 +301,7 @@ impl<'a, S: Sleeper> Run<'a, S> {
                 partial.end_id = end_id;
                 partial.next_page = next_page;
                 match error {
-                    Some(error) => Err((error, Some(partial))),
+                    Some(error) => Err(Box::new((error, Some(partial)))),
                     None => Ok((Vec::new(), Some(partial))),
                 }
             }
@@ -311,7 +319,7 @@ impl<'a, S: Sleeper> Run<'a, S> {
             } => {
                 let partial = self.partial_from(head.floor, head.records, end_id, next_page);
                 match error {
-                    Some(error) => Err((error, partial)),
+                    Some(error) => Err(Box::new((error, partial))),
                     None => Ok((Vec::new(), partial)),
                 }
             }
@@ -320,7 +328,7 @@ impl<'a, S: Sleeper> Run<'a, S> {
 
     fn partial_from(
         &self,
-        floor: Option<u64>,
+        floor: Known,
         records: BTreeMap<u64, ApiRecord>,
         end_id: u64,
         next_page: u32,
@@ -351,13 +359,13 @@ impl<'a, S: Sleeper> Run<'a, S> {
         let mut records = BTreeMap::new();
         let mut known_floor = match floor {
             Floor::Fixed(floor) => Some(floor),
-            Floor::Cursor => self.cursor.as_ref().map(|cursor| cursor.newest(banner)),
+            Floor::Cursor => self.cursor.as_ref().map(|cursor| cursor.known(banner)),
         };
         for read in 0.. {
             if read == self.page_cap {
                 return Ok(Pass {
                     records,
-                    floor: known_floor.flatten(),
+                    floor: known_floor.clone().unwrap_or_default(),
                     end: PassEnd::Cut {
                         end_id,
                         next_page: page,
@@ -372,7 +380,7 @@ impl<'a, S: Sleeper> Run<'a, S> {
                 Err(error) => {
                     return Ok(Pass {
                         records,
-                        floor: known_floor.flatten(),
+                        floor: known_floor.clone().unwrap_or_default(),
                         end: PassEnd::Cut {
                             end_id,
                             next_page: page,
@@ -388,14 +396,14 @@ impl<'a, S: Sleeper> Run<'a, S> {
                 self.region = answer.region.clone();
             }
             self.check_uid(&answer.records)?;
-            let floor = match known_floor {
-                Some(floor) => floor,
+            let floor = match &known_floor {
+                Some(floor) => floor.clone(),
                 None => {
                     let uid = self.uid.clone().expect("check_uid set it");
                     let cursor = self.tracker.cursor(&uid).await.map_err(RunError::Tracker)?;
-                    let floor = cursor.newest(banner);
+                    let floor = cursor.known(banner);
                     self.cursor = Some(cursor);
-                    known_floor = Some(floor);
+                    known_floor = Some(floor.clone());
                     floor
                 }
             };
@@ -405,7 +413,7 @@ impl<'a, S: Sleeper> Run<'a, S> {
             for record in answer.records {
                 let id = record_id(&record)?;
                 last = Some(id);
-                if floor.is_some_and(|floor| id <= floor) {
+                if floor.covers(id, &record.time) {
                     reached_known = true;
                 } else {
                     records.insert(id, record);
@@ -419,7 +427,7 @@ impl<'a, S: Sleeper> Run<'a, S> {
         }
         Ok(Pass {
             records,
-            floor: known_floor.flatten(),
+            floor: known_floor.unwrap_or_default(),
             end: PassEnd::Complete,
         })
     }

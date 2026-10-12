@@ -26,6 +26,17 @@ fn id_of(banner: Banner, index: u64) -> u64 {
     1_790_000_000_000_000_000 + u64::from(banner) * 100_000 - index
 }
 
+/// A record's time: newest first, ten records (a ten-pull) per second, a
+/// minute between ten-pulls. Index 0..9 is `2026-10-12 21:04:11`.
+fn time_of(index: u64) -> String {
+    let newest =
+        chrono::NaiveDateTime::parse_from_str("2026-10-12 21:04:11", "%Y-%m-%d %H:%M:%S").unwrap();
+    let minutes = i64::try_from(index / 10).unwrap();
+    (newest - chrono::Duration::minutes(minutes))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
+
 fn record(banner: Banner, index: u64, uid: &str) -> Value {
     let gacha_type = if banner == 301 && index % 2 == 1 {
         "400".to_owned()
@@ -34,7 +45,7 @@ fn record(banner: Banner, index: u64, uid: &str) -> Value {
     };
     json!({
         "uid": uid, "gacha_type": gacha_type, "item_id": "", "count": "1",
-        "time": "2026-10-12 21:04:11", "name": format!("Item {index}"), "lang": "en-us",
+        "time": time_of(index), "name": format!("Item {index}"), "lang": "en-us",
         "item_type": "Weapon", "rank_type": "3", "id": id_of(banner, index).to_string(),
     })
 }
@@ -44,6 +55,9 @@ struct World {
     history: BTreeMap<Banner, Vec<Value>>,
     /// The tracker's newest id per banner.
     newest: BTreeMap<Banner, u64>,
+    /// The tracker's newest wish time per banner (`newestTime`); none sent
+    /// while empty, like an older tracker.
+    newest_time: BTreeMap<Banner, String>,
     /// Answers to override, by the number of the log request (1-based).
     faults: BTreeMap<usize, Reply>,
     /// The tracker's answer to the cursor, if not the cursor.
@@ -74,6 +88,7 @@ impl World {
         Self {
             history,
             newest: BTreeMap::new(),
+            newest_time: BTreeMap::new(),
             faults: BTreeMap::new(),
             cursor_reply: None,
             import_status: 200,
@@ -174,10 +189,12 @@ impl World {
                 };
                 newest.insert(banner.to_string(), value);
             }
-            return Reply::json(
-                200,
-                json!({"uid": request.param("uid"), "accountId": 12, "newest": newest}).to_string(),
-            );
+            let mut answer =
+                json!({"uid": request.param("uid"), "accountId": 12, "newest": newest});
+            if !self.newest_time.is_empty() {
+                answer["newestTime"] = json!(self.newest_time);
+            }
+            return Reply::json(200, answer.to_string());
         }
         if request.path == "/api/wishes/import" {
             if self.import_status != 200 {
@@ -816,5 +833,101 @@ async fn the_trackers_refusals_end_the_run_in_words() {
             "{code}"
         );
         assert!(auth.status().borrow().is_signed_in(), "{code}");
+    }
+}
+
+/// The ids sent, newest first, as indexes of `banner`'s history.
+fn sent_indexes(fixture: &Fixture, banner: Banner) -> Vec<u64> {
+    let mut indexes: Vec<u64> = fixture
+        .imported_ids()
+        .into_iter()
+        .map(|id| u64::from(banner) * 100_000 + 1_790_000_000_000_000_000 - id)
+        .collect();
+    indexes.sort_unstable();
+    indexes
+}
+
+#[tokio::test]
+async fn a_history_the_tracker_got_from_a_backup_stops_at_its_newest_time() {
+    // The tracker's history came from a paimon.moe backup: no real ids, only
+    // the newest wish's time.
+    let mut world = World::new(&[(301, 100), (200, 15), (500, 8)]);
+    world.newest_time.insert(301, time_of(25));
+    world.newest_time.insert(200, time_of(0));
+    world
+        .newest_time
+        .insert(500, "2026-10-12 23:00:00".to_owned());
+    let mut fixture = Fixture::new(world);
+
+    let report = fixture.run(&[301, 200, 500]).await;
+
+    assert_eq!(report.error, None);
+    // 301: page 2 holds the first record older than the tracker's newest;
+    // 200 and 500: page 1 already does, or is all older.
+    assert_eq!(
+        fixture.log_requests(),
+        vec![
+            (301, 1, 0),
+            (301, 2, id_of(301, 19)),
+            (200, 1, 0),
+            (500, 1, 0)
+        ]
+    );
+    // 301: everything newer, plus the ten-pull of the tracker's newest
+    // second (20..29); 200: that second's ten-pull only; 500: nothing.
+    let ids = fixture.imported_ids();
+    let expected: Vec<u64> = (0..30)
+        .map(|index| id_of(301, index))
+        .chain((0..10).map(|index| id_of(200, index)))
+        .collect();
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    let mut expected_sorted = expected;
+    expected_sorted.sort_unstable();
+    assert_eq!(sorted, expected_sorted);
+    assert_eq!(report.sent, 40);
+}
+
+#[tokio::test]
+async fn ids_and_times_together_stop_at_whichever_comes_first() {
+    // The time comes first (index 30 is older than its second; id 50 later).
+    let mut world = World::new(&[(301, 100)]);
+    world.newest.insert(301, id_of(301, 50));
+    world.newest_time.insert(301, time_of(25));
+    let mut fixture = Fixture::new(world);
+    fixture.run(&[301]).await;
+    assert_eq!(fixture.log_requests().len(), 2);
+    assert_eq!(sent_indexes(&fixture, 301), (0..30).collect::<Vec<_>>());
+
+    // The id comes first.
+    let mut world = World::new(&[(301, 100)]);
+    world.newest.insert(301, id_of(301, 5));
+    world.newest_time.insert(301, time_of(60));
+    let mut fixture = Fixture::new(world);
+    fixture.run(&[301]).await;
+    assert_eq!(fixture.log_requests(), vec![(301, 1, 0)]);
+    assert_eq!(sent_indexes(&fixture, 301), (0..5).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn a_cursor_without_usable_times_stops_by_id_as_before() {
+    for newest_time in [
+        json!("2026-10-12 21:00:00"),
+        json!({"301": "yesterday", "200": 17}),
+        json!(null),
+    ] {
+        let mut world = World::new(&[(301, 45)]);
+        world.cursor_reply = Some(Reply::json(
+            200,
+            json!({"uid": UID, "accountId": 12,
+                   "newest": {"301": id_of(301, 42).to_string()},
+                   "newestTime": newest_time})
+            .to_string(),
+        ));
+        let mut fixture = Fixture::new(world);
+        let report = fixture.run(&[301]).await;
+        assert_eq!(report.error, None, "{newest_time}");
+        assert_eq!(report.sent, 42, "{newest_time}");
+        assert_eq!(fixture.log_requests().len(), 3, "{newest_time}");
     }
 }
