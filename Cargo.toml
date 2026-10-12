@@ -41,7 +41,10 @@ tokio = { version = "1.47.1", features = [
 # Shared with [build-dependencies]; see [workspace.dependencies] above.
 anime-game-data = { workspace = true }
 flate2 = { workspace = true }
-tokio = { workspace = true }
+# `net` and `io-util` for the sign-in's loopback listener (src/signin.rs).
+# Both were already compiled in through reqwest's hyper; named here so the
+# listener does not depend on another crate's feature choice.
+tokio = { workspace = true, features = ["net", "io-util", "time"] }
 
 anyhow = "1.0.99"
 async-trait = "0.1.89"
@@ -66,6 +69,12 @@ egui-notify = "0.20.0"
 egui_extras = { version = "0.32.2", features = ["image", "svg", "webp"] }
 egui_material_icons = "0.4.0"
 futures = "0.3.31"
+# The PC's name, shown to the user on the tracker's consent screen and in its
+# Devices list ("Irminsul on <PC>"). Already in the tree (x11rb, tray-icon).
+gethostname = "1.1.0"
+# Random bytes for the sign-in's PKCE verifier and `state` (src/signin.rs).
+# Already in the tree at this version (through rand and ring).
+getrandom = "0.3.4"
 futures-util = "0.3.31"
 indexmap = "2.11.1"
 log = "0.4.27"
@@ -95,6 +104,9 @@ reqwest = { version = "0.12.23", features = [
 self_update = { version = "0.42.0", features = ["compression-flate2"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.143", features = ["alloc"] }
+# SHA-256 for the sign-in's PKCE challenge (RFC 7636 S256). Already in the
+# tree at this version.
+sha2 = "0.10.9"
 # Only the `system` feature, and only for a process-name scan (see
 # `src/game_watch.rs`). This is not really a new dependency: `egui-file-dialog`
 # already pulls the same 0.36 line in with `default-features = false,
@@ -110,6 +122,25 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 tray-icon = { version = "0.24.1", default-features = false, features = [ "gtk" ] }
 image = "0.25.9"
 single-instance = "0.3.3"
+
+# The tracker sign-in's refresh token lives in the OS credential store, never
+# in app.ron (src/signin.rs `KeyringStore`): Windows Credential Manager, the
+# macOS Keychain, the Secret Service (GNOME Keyring, KWallet) on Linux. One
+# backend per platform, chosen per target below, so no platform compiles the
+# others'.
+[target.'cfg(windows)'.dependencies.keyring]
+version = "3.6.3"
+features = ["windows-native"]
+
+[target.'cfg(target_os = "macos")'.dependencies.keyring]
+version = "3.6.3"
+features = ["apple-native"]
+
+# `sync-secret-service` talks to the Secret Service over libdbus, which needs
+# `libdbus-1-dev` to build (CI installs it with the GTK packages).
+[target.'cfg(target_os = "linux")'.dependencies.keyring]
+version = "3.6.3"
+features = ["sync-secret-service", "crypto-rust"]
 
 [target.'cfg(windows)'.dependencies]
 pktmon = { version = "0.6.2", features = ["tokio"] }

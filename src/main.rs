@@ -28,6 +28,7 @@ mod pcapng;
 mod player_data;
 mod recording;
 mod replay;
+mod signin;
 mod update;
 mod wish;
 
@@ -80,7 +81,16 @@ pub enum Message {
         String,
         oneshot::Sender<Result<monitor::TrackerAccount>>,
     ),
-    UploadToTracker(String, String, String, oneshot::Sender<Result<(), String>>),
+    /// Upload a GOOD export, with an import key or the sign-in (see
+    /// `app::upload_credential`).
+    UploadToTracker(
+        String,
+        signin::UploadCredential,
+        oneshot::Sender<Result<(), String>>,
+    ),
+    /// Something for the tracker sign-in (`signin.rs`): sign in or out, a
+    /// whoami refresh, an address change. Answered through its status.
+    Tracker(signin::TrackerRequest),
     /// Terminate the running game, from the "game already running" modal.
     ///
     /// Handled in `monitor.rs` rather than in the UI because the process

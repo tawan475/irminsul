@@ -98,9 +98,41 @@ This fork can also push a capture straight to a Genshin Data Tracker account,
 from the "Tracker" section of the main window. By default it talks to the hosted
 tracker at <https://genshin-tracker.475.dev>:
 
-1. In the tracker dashboard, generate an **Import Key** for the Genshin account you want to fill.
-2. In Irminsul, click the gear icon in the "Tracker" section, paste the key, and click "Save & Close". Irminsul verifies the key and shows the account name, UID and server it belongs to.
-3. With a capture completed, click the cloud upload icon to send the current data. Tick "Auto export to tracker" in the same section to upload every completed capture automatically.
+1. Click **Sign in** in the "Tracker" section. Your browser opens the tracker:
+   sign in there if you aren't already, choose where this PC's uploads go, and
+   click **Allow**. The page then says you can close it, and Irminsul shows
+   "Signed in as <your name>" and where uploads go.
+2. With a capture completed, click the cloud upload icon to send the current
+   data. Tick "Auto export to tracker" in the same section to upload every
+   completed capture automatically.
+
+Where uploads go is set on the tracker, not in Irminsul: **Auto (by UID)**
+(the default) files each capture under the account with that capture's UID and
+creates one for a new UID; **Always this account** sends everything to one
+account. Click **Configure** next to "Uploads:" to change it in the browser;
+Irminsul picks the change up when you come back to its window (and every few
+minutes while it is open). This PC also appears in the tracker's **Settings →
+Devices** as "Irminsul on <PC name>", where you can change the target or sign
+it out.
+
+The sign-out icon next to your name signs this PC out: it ends the session on
+the tracker and deletes what Irminsul stored. Signing out everywhere on the
+tracker, changing your password there, or signing this device out from its
+Devices page signs Irminsul out too; it then says "Signed out, sign in again".
+
+What is stored where: the sign-in's long-lived (refresh) token is kept in your
+system's credential store -- Windows Credential Manager, the macOS Keychain, or
+the Secret Service (GNOME Keyring, KWallet) on Linux -- under the name
+`irminsul`, one entry per tracker address. It is never written to Irminsul's
+settings file. The short-lived token uploads are sent with lives only in
+memory. On a Linux desktop without a Secret Service, the sign-in lasts until
+Irminsul closes (it says "Signed in for this session only").
+
+If the browser that opens is not the one you use (Irminsul runs as
+administrator on Windows, and a browser started from it can open as a separate,
+signed-out window), finish the sign-in there, or click the copy icon next to
+"Waiting for the browser…" and paste the link into the browser you normally
+use. Cancel stops waiting.
 
 An upload holds everything the capture saw -- every character, every artifact
 and weapon of any rarity and level, all materials and achievements -- whatever
@@ -108,20 +140,32 @@ the Genshin Optimizer export settings leave out, and it never fakes an
 artifact's fourth line. The toast names the counts it sent (for example
 "1,122 weapons"), so you can hold them against the game's own.
 
-The same modal has a **Tracker API base URL** field, so a self-hosted tracker
-needs no rebuild -- point it at your backend's API base and click "Save &
-Close". The default is `https://genshin-tracker.475.dev/api`; note the `/api`,
-under which the tracker serves its API. The compile-time `TRACKER_API_URL`
-replaces that default for a build and only supplies the value a fresh install
-starts with; once you have edited or saved the field the stored URL wins,
-including after an update to a build with a different baked-in default. The
-exceptions are an empty field and the old default `http://localhost:49000`,
-which Irminsul resets to the build's default when it starts (to keep using a
-local backend on that port, enter it as `http://127.0.0.1:49000`). "Reset URL
-to default" puts the build's own value back.
+### Advanced: tracker address and import key
 
-The key is stored with the rest of Irminsul's saved state on your machine and
-is sent only to the tracker it belongs to.
+The gear icon opens the tracker window. Under **Advanced**:
+
+- **Tracker address**, so a self-hosted tracker needs no rebuild: enter your
+  tracker's API base and click **Apply**. Irminsul asks "Uploads will now go to
+  <host>. Continue?" first -- every upload carries the whole account, so a
+  pasted lookalike address must not slip through -- and signs out of the old
+  address: a sign-in belongs to one address and its tokens are never sent to
+  another. The default is `https://genshin-tracker.475.dev/api`; note the
+  `/api`, under which the tracker serves its API. The compile-time
+  `TRACKER_API_URL` replaces that default for a build and only supplies the
+  value a fresh install starts with; once you have changed the address the
+  stored one wins, including after an update to a build with a different
+  baked-in default. The exceptions are an empty address and the old default
+  `http://localhost:49000`, which Irminsul resets to the build's default when
+  it starts (to keep using a local backend on that port, enter it as
+  `http://127.0.0.1:49000`). The reset icon next to the field puts the build's
+  own value back in the field.
+- **Import key**, the older way to link an account, which keeps working for as
+  long as you are not signed in: generate an **Import Key** in the tracker
+  dashboard, paste it here and click "Save & Close"; Irminsul verifies it and
+  shows the account name, UID and server it belongs to. Once you sign in, the
+  key is no longer used. The key is stored in plain text with the rest of
+  Irminsul's saved state on your machine and never expires, which is why
+  signing in is the recommended way; "Clear key" removes it.
 
 ## Start Irminsul when you sign in (Windows)
 

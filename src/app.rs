@@ -22,6 +22,9 @@ use tokio_util::sync::CancellationToken;
 use crate::autostart::Startup;
 use crate::capture;
 use crate::monitor::TrackerAccount;
+use crate::signin::{
+    self, AuthStatus, TrackerAuth, TrackerRequest, UploadCredential, UploadScope, Whoami,
+};
 
 type AsyncRuntimeHandles = (
     mpsc::UnboundedSender<Message>,
@@ -71,6 +74,40 @@ const MONITOR_SHUTDOWN_TIMEOUT: Duration =
 /// back to reporting the time of the last capture.
 const CAPTURE_SUCCESS_DISPLAY: Duration = Duration::from_secs(5);
 
+/// How often whoami is re-read while signed in, so an upload target changed
+/// on the tracker's website shows up without a restart.
+const WHOAMI_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Coming back to the window re-reads whoami (the user may have just changed
+/// the target in the browser), but not more often than this.
+const WHOAMI_FOCUS_MIN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Whether the tracker sign-in (`signin.rs`) is signed in, as the upload
+/// gates see it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TrackerSignIn {
+    /// The stored sign-in has not been read yet (start-up, or just after an
+    /// address change). Nothing uploads: the import key must not stand in
+    /// for a sign-in that is about to load.
+    #[default]
+    Unknown,
+    /// Not signed in (or a sign-in is waiting on the browser): the import
+    /// key, when one is saved and verified, is what uploads.
+    SignedOut,
+    /// Signed in: uploads use the sign-in and the key is not used.
+    SignedIn,
+}
+
+impl TrackerSignIn {
+    fn from_status(status: &AuthStatus) -> Self {
+        match status {
+            AuthStatus::Loading => Self::Unknown,
+            AuthStatus::SignedOut { .. } | AuthStatus::Waiting { .. } => Self::SignedOut,
+            AuthStatus::SignedIn { .. } => Self::SignedIn,
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct SavedAppState {
     pub export_settings: ExportSettings,
@@ -112,6 +149,12 @@ pub struct SavedAppState {
     /// thing the manual button does.
     #[serde(skip)]
     pub tracker_verified: bool,
+    /// Whether the tracker sign-in is signed in, mirrored from its status by
+    /// the UI every frame. Never persisted (the sign-in itself lives in the
+    /// OS credential store); here because, like `tracker_verified`, this
+    /// struct is what `monitor.rs`'s automation reads.
+    #[serde(skip)]
+    pub tracker_sign_in: TrackerSignIn,
     #[serde(default)]
     pub minimize_to_tray: Option<bool>,
 }
@@ -197,6 +240,7 @@ impl Default for SavedAppState {
             tracker_api_url: default_tracker_url(),
             auto_export_to_tracker: false,
             tracker_verified: false,
+            tracker_sign_in: TrackerSignIn::Unknown,
             minimize_to_tray: None,
         }
     }
@@ -278,8 +322,81 @@ fn tracker_error_status(error: &str) -> Option<u16> {
 /// tracker" checkbox, so on the default settings -- key verified, auto export
 /// off -- clicking the *enabled* button ran a full export and then toasted
 /// "Tracker key not verified. Open settings to re-link."
+///
+/// Signed in, the sign-in uploads; signed out, a saved and verified import
+/// key does, exactly as before sign-in existed; while the sign-in is still
+/// being read, nothing does.
 pub(crate) fn can_upload_to_tracker(state: &SavedAppState) -> bool {
-    !state.tracker_import_key.is_empty() && state.tracker_verified
+    upload_credential(state).is_some()
+}
+
+/// How the next upload authenticates, if it can at all. The one place both
+/// upload paths (the button and the automation) choose between the sign-in
+/// and the import key.
+pub(crate) fn upload_credential(state: &SavedAppState) -> Option<UploadCredential> {
+    match state.tracker_sign_in {
+        TrackerSignIn::SignedIn => Some(UploadCredential::SignedIn {
+            base: state.tracker_api_url.clone(),
+        }),
+        TrackerSignIn::SignedOut
+            if !state.tracker_import_key.is_empty() && state.tracker_verified =>
+        {
+            Some(UploadCredential::ImportKey {
+                url: crate::monitor::import_url(&state.tracker_api_url),
+                key: state.tracker_import_key.clone(),
+            })
+        }
+        TrackerSignIn::SignedOut | TrackerSignIn::Unknown => None,
+    }
+}
+
+/// What applying an edited tracker address would do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AddressChange {
+    /// The same address (ignoring surrounding space and a trailing slash).
+    Same,
+    /// Not an http(s) URL.
+    Invalid,
+    /// A new address, normalized, and its host for the confirmation.
+    To { base: String, host: String },
+}
+
+fn address_change(current: &str, edited: &str) -> AddressChange {
+    let base = signin::normalize_base(edited);
+    if base == signin::normalize_base(current) {
+        return AddressChange::Same;
+    }
+    match signin::host_of(&base) {
+        Some(host) => AddressChange::To { base, host },
+        None => AddressChange::Invalid,
+    }
+}
+
+/// Whether whoami should be read again: never read yet, the window just
+/// got the focus back (and the last read is not brand new), or it is due.
+fn whoami_refresh_due(regained_focus: bool, since_last: Option<Duration>) -> bool {
+    match since_last {
+        None => true,
+        Some(since) => {
+            since >= WHOAMI_REFRESH_INTERVAL
+                || (regained_focus && since >= WHOAMI_FOCUS_MIN_INTERVAL)
+        }
+    }
+}
+
+/// A whoami answer as the account the UID check compares against: only in
+/// account mode, where every upload goes to that one account.
+fn whoami_account(whoami: &Whoami) -> Option<TrackerAccount> {
+    // No account id: the chosen account was deleted, nothing to compare.
+    (whoami.scope == UploadScope::Account && whoami.account_id.is_some()).then(|| TrackerAccount {
+        name: whoami
+            .account_name
+            .clone()
+            .unwrap_or_else(|| "the account".to_string()),
+        uid: whoami.uid.clone().unwrap_or_else(|| "N/A".to_string()),
+        server: whoami.server.clone().unwrap_or_else(|| "N/A".to_string()),
+        dashboard_url: whoami.dashboard_url.clone(),
+    })
 }
 
 /// Whether the automation path should upload after an export.
@@ -362,7 +479,7 @@ fn missing_export_data_toast(missing: &[&'static str]) -> String {
     )
 }
 
-/// The captured UID, when the tracker key verified to an account with another.
+/// The captured UID, when uploads go to one account and it has another.
 ///
 /// `None` whenever either side is unknown: the old backend may answer with no
 /// UID ("N/A"), an account need not have one set, and no UID is claimed for a
@@ -376,9 +493,8 @@ fn uid_mismatch(account: &TrackerAccount, captured: Option<u32>) -> Option<u32> 
 /// What the UID warning says, in its toast and its tooltip.
 fn uid_mismatch_message(account: &TrackerAccount, captured: u32) -> String {
     format!(
-        "This capture is UID {captured}, but the tracker key belongs to {} (UID {}). Uploads \
-         still go to that account: log in with it, or link the key of the account you are \
-         playing.",
+        "This capture is UID {captured}, but uploads go to {} (UID {}). Uploads still go to \
+         that account: log in with it, or change where uploads go.",
         account.name,
         account.uid.trim()
     )
@@ -479,6 +595,24 @@ pub struct IrminsulApp {
     tracker_account: Option<TrackerAccount>,
     tracker_verify_rx: Option<oneshot::Receiver<Result<TrackerAccount>>>,
     tracker_upload_rx: Option<oneshot::Receiver<Result<(), String>>>,
+    /// The tracker sign-in's status (`signin.rs`), published by the monitor
+    /// side.
+    auth_status_rx: watch::Receiver<AuthStatus>,
+    /// Sign-in pages to open in the browser, from the monitor side; opened
+    /// here so they take the same `open_url` path as every other link.
+    browser_rx: mpsc::UnboundedReceiver<String>,
+    /// When whoami was last asked for.
+    whoami_checked_at: Option<Instant>,
+    /// Whether the window had the focus last frame (for the whoami re-read
+    /// on return).
+    window_focused: bool,
+    /// The sign-in notice last toasted, so it is said once.
+    auth_notice_toasted: Option<String>,
+    /// The tracker address being edited under "Advanced"; applied only once
+    /// confirmed.
+    tracker_url_edit: String,
+    /// An edited address waiting on "Uploads will now go to <host>".
+    pending_address: Option<String>,
     /// The `(linked account UID, captured UID)` pair the mismatch toast was
     /// last raised for, so it appears once per occurrence rather than per
     /// frame. See `note_uid_mismatch`.
@@ -721,6 +855,7 @@ fn quit_from_tray(ctx: &Context) {
     ctx.request_repaint();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_async_runtime(
     cancel_token: CancellationToken,
     egui_ctx: Context,
@@ -729,6 +864,7 @@ fn start_async_runtime(
     capture_backend: capture::BackendType,
     capture_source: capture::CaptureSource,
     install_lock: Arc<InstallLock>,
+    tracker_auth: TrackerAuth,
 ) -> AsyncRuntimeHandles {
     tracing::info!("starting tokio async");
     let (ui_message_tx, ui_message_rx) = mpsc::unbounded_channel::<Message>();
@@ -798,6 +934,7 @@ fn start_async_runtime(
                 capture_source,
                 saved_state_rx,
                 toast_tx,
+                tracker_auth,
                 monitor_ctx,
             )
             .await
@@ -849,6 +986,24 @@ impl IrminsulApp {
         let (log_packets_tx, log_packets_rx) = watch::channel(saved_state.log_raw_packets);
         let (saved_state_tx, saved_state_rx) = watch::channel(saved_state.clone());
 
+        // The tracker sign-in. Its refresh token lives in the OS credential
+        // store; reading it is the first thing the monitor does with it
+        // (`TrackerRequest::Load` below), off this thread.
+        let (browser_tx, browser_rx) = mpsc::unbounded_channel::<String>();
+        let opener_ctx = cc.egui_ctx.clone();
+        let notify_ctx = cc.egui_ctx.clone();
+        let tracker_auth = TrackerAuth::new(
+            &saved_state.tracker_api_url,
+            Arc::new(signin::KeyringStore),
+            signin::device_name(),
+            Arc::new(move |url| {
+                let _ = browser_tx.send(url);
+                opener_ctx.request_repaint();
+            }),
+            Arc::new(move || notify_ctx.request_repaint()),
+        );
+        let auth_status_rx = tracker_auth.status();
+
         let (ui_message_tx, update_answer_tx, state_rx, wish_url_rx, toast_rx, monitor_handle) =
             start_async_runtime(
                 cancel_token.clone(),
@@ -858,11 +1013,13 @@ impl IrminsulApp {
                 capture_backend,
                 capture_source,
                 Arc::clone(&install_lock),
+                tracker_auth,
             );
 
         if let Err(e) = ui_message_tx.send(Message::StartCapture) {
             tracing::error!("Failed to send auto start message: {e}");
         }
+        let _ = ui_message_tx.send(Message::Tracker(TrackerRequest::Load));
 
         let toasts = Toasts::default().with_anchor(egui_notify::Anchor::BottomLeft);
 
@@ -992,6 +1149,7 @@ impl IrminsulApp {
             });
         }
 
+        let tracker_url_edit = saved_state.tracker_api_url.clone();
         Self {
             saved_state,
             ui_message_tx,
@@ -1028,6 +1186,13 @@ impl IrminsulApp {
             tracker_account: None,
             tracker_verify_rx,
             tracker_upload_rx: None,
+            auth_status_rx,
+            browser_rx,
+            whoami_checked_at: None,
+            window_focused: true,
+            auth_notice_toasted: None,
+            tracker_url_edit,
+            pending_address: None,
             uid_mismatch_warned: None,
             uid_match_logged: None,
             tray_icon,
@@ -1379,6 +1544,7 @@ impl IrminsulApp {
         #[cfg(any(windows, target_os = "linux"))]
         self.wish_handle_find_url(ctx).toast_error(self);
         self.achievements_handle_export(ctx).toast_error(self);
+        self.poll_tracker_sign_in(ctx);
         self.poll_tracker_upload();
         self.poll_tracker_verify();
         self.startup.poll(
@@ -1403,7 +1569,11 @@ impl IrminsulApp {
                     .success("Successfully synced capture to Tracker!");
             }
             Err(e) => {
-                if matches!(tracker_error_status(&e), Some(401 | 403)) {
+                // A refused key is re-verified; a refused sign-in is the
+                // sign-in's own business (it refreshes, or signs out).
+                if self.saved_state.tracker_sign_in != TrackerSignIn::SignedIn
+                    && matches!(tracker_error_status(&e), Some(401 | 403))
+                {
                     self.saved_state.tracker_verified = false;
                     self.tracker_account = None;
                     self.request_tracker_verify();
@@ -2117,16 +2287,17 @@ impl IrminsulApp {
         }
     }
 
-    /// Warn, once per occurrence, that the captured account is not the one the
-    /// tracker key belongs to.
+    /// Warn, once per occurrence, that the captured account is not the one
+    /// uploads go to.
     ///
-    /// Only a warning: an upload still goes to the key's account, as it always
+    /// Only a warning: an upload still goes to that account, as it always
     /// has, and the UID scheme this relies on is not yet proven on every
     /// capture. Raised as soon as both UIDs are known, which is ahead of the
     /// automation export's debounce; the tracker section keeps saying it for as
     /// long as it is true.
     fn note_uid_mismatch(&mut self, captured_uid: Option<u32>) {
-        let mismatch = self.tracker_account.as_ref().and_then(|account| {
+        let linked = self.upload_account();
+        let mismatch = linked.as_ref().and_then(|account| {
             uid_mismatch(account, captured_uid).map(|captured| (account.clone(), captured))
         });
         let Some((account, captured)) = mismatch else {
@@ -2134,13 +2305,13 @@ impl IrminsulApp {
             self.uid_mismatch_warned = None;
             // Say so when the two agree too: the UID is derived from guids by
             // a scheme that is still being verified, and a match is the proof.
-            if let (Some(account), Some(captured)) = (&self.tracker_account, captured_uid) {
+            if let (Some(account), Some(captured)) = (&linked, captured_uid) {
                 let pair = (account.uid.trim().to_string(), captured);
                 if self.uid_match_logged.as_ref() != Some(&pair) {
                     tracing::info!(
                         captured,
                         linked = %pair.0,
-                        "the captured UID matches the tracker key's account"
+                        "the captured UID matches the account uploads go to"
                     );
                     self.uid_match_logged = Some(pair);
                 }
@@ -2155,7 +2326,7 @@ impl IrminsulApp {
         tracing::warn!(
             captured,
             linked = %account.uid,
-            "the captured account is not the one the tracker key belongs to"
+            "the captured account is not the one uploads go to"
         );
         self.toasts
             .warning(uid_mismatch_message(&account, captured))
@@ -2186,67 +2357,331 @@ impl IrminsulApp {
         self.saved_state.tracker_verified = false;
     }
 
+    fn send_tracker(&self, request: TrackerRequest) {
+        let _ = self.ui_message_tx.send(Message::Tracker(request));
+    }
+
+    /// Follow the sign-in: open the browser when it asks, mirror whether it
+    /// is signed in into the saved state (which the upload gates read), and
+    /// re-read whoami when the user comes back to the window and every few
+    /// minutes, so a target changed on the tracker's website shows up.
+    fn poll_tracker_sign_in(&mut self, ctx: &Context) {
+        // The same path every other link takes (`open_url`), from the UI
+        // thread. See `TrackerAuth::sign_in` on elevated browsers.
+        while let Ok(url) = self.browser_rx.try_recv() {
+            ctx.open_url(OpenUrl::new_tab(url));
+        }
+
+        let status = self.auth_status_rx.borrow().clone();
+        let sign_in = TrackerSignIn::from_status(&status);
+        if sign_in == TrackerSignIn::SignedIn && self.saved_state.tracker_sign_in != sign_in {
+            // Signing in (or loading a saved sign-in) reads whoami itself.
+            self.whoami_checked_at = Some(Instant::now());
+        }
+        self.saved_state.tracker_sign_in = sign_in;
+
+        if let AuthStatus::SignedOut {
+            notice: Some(notice),
+        } = &status
+        {
+            if self.auth_notice_toasted.as_ref() != Some(notice) {
+                self.toasts.error(notice.clone());
+                self.auth_notice_toasted = Some(notice.clone());
+            }
+        } else {
+            self.auth_notice_toasted = None;
+        }
+
+        let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        let regained_focus = focused && !self.window_focused;
+        self.window_focused = focused;
+        if sign_in != TrackerSignIn::SignedIn {
+            return;
+        }
+        let since = self.whoami_checked_at.map(|at| at.elapsed());
+        if whoami_refresh_due(regained_focus, since) {
+            self.whoami_checked_at = Some(Instant::now());
+            self.send_tracker(TrackerRequest::Refresh);
+            ctx.request_repaint_after(WHOAMI_REFRESH_INTERVAL);
+        } else if let Some(since) = since {
+            ctx.request_repaint_after(WHOAMI_REFRESH_INTERVAL.saturating_sub(since));
+        }
+    }
+
+    /// The account uploads go to, when that is one known account: the
+    /// sign-in's target in account mode, or the verified import key's while
+    /// signed out. `None` in UID mode -- the tracker files each capture under
+    /// its own UID, so there is nothing to mismatch -- and when nothing is
+    /// linked.
+    fn upload_account(&self) -> Option<TrackerAccount> {
+        match self.saved_state.tracker_sign_in {
+            TrackerSignIn::SignedIn => match &*self.auth_status_rx.borrow() {
+                AuthStatus::SignedIn {
+                    whoami: Some(whoami),
+                    ..
+                } => whoami_account(whoami),
+                _ => None,
+            },
+            TrackerSignIn::SignedOut => self.tracker_account.clone(),
+            TrackerSignIn::Unknown => None,
+        }
+    }
+
+    /// The "Sign in" button, with the reason the last sign-in ended or
+    /// failed behind a warning icon.
+    fn sign_in_button(&mut self, ui: &mut egui::Ui, notice: Option<&String>) {
+        let host = signin::host_of(&self.saved_state.tracker_api_url)
+            .unwrap_or_else(|| "the tracker".to_string());
+        if ui
+            .button(format!(
+                "{} Sign in",
+                egui_material_icons::icons::ICON_LOGIN
+            ))
+            .on_hover_text(format!("Sign in to {host} in your browser"))
+            .clicked()
+        {
+            self.send_tracker(TrackerRequest::SignIn);
+        }
+        if let Some(notice) = notice {
+            ui.label(RichText::new(egui_material_icons::icons::ICON_WARNING).color(Color32::RED))
+                .on_hover_text(notice);
+        }
+    }
+
+    /// The sign-in's state while it is not plain "signed out": waiting on
+    /// the browser, or who is signed in and where uploads go. Shared by the
+    /// panel and the settings window.
+    fn sign_in_status_ui(&mut self, ui: &mut egui::Ui, status: &AuthStatus) {
+        match status {
+            AuthStatus::Loading => {
+                ui.label(RichText::new("…").color(Color32::GRAY));
+            }
+            AuthStatus::SignedOut { notice } => {
+                ui.horizontal(|ui| self.sign_in_button(ui, notice.as_ref()));
+            }
+            AuthStatus::Waiting { link } => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Waiting for the browser…").color(Color32::YELLOW))
+                        .on_hover_text("Finish signing in on the page that opened.");
+                    if let Some(link) = link
+                        && ui
+                            .small_button(egui_material_icons::icons::ICON_CONTENT_COPY)
+                            .on_hover_text(
+                                "Copy the sign-in link, to open it in the browser you use",
+                            )
+                            .clicked()
+                    {
+                        ui.ctx().copy_text(link.clone());
+                        self.toasts.info("Sign-in link copied");
+                    }
+                    if ui.small_button("Cancel").clicked() {
+                        self.send_tracker(TrackerRequest::CancelSignIn);
+                    }
+                });
+            }
+            AuthStatus::SignedIn { whoami, error } => {
+                let host = signin::host_of(&self.saved_state.tracker_api_url).unwrap_or_default();
+                ui.horizontal(|ui| {
+                    let user = whoami.as_ref().map_or("…", |w| w.user.as_str());
+                    ui.label(
+                        RichText::new(format!("Signed in as {user}"))
+                            .color(Color32::from_hex("#00ab3f").unwrap()),
+                    )
+                    .on_hover_text(format!("Uploads go to {host}"));
+                    if let Some(error) = error {
+                        ui.label(
+                            RichText::new(egui_material_icons::icons::ICON_WARNING)
+                                .color(Color32::RED),
+                        )
+                        .on_hover_text(error);
+                    }
+                    if ui
+                        .small_button(egui_material_icons::icons::ICON_LOGOUT)
+                        .on_hover_text("Sign out")
+                        .clicked()
+                    {
+                        self.send_tracker(TrackerRequest::SignOut);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let target = whoami
+                        .as_ref()
+                        .map_or_else(|| "…".to_string(), Whoami::target_label);
+                    // Account mode whose account was deleted: nothing uploads
+                    // (409 `upload_target_missing`) until one is chosen.
+                    let unset = whoami
+                        .as_ref()
+                        .is_some_and(|w| w.scope == UploadScope::Account && w.account_id.is_none());
+                    let (colour, hover) = if unset {
+                        (
+                            Color32::RED,
+                            "The account uploads went to is gone. Choose another.",
+                        )
+                    } else {
+                        (
+                            Color32::GRAY,
+                            "Where this PC's uploads go. Change it on the tracker.",
+                        )
+                    };
+                    ui.label(RichText::new(format!("Uploads: {target}")).color(colour))
+                        .on_hover_text(hover);
+                    if let Some(url) = whoami.as_ref().and_then(|w| w.config_url.as_ref())
+                        && ui
+                            .small_button("Configure")
+                            .on_hover_text("Choose where uploads go, on the tracker")
+                            .clicked()
+                    {
+                        ui.ctx().open_url(OpenUrl::new_tab(url));
+                    }
+                });
+            }
+        }
+    }
+
+    /// The import key's account lines, for while signed out.
+    fn import_key_status_ui(&self, ui: &mut egui::Ui, captured_uid: Option<u32>) {
+        if self.saved_state.tracker_import_key.is_empty() {
+            return;
+        }
+        if let Some(account) = &self.tracker_account {
+            ui.label(
+                RichText::new(format!("Account: {}", account.name))
+                    .color(Color32::from_hex("#00ab3f").unwrap()),
+            )
+            .on_hover_text("Linked with an import key");
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("UID: {}", account.uid)).color(Color32::GRAY));
+                ui.label(RichText::new("•").color(Color32::DARK_GRAY));
+                ui.label(RichText::new(format!("Server: {}", account.server)).color(Color32::GRAY));
+            });
+            // Shown for as long as it is true; the toast in
+            // `note_uid_mismatch` only announces it.
+            if let Some(captured) = uid_mismatch(account, captured_uid) {
+                ui.label(
+                    RichText::new(format!(
+                        "{} Captured UID {captured} is not this account's",
+                        egui_material_icons::icons::ICON_WARNING
+                    ))
+                    .color(Color32::RED),
+                )
+                .on_hover_text(uid_mismatch_message(account, captured));
+            }
+        } else if self.tracker_verify_rx.is_some() {
+            ui.label(RichText::new("Verifying key...").color(Color32::YELLOW));
+        } else {
+            ui.label(RichText::new("Import key not verified").color(Color32::RED))
+                .on_hover_text("The tracker did not accept the import key, or was unreachable");
+        }
+    }
+
+    /// The tracker window's "Advanced" part: the tracker address and the
+    /// import key, the older way to link an account.
+    fn tracker_advanced_ui(&mut self, ui: &mut egui::Ui) {
+        // The URL used to be compile-time only (`#[serde(skip)]`, no
+        // widget), so anyone self-hosting on another host or port had to
+        // rebuild Irminsul to point it at their backend. It is now edited
+        // here and only takes effect once confirmed (`pending_address`).
+        ui.label("Tracker address").on_hover_text(
+            "The tracker's API address. A sign-in belongs to one address: changing it signs out.",
+        );
+        let change = address_change(&self.saved_state.tracker_api_url, &self.tracker_url_edit);
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.tracker_url_edit)
+                    .hint_text(default_tracker_url())
+                    .desired_width(230.0),
+            );
+            if ui
+                .add_enabled(
+                    matches!(change, AddressChange::To { .. }),
+                    Button::new("Apply"),
+                )
+                .clicked()
+                && let AddressChange::To { base, .. } = &change
+            {
+                self.pending_address = Some(base.clone());
+            }
+            if ui
+                .small_button(egui_material_icons::icons::ICON_RESTART_ALT)
+                .on_hover_text("Default address")
+                .clicked()
+            {
+                self.tracker_url_edit = default_tracker_url();
+            }
+        });
+        if change == AddressChange::Invalid {
+            ui.label(
+                RichText::new("Not an http(s) address")
+                    .color(Color32::RED)
+                    .small(),
+            );
+        }
+
+        ui.add_space(6.0);
+        ui.label("Import key").on_hover_text(
+            "Only used while signed out. Generate one on the tracker's dashboard and paste it here.",
+        );
+        ui.add(egui::TextEdit::singleline(&mut self.saved_state.tracker_import_key).password(true));
+        ui.label(
+            RichText::new(
+                "Stored in plain text in Irminsul's app data and never expires. Signing in is \
+                 safer.",
+            )
+            .color(Color32::GRAY)
+            .small(),
+        );
+        ui.horizontal(|ui| {
+            if ui
+                .button("Clear key")
+                .on_hover_text("Remove the stored key from this machine.")
+                .clicked()
+            {
+                self.saved_state.tracker_import_key.clear();
+                self.tracker_account = None;
+                self.saved_state.tracker_verified = false;
+                self.tracker_verify_rx = None;
+            }
+            if self.tracker_verify_rx.is_some() {
+                ui.label(RichText::new("Verifying key…").color(Color32::YELLOW));
+            } else if self.saved_state.tracker_verified {
+                if let Some(account) = &self.tracker_account {
+                    ui.label(
+                        RichText::new(format!("Valid: {} (UID {})", account.name, account.uid))
+                            .color(Color32::from_hex("#00ab3f").unwrap()),
+                    )
+                    .on_hover_text(format!("Server: {}", account.server));
+                }
+            } else if !self.saved_state.tracker_import_key.is_empty() {
+                ui.label(RichText::new("Key invalid or unreachable").color(Color32::RED));
+            }
+        });
+    }
+
+    /// Point uploads at another tracker, once the user confirmed it.
+    fn apply_tracker_address(&mut self, base: String) {
+        tracing::info!("Tracker API URL changed to {base}");
+        self.saved_state.tracker_api_url = base.clone();
+        self.tracker_url_edit = base.clone();
+        // Nothing uploads until the sign-in for the new address is read.
+        self.saved_state.tracker_sign_in = TrackerSignIn::Unknown;
+        self.send_tracker(TrackerRequest::SetAddress(base));
+        self.request_tracker_verify();
+    }
+
     fn tracker_ui(&mut self, ui: &mut egui::Ui, app_state: &AppState) {
+        let status = self.auth_status_rx.borrow().clone();
+
         if self.tracker_key_modal_open {
             let modal = Modal::new(Id::new("Tracker Key Modal")).show(ui.ctx(), |ui| {
                 ui.set_width(360.0);
-                ui.heading("Set Tracker Import Key");
+                ui.heading("Tracker");
                 ui.separator();
-
-                // The URL used to be compile-time only (`#[serde(skip)]`, no
-                // widget), so anyone self-hosting on another host or port had
-                // to rebuild Irminsul to point it at their backend.
-                ui.label("Tracker API base URL:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.saved_state.tracker_api_url)
-                        .hint_text(default_tracker_url()),
-                );
-                if ui.button("Reset URL to default").clicked() {
-                    self.saved_state.tracker_api_url = default_tracker_url();
-                }
-
+                self.sign_in_status_ui(ui, &status);
                 ui.add_space(6.0);
-                ui.label("Enter your Import Key generated from the GDT dashboard:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.saved_state.tracker_import_key)
-                        .password(true),
-                );
-                ui.label(
-                    RichText::new(
-                        "The key is stored in plain text in Irminsul's app data directory and \
-                         does not expire. Anyone who copies that folder can write snapshots to \
-                         this account until you regenerate the key on the dashboard.",
-                    )
-                    .color(Color32::GRAY)
-                    .small(),
-                );
-                if ui
-                    .button("Clear key")
-                    .on_hover_text("Remove the stored key from this machine.")
-                    .clicked()
-                {
-                    self.saved_state.tracker_import_key.clear();
-                    self.tracker_account = None;
-                    self.saved_state.tracker_verified = false;
-                    self.tracker_verify_rx = None;
-                }
-
-                if self.tracker_verify_rx.is_some() {
-                    ui.label(RichText::new("Verifying key…").color(Color32::YELLOW));
-                } else if self.saved_state.tracker_verified {
-                    if let Some(account) = &self.tracker_account {
-                        ui.label(
-                            RichText::new(format!("Valid: {} (UID {})", account.name, account.uid))
-                                .color(Color32::from_hex("#00ab3f").unwrap()),
-                        );
-                        ui.label(
-                            RichText::new(format!("Server: {}", account.server))
-                                .color(Color32::GRAY),
-                        );
-                    }
-                } else if !self.saved_state.tracker_import_key.is_empty() {
-                    ui.label(RichText::new("Key invalid or unreachable").color(Color32::RED));
-                }
+                egui::CollapsingHeader::new("Advanced")
+                    .id_salt("tracker_advanced")
+                    .show(ui, |ui| self.tracker_advanced_ui(ui));
                 ui.separator();
                 if ui.button("Save & Close").clicked() {
                     self.tracker_key_modal_open = false;
@@ -2258,95 +2693,138 @@ impl IrminsulApp {
             }
         }
 
+        // "Uploads will now go to <host>": every upload carries the whole
+        // account, so a pasted lookalike address must not slip through.
+        if let Some(base) = self.pending_address.clone() {
+            let host = signin::host_of(&base).unwrap_or_else(|| base.clone());
+            let mut answer = None;
+            let modal = Modal::new(Id::new("Tracker Address Modal")).show(ui.ctx(), |ui| {
+                ui.set_width(320.0);
+                ui.label(format!("Uploads will now go to {host}. Continue?"));
+                if self.saved_state.tracker_sign_in == TrackerSignIn::SignedIn {
+                    ui.label(
+                        RichText::new("You will be signed out of the current tracker.")
+                            .color(Color32::GRAY)
+                            .small(),
+                    );
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Continue").clicked() {
+                        answer = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        answer = Some(false);
+                    }
+                });
+            });
+            if modal.should_close() && answer.is_none() {
+                answer = Some(false);
+            }
+            match answer {
+                Some(true) => {
+                    self.pending_address = None;
+                    self.apply_tracker_address(base);
+                }
+                Some(false) => self.pending_address = None,
+                None => {}
+            }
+        }
+
         let captured_uid = app_state.player.as_ref().and_then(|player| player.uid);
         self.note_uid_mismatch(captured_uid);
 
-        // Only while the key is verified: `tracker_account` is set by a
-        // successful verify and cleared whenever one starts or fails.
-        let dashboard_url = self
-            .tracker_account
-            .as_ref()
-            .and_then(|account| account.dashboard_url.clone());
+        let signed_in = self.saved_state.tracker_sign_in == TrackerSignIn::SignedIn;
+        // Signed in: whoami's link. Otherwise only while the key is verified:
+        // `tracker_account` is set by a successful verify and cleared
+        // whenever one starts or fails.
+        let dashboard_url = match &status {
+            AuthStatus::SignedIn { whoami, .. } => {
+                whoami.as_ref().and_then(|w| w.dashboard_url.clone())
+            }
+            _ => self
+                .tracker_account
+                .as_ref()
+                .and_then(|account| account.dashboard_url.clone()),
+        };
 
-        ui.add_enabled_ui(true, |ui| {
-            ui.vertical(|ui| {
-                egui::Sides::new().show(
-                    ui,
-                    |ui| {
-                        Self::section_header(ui, "Tracker");
-                    },
-                    |ui| {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .button(egui_material_icons::icons::ICON_REFRESH)
-                                .clicked()
-                            {
-                                self.request_tracker_verify();
-                            }
-                            // Only the classes this upload actually writes, and
-                            // the same key check the click handler makes -- an
-                            // enabled button whose handler then refuses is
-                            // exactly what this used to be.
-                            let missing = missing_export_data(
-                                &OptimizerExportTarget::TrackerManual
-                                    .export_settings(&self.saved_state.export_settings),
-                                &app_state.updated,
-                            );
-                            ui.add_enabled_ui(
-                                missing.is_empty()
-                                    && can_upload_to_tracker(&self.saved_state)
-                                    && self.optimizer_export_rx.is_none(),
-                                |ui| {
-                                    if ui
-                                        .button(egui_material_icons::icons::ICON_CLOUD_UPLOAD)
-                                        .on_hover_text("Export current capture to Tracker")
-                                        .clicked()
-                                    {
-                                        self.genshin_optimizer_request_export(
-                                            OptimizerExportTarget::TrackerManual,
-                                        );
-                                    }
-                                },
-                            );
-                            if let Some(url) = &dashboard_url
-                                && ui
-                                    .button(egui_material_icons::icons::ICON_OPEN_IN_NEW)
-                                    .on_hover_text("Open dashboard")
-                                    .clicked()
-                            {
-                                ui.ctx().open_url(OpenUrl::new_tab(url));
-                            }
-                            if ui
-                                .button(egui_material_icons::icons::ICON_SETTINGS)
-                                .clicked()
-                            {
-                                self.tracker_key_modal_open = true;
-                                self.request_tracker_verify();
-                            }
-                        });
-                    },
-                );
-
-                if self.saved_state.tracker_import_key.is_empty() {
-                    ui.label("No account linked.");
-                } else if let Some(account) = &self.tracker_account {
-                    ui.label(
-                        RichText::new(format!("Account: {}", account.name))
-                            .color(Color32::from_hex("#00ab3f").unwrap()),
-                    );
+        ui.vertical(|ui| {
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    Self::section_header(ui, "Tracker");
+                },
+                |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!("UID: {}", account.uid)).color(Color32::GRAY),
+                        if ui
+                            .button(egui_material_icons::icons::ICON_REFRESH)
+                            .clicked()
+                        {
+                            if signed_in {
+                                self.whoami_checked_at = Some(Instant::now());
+                                self.send_tracker(TrackerRequest::Refresh);
+                            } else {
+                                self.request_tracker_verify();
+                            }
+                        }
+                        // Only the classes this upload actually writes, and
+                        // the same check the click handler makes -- an
+                        // enabled button whose handler then refuses is
+                        // exactly what this used to be.
+                        let missing = missing_export_data(
+                            &OptimizerExportTarget::TrackerManual
+                                .export_settings(&self.saved_state.export_settings),
+                            &app_state.updated,
                         );
-                        ui.label(RichText::new("•").color(Color32::DARK_GRAY));
-                        ui.label(
-                            RichText::new(format!("Server: {}", account.server))
-                                .color(Color32::GRAY),
+                        ui.add_enabled_ui(
+                            missing.is_empty()
+                                && can_upload_to_tracker(&self.saved_state)
+                                && self.optimizer_export_rx.is_none(),
+                            |ui| {
+                                if ui
+                                    .button(egui_material_icons::icons::ICON_CLOUD_UPLOAD)
+                                    .on_hover_text("Export current capture to Tracker")
+                                    .clicked()
+                                {
+                                    self.genshin_optimizer_request_export(
+                                        OptimizerExportTarget::TrackerManual,
+                                    );
+                                }
+                            },
                         );
+                        if let Some(url) = &dashboard_url
+                            && ui
+                                .button(egui_material_icons::icons::ICON_OPEN_IN_NEW)
+                                .on_hover_text("Open dashboard")
+                                .clicked()
+                        {
+                            ui.ctx().open_url(OpenUrl::new_tab(url));
+                        }
+                        if ui
+                            .button(egui_material_icons::icons::ICON_SETTINGS)
+                            .clicked()
+                        {
+                            self.tracker_key_modal_open = true;
+                            self.tracker_url_edit = self.saved_state.tracker_api_url.clone();
+                            if !signed_in {
+                                self.request_tracker_verify();
+                            }
+                        }
                     });
-                    // Shown for as long as it is true; the toast in
-                    // `note_uid_mismatch` only announces it.
-                    if let Some(captured) = uid_mismatch(account, captured_uid) {
+                },
+            );
+
+            match &status {
+                AuthStatus::SignedOut { notice } => {
+                    // Sign in, and the import key's account while it is
+                    // still the way uploads are linked.
+                    ui.horizontal(|ui| self.sign_in_button(ui, notice.as_ref()));
+                    self.import_key_status_ui(ui, captured_uid);
+                }
+                other => {
+                    self.sign_in_status_ui(ui, other);
+                    if let Some(account) = signed_in.then(|| self.upload_account()).flatten()
+                        && let Some(captured) = uid_mismatch(&account, captured_uid)
+                    {
                         ui.label(
                             RichText::new(format!(
                                 "{} Captured UID {captured} is not this account's",
@@ -2354,33 +2832,30 @@ impl IrminsulApp {
                             ))
                             .color(Color32::RED),
                         )
-                        .on_hover_text(uid_mismatch_message(account, captured));
+                        .on_hover_text(uid_mismatch_message(&account, captured));
                     }
-                } else if self.tracker_verify_rx.is_some() {
-                    ui.label(RichText::new("Verifying...").color(Color32::YELLOW));
-                } else {
-                    ui.label(RichText::new("Verification Failed").color(Color32::RED));
                 }
+            }
 
-                ui.checkbox(
-                    &mut self.saved_state.auto_export_to_tracker,
-                    "Auto export to tracker",
+            ui.checkbox(
+                &mut self.saved_state.auto_export_to_tracker,
+                "Auto export to tracker",
+            );
+            // Checked but inert is otherwise completely silent: the
+            // automation upload simply never fires.
+            if self.saved_state.auto_export_to_tracker
+                && self.saved_state.tracker_sign_in != TrackerSignIn::Unknown
+                && !want_tracker_upload(&self.saved_state)
+            {
+                ui.label(
+                    RichText::new(
+                        "Auto export is on, but you are not signed in (and no verified key), \
+                         so nothing will be uploaded.",
+                    )
+                    .color(Color32::RED)
+                    .small(),
                 );
-                // Checked but inert is otherwise completely silent: the
-                // automation upload simply never fires.
-                if self.saved_state.auto_export_to_tracker
-                    && !want_tracker_upload(&self.saved_state)
-                {
-                    ui.label(
-                        RichText::new(
-                            "Auto export is on, but the key is not linked and verified, \
-                             so nothing will be uploaded.",
-                        )
-                        .color(Color32::RED)
-                        .small(),
-                    );
-                }
-            });
+            }
         });
     }
 
@@ -2679,7 +3154,7 @@ impl IrminsulApp {
             }
 
             OptimizerExportTarget::TrackerManual => {
-                if can_upload_to_tracker(&self.saved_state) {
+                if let Some(credential) = upload_credential(&self.saved_state) {
                     // Said again at the click, then uploaded anyway: see
                     // `note_uid_mismatch`.
                     let captured_uid = self
@@ -2688,19 +3163,22 @@ impl IrminsulApp {
                         .player
                         .as_ref()
                         .and_then(|player| player.uid);
-                    if let Some(account) = &self.tracker_account
-                        && let Some(captured) = uid_mismatch(account, captured_uid)
+                    if let Some(account) = self.upload_account()
+                        && let Some(captured) = uid_mismatch(&account, captured_uid)
                     {
                         self.toasts
-                            .warning(uid_mismatch_message(account, captured))
+                            .warning(uid_mismatch_message(&account, captured))
                             .duration(Some(Duration::from_secs(15)));
                     }
-                    self.tracker_upload_json(json, counts);
+                    self.tracker_upload_json(json, counts, credential);
+                } else if self.saved_state.tracker_sign_in == TrackerSignIn::Unknown {
+                    self.toasts
+                        .error("Still reading the tracker sign-in. Try again in a moment.");
                 } else if !self.saved_state.tracker_import_key.is_empty() {
                     self.toasts
                         .error("Tracker key not verified. Open settings to re-link.");
                 } else {
-                    self.toasts.error("No tracker import key configured.");
+                    self.toasts.error("Not signed in to the tracker.");
                 }
             }
         }
@@ -2730,20 +3208,18 @@ impl IrminsulApp {
         Ok(())
     }
 
-    fn tracker_upload_json(&mut self, json: String, counts: ExportCounts) {
-        let key = self.saved_state.tracker_import_key.clone();
-        let base_url = self.saved_state.tracker_api_url.clone();
-        let url = format!(
-            "{}/genshin-accounts-public/import-by-key",
-            base_url.trim_end_matches('/')
-        );
-
+    fn tracker_upload_json(
+        &mut self,
+        json: String,
+        counts: ExportCounts,
+        credential: UploadCredential,
+    ) {
         self.toasts.info(format!("Uploading to Tracker: {counts}"));
 
         let (tx, rx) = oneshot::channel();
         let _ = self
             .ui_message_tx
-            .send(Message::UploadToTracker(json, url, key, tx));
+            .send(Message::UploadToTracker(json, credential, tx));
         self.tracker_upload_rx = Some(rx);
     }
 
@@ -3022,6 +3498,9 @@ mod tests {
         SavedAppState {
             tracker_import_key: "gdt_import_1_abc".to_string(),
             tracker_verified: true,
+            // Signed out: the key path. While the sign-in is still being read
+            // (`Unknown`) nothing uploads at all.
+            tracker_sign_in: TrackerSignIn::SignedOut,
             ..Default::default()
         }
     }
@@ -3466,5 +3945,152 @@ mod tests {
             uid_mismatch(&linked_account(" 800000001 "), Some(800_000_001)),
             None
         );
+    }
+
+    #[test]
+    fn a_sign_in_takes_over_from_the_import_key() {
+        // Signed in: the sign-in uploads, whether or not a key is saved.
+        let mut state = verified_state();
+        state.tracker_sign_in = TrackerSignIn::SignedIn;
+        assert_eq!(
+            upload_credential(&state),
+            Some(UploadCredential::SignedIn {
+                base: state.tracker_api_url.clone()
+            })
+        );
+        state.tracker_import_key.clear();
+        state.tracker_verified = false;
+        assert_eq!(
+            upload_credential(&state),
+            Some(UploadCredential::SignedIn {
+                base: state.tracker_api_url.clone()
+            })
+        );
+        state.auto_export_to_tracker = true;
+        assert!(want_tracker_upload(&state));
+    }
+
+    #[test]
+    fn signed_out_the_key_path_is_what_it_always_was() {
+        let mut state = verified_state();
+        state.tracker_api_url = "https://gdt.example/api/".to_string();
+        assert_eq!(
+            upload_credential(&state),
+            Some(UploadCredential::ImportKey {
+                url: "https://gdt.example/api/genshin-accounts-public/import-by-key".to_string(),
+                key: "gdt_import_1_abc".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn nothing_uploads_while_the_sign_in_is_still_being_read() {
+        let mut state = verified_state();
+        state.tracker_sign_in = TrackerSignIn::Unknown;
+        state.auto_export_to_tracker = true;
+        assert_eq!(upload_credential(&state), None);
+        assert!(!can_upload_to_tracker(&state));
+        assert!(!want_tracker_upload(&state));
+    }
+
+    #[test]
+    fn the_sign_in_status_maps_onto_the_upload_gate() {
+        assert_eq!(
+            TrackerSignIn::from_status(&AuthStatus::Loading),
+            TrackerSignIn::Unknown
+        );
+        assert_eq!(
+            TrackerSignIn::from_status(&AuthStatus::SignedOut { notice: None }),
+            TrackerSignIn::SignedOut
+        );
+        // Waiting on the browser is still signed out: a saved key keeps
+        // working until the sign-in completes.
+        assert_eq!(
+            TrackerSignIn::from_status(&AuthStatus::Waiting { link: None }),
+            TrackerSignIn::SignedOut
+        );
+        assert_eq!(
+            TrackerSignIn::from_status(&AuthStatus::SignedIn {
+                whoami: None,
+                error: None
+            }),
+            TrackerSignIn::SignedIn
+        );
+    }
+
+    #[test]
+    fn an_edited_address_is_a_change_only_when_it_points_elsewhere() {
+        let current = "https://genshin-tracker.475.dev/api";
+        assert_eq!(address_change(current, current), AddressChange::Same);
+        assert_eq!(
+            address_change(current, " https://genshin-tracker.475.dev/api/ "),
+            AddressChange::Same
+        );
+        assert_eq!(
+            address_change(current, "https://gdt.example/api"),
+            AddressChange::To {
+                base: "https://gdt.example/api".to_string(),
+                host: "gdt.example".to_string(),
+            }
+        );
+        // A lookalike is named by its host in the confirmation.
+        assert_eq!(
+            address_change(current, "https://genshin-tracker.475.dev.evil.example/api"),
+            AddressChange::To {
+                base: "https://genshin-tracker.475.dev.evil.example/api".to_string(),
+                host: "genshin-tracker.475.dev.evil.example".to_string(),
+            }
+        );
+        assert_eq!(
+            address_change(current, "http://localhost:8787/api"),
+            AddressChange::To {
+                base: "http://localhost:8787/api".to_string(),
+                host: "localhost:8787".to_string(),
+            }
+        );
+        for invalid in [
+            "",
+            "tracker",
+            "ftp://gdt.example/api",
+            "javascript:alert(1)",
+        ] {
+            assert_eq!(
+                address_change(current, invalid),
+                AddressChange::Invalid,
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn whoami_is_reread_on_return_and_every_few_minutes() {
+        assert!(whoami_refresh_due(false, None));
+        assert!(!whoami_refresh_due(false, Some(Duration::from_secs(30))));
+        assert!(whoami_refresh_due(true, Some(Duration::from_secs(30))));
+        // Not on every focus flicker.
+        assert!(!whoami_refresh_due(true, Some(Duration::from_secs(2))));
+        assert!(whoami_refresh_due(false, Some(WHOAMI_REFRESH_INTERVAL)));
+    }
+
+    fn whoami(scope: UploadScope) -> Whoami {
+        Whoami {
+            scope,
+            user: "traveler".to_string(),
+            account_id: Some(12),
+            account_name: Some("Main".to_string()),
+            uid: Some("811111111".to_string()),
+            server: Some("ASIA".to_string()),
+            dashboard_url: None,
+            config_url: None,
+        }
+    }
+
+    #[test]
+    fn only_an_account_target_can_mismatch_the_captured_uid() {
+        let account = whoami_account(&whoami(UploadScope::Account)).unwrap();
+        assert_eq!(uid_mismatch(&account, Some(800_000_001)), Some(800_000_001));
+        assert_eq!(uid_mismatch(&account, Some(811_111_111)), None);
+        // By UID, every capture goes to its own account.
+        assert_eq!(whoami_account(&whoami(UploadScope::Uid)), None);
     }
 }

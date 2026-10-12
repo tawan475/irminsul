@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 use crate::capture::{self, BackendType, CaptureSource, create_capture};
 use crate::game_watch::{self, GameStatus, GameWatch, SystemProcessDetector};
 use crate::player_data::{ExportReport, ExportSettings, PlayerData};
+use crate::signin::{TrackerAuth, UploadCredential};
 use crate::{AppState, DataUpdated, Message, State};
 
 /// How long the automation trigger waits after the last new data before it
@@ -872,6 +873,8 @@ pub struct Monitor {
     saved_state_rx: watch::Receiver<crate::app::SavedAppState>,
     toast_tx: mpsc::UnboundedSender<(String, bool)>,
     http: reqwest::Client,
+    /// The tracker sign-in (`signin.rs`); its HTTP goes through `http` too.
+    tracker_auth: TrackerAuth,
     packet_log: PacketLog,
 
     /// When the newest captured data arrived, in epoch milliseconds. Uploaded as
@@ -908,6 +911,7 @@ impl Monitor {
         capture_source: CaptureSource,
         saved_state_rx: watch::Receiver<crate::app::SavedAppState>,
         toast_tx: mpsc::UnboundedSender<(String, bool)>,
+        tracker_auth: TrackerAuth,
         ctx: egui::Context,
     ) -> Result<Self> {
         let mut app_state = AppStateManager::new(state_tx.borrow().clone(), state_tx.clone());
@@ -975,6 +979,7 @@ impl Monitor {
             saved_state_rx,
             toast_tx,
             http,
+            tracker_auth,
             packet_log: PacketLog::new(),
             capture_timestamp_ms: None,
             automation_pending_since: None,
@@ -1122,8 +1127,11 @@ impl Monitor {
                     ctx.request_repaint();
                 });
             }
-            Message::UploadToTracker(json, url, key, reply_tx) => {
-                self.spawn_tracker_upload(url, key, json, UploadReport::Reply(reply_tx));
+            Message::UploadToTracker(json, credential, reply_tx) => {
+                self.spawn_tracker_upload(credential, json, UploadReport::Reply(reply_tx));
+            }
+            Message::Tracker(request) => {
+                self.tracker_auth.handle(self.http.clone(), request);
             }
             _ => (),
         }
@@ -1703,13 +1711,14 @@ impl Monitor {
             }
         }
 
-        if let Some((json, report)) = tracker_export {
+        if let Some((json, report)) = tracker_export
+            && let Some(credential) = crate::app::upload_credential(&saved_state)
+        {
             let _ = self
                 .toast_tx
                 .send((format!("Uploading to Tracker: {}", report.counts()), false));
             self.spawn_tracker_upload(
-                import_url(&saved_state.tracker_api_url),
-                saved_state.tracker_import_key.clone(),
+                credential,
                 json,
                 UploadReport::Toast {
                     retry_tx: self.automation_retry_tx.clone(),
@@ -1782,19 +1791,33 @@ impl Monitor {
         Ok(path)
     }
 
-    fn spawn_tracker_upload(&self, url: String, key: String, json: String, report: UploadReport) {
+    fn spawn_tracker_upload(
+        &self,
+        credential: UploadCredential,
+        json: String,
+        report: UploadReport,
+    ) {
         let client = self.http.clone();
+        let auth = self.tracker_auth.clone();
         let ctx = self.ctx.clone();
         let toast_tx = self.toast_tx.clone();
         let captured_at = self.capture_timestamp_ms;
         let allowed = uploads_allowed(&self.capture_source);
 
         tokio::spawn(async move {
-            let result = if allowed {
-                upload_to_tracker(&client, &url, &key, json, captured_at).await
-            } else {
+            let result = if !allowed {
                 tracing::warn!("{REPLAY_UPLOAD_REFUSED}");
                 Err(REPLAY_UPLOAD_REFUSED.to_string())
+            } else {
+                match credential {
+                    UploadCredential::ImportKey { url, key } => {
+                        upload_to_tracker(&client, &url, &key, json, captured_at).await
+                    }
+                    UploadCredential::SignedIn { base } => {
+                        auth.upload(&client, &base, json, captured_at, TRACKER_UPLOAD_TIMEOUT)
+                            .await
+                    }
+                }
             };
             match report {
                 UploadReport::Reply(reply_tx) => {
@@ -1869,7 +1892,7 @@ async fn join_capture(
 }
 
 /// The tracker's snapshot import endpoint for a configured base URL.
-fn import_url(base_url: &str) -> String {
+pub(crate) fn import_url(base_url: &str) -> String {
     format!(
         "{}/genshin-accounts-public/import-by-key",
         base_url.trim_end_matches('/')
@@ -1888,20 +1911,7 @@ async fn upload_to_tracker(
     json: String,
     captured_at_ms: Option<i64>,
 ) -> std::result::Result<(), String> {
-    let part = reqwest::multipart::Part::bytes(json.into_bytes())
-        .file_name("irminsul_capture.json")
-        .mime_str("application/json")
-        .map_err(|e| format!("could not build the upload body: {e}"))?;
-
-    // Sent before the file part, because the backend reads it while streaming
-    // the upload. Without it a snapshot is stamped with the server's receive
-    // time, which both misdates a delayed upload and stops the server's
-    // duplicate check from ever firing on a re-upload of unchanged data.
-    let mut form = reqwest::multipart::Form::new();
-    if let Some(captured_at_ms) = captured_at_ms {
-        form = form.text("timestamp", captured_at_ms.to_string());
-    }
-    let form = form.part("file", part);
+    let form = snapshot_form(json, captured_at_ms)?;
 
     let response = client
         .post(url)
@@ -1926,6 +1936,28 @@ async fn upload_to_tracker(
         tracing::error!("Tracker upload failed ({}): {}", status, body);
         Err(format!("HTTP {} - {}", status, body))
     }
+}
+
+/// The multipart body of a snapshot upload, shared by the import-key path and
+/// the signed-in one (`signin.rs`), whose routes take the same body.
+pub(crate) fn snapshot_form(
+    json: String,
+    captured_at_ms: Option<i64>,
+) -> std::result::Result<reqwest::multipart::Form, String> {
+    let part = reqwest::multipart::Part::bytes(json.into_bytes())
+        .file_name("irminsul_capture.json")
+        .mime_str("application/json")
+        .map_err(|e| format!("could not build the upload body: {e}"))?;
+
+    // Sent before the file part, because the backend reads it while streaming
+    // the upload. Without it a snapshot is stamped with the server's receive
+    // time, which both misdates a delayed upload and stops the server's
+    // duplicate check from ever firing on a re-upload of unchanged data.
+    let mut form = reqwest::multipart::Form::new();
+    if let Some(captured_at_ms) = captured_at_ms {
+        form = form.text("timestamp", captured_at_ms.to_string());
+    }
+    Ok(form.part("file", part))
 }
 
 /// What the tracker says about an import key (`verify-key`).
@@ -2111,6 +2143,7 @@ pub(crate) mod tests {
             auto_export_to_tracker: true,
             tracker_import_key: "gdt_import_1_abc".to_string(),
             tracker_verified: true,
+            tracker_sign_in: crate::app::TrackerSignIn::SignedOut,
             export_settings: ExportSettings {
                 include_characters: false,
                 fake_initialize_4th_line: true,
