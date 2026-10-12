@@ -350,11 +350,14 @@ pub(crate) struct AppliedData {
     /// Player properties. They stamp no timestamp of their own (see
     /// [`Monitor::handle_game_packet`]) but are still new data.
     pub(crate) properties: bool,
+    /// The Travel Accounts book. Like properties, no timestamp of its own:
+    /// it rides along with whatever export the other classes trigger.
+    pub(crate) anecdotes: bool,
 }
 
 impl AppliedData {
     pub(crate) fn any(&self) -> bool {
-        self.items || self.characters || self.achievements || self.properties
+        self.items || self.characters || self.achievements || self.properties || self.anecdotes
     }
 
     /// Everything either side changed.
@@ -364,6 +367,7 @@ impl AppliedData {
             characters: self.characters || other.characters,
             achievements: self.achievements || other.achievements,
             properties: self.properties || other.properties,
+            anecdotes: self.anecdotes || other.anecdotes,
         }
     }
 }
@@ -418,6 +422,14 @@ pub(crate) fn apply_commands(
                 );
                 player_data.process_achievements(&achievements);
                 applied.achievements = true;
+            }
+            CommandMatch::Anecdotes(anecdotes) => {
+                tracing::info!(
+                    "Found anecdote packet with {} anecdotes",
+                    anecdotes.anecdotes.len()
+                );
+                player_data.process_anecdotes(&anecdotes);
+                applied.anecdotes = true;
             }
             CommandMatch::DeletedItems(guids) => {
                 // The matcher reports candidates -- its shape is shared with

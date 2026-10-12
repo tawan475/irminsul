@@ -66,10 +66,16 @@ use rsa::pkcs1::DecodeRsaPrivateKey;
 use tracing::{debug, info, info_span, instrument, trace, warn};
 
 use crate::Key::Dispatch;
+pub use crate::anecdotes::{
+    ANECDOTE_AREA_IDS, ANECDOTE_FINISHED_STATE, ANECDOTE_IDS, Anecdote, AnecdoteData,
+    AnecdoteReward, AnecdoteWish, MAX_ANECDOTE_FINISH_COUNT, MAX_ANECDOTE_STATE, MAX_ANECDOTES,
+    matches_anecdote_get_data_rsp,
+};
 use crate::connection::parse_frame;
 use crate::crypto::{bruteforce, decrypt_command, guess, lookup_initial_key};
 use crate::r#gen::protos::{AvatarInfo, Item, PacketHead, PropValue, Unk, prop_value};
 use crate::kcp::{KcpSniffer, SegmentHead, segment_head};
+use crate::oodle::TcpDecoder;
 pub use crate::unk_util::{
     Achievement, AchievementMatchError, matches_achievement_all_data_notify,
     matches_avatars_all_data_notify, matches_get_player_token_rsp, matches_items_all_data_notify,
@@ -85,10 +91,12 @@ fn bytes_as_hex(bytes: &[u8]) -> String {
 
 pub mod r#gen;
 
+mod anecdotes;
 mod connection;
 mod crypto;
 mod cs_rand;
 mod kcp;
+pub mod oodle;
 #[cfg(test)]
 mod test_support;
 mod unk_util;
@@ -187,10 +195,13 @@ const PENDING_RESET_DISARM_MESSAGES: u32 = 64;
 /// length once decompressed.
 ///
 /// Not in the protos -- no generated type knows it -- so it is read from the
-/// header's unknown fields. Seen on 2026-10-05 on the `GetPlayerTokenRsp` from
-/// some gate servers only (25,563 bytes sent as 20,118), and on no other
-/// message of that session. This build cannot decompress it, so all it can do
-/// is say so.
+/// header's unknown fields. First seen on 2026-10-05 on the `GetPlayerTokenRsp`
+/// from some gate servers (25,563 bytes sent as 20,118); by 2026-10-12 the
+/// server compressed hundreds of messages per session this way. The payload is
+/// Oodle Network 1 in its TCP mode, decompressed by one [`TcpDecoder`] per
+/// direction (see `GameSniffer::decompress`). When the field equals the
+/// payload's length, the payload was sent as is but is still one message of
+/// the compressed stream.
 const COMPRESSED_LEN_FIELD: u32 = 8;
 
 /// Entries a property notify needs before it is believed.
@@ -245,6 +256,7 @@ static ITEM_DEL_NOTIFY_LOGGED: AtomicBool = AtomicBool::new(false);
 static PROPERTY_NOTIFY_LOGGED: AtomicBool = AtomicBool::new(false);
 static AVATAR_NOTIFY_LOGGED: AtomicBool = AtomicBool::new(false);
 static ACHIEVEMENT_NOTIFY_LOGGED: AtomicBool = AtomicBool::new(false);
+static ANECDOTE_RSP_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// `true` the first time it is called for a given flag.
 fn first_time(flag: &AtomicBool) -> bool {
@@ -543,6 +555,16 @@ struct Lane {
     /// the lane can switch to it without losing a message. See
     /// [`GameSniffer::consider_switching`].
     candidate: Option<Candidate>,
+    /// This direction's decoder for compressed messages, created by the first
+    /// one. Every compressed message of a conversation updates the state the
+    /// next one is decoded with, so the decoder lives exactly as long as the
+    /// lane's binding: binding a conversation builds a new `Lane`, and with it
+    /// a fresh decoder, which is the state the server starts a connection in.
+    decompressor: Option<TcpDecoder>,
+    /// A compressed message of this conversation failed to decode. Its share
+    /// of the stream state is lost with it, so every later compressed message
+    /// would decode to garbage and is skipped until the lane binds anew.
+    decompressor_broken: bool,
 }
 
 struct Candidate {
@@ -588,8 +610,9 @@ pub struct GameSniffer {
     /// in a form this build can read. Nothing of the connection can decrypt,
     /// so it counts as a given-up key recovery.
     seedless_login: bool,
-    /// A compressed message was reported for this connection (once).
-    compressed_reported: bool,
+    /// A compressed message failed to decode on this connection and was
+    /// reported (once).
+    decompress_failure_reported: bool,
     /// A handshake request arrived while a session key was live. Nothing about
     /// that datagram is authenticated, so the reset it asks for waits for
     /// corroboration.
@@ -768,7 +791,7 @@ impl GameSniffer {
         self.session_rederive_exhausted = false;
         self.bruteforce_attempts = 0;
         self.seedless_login = false;
-        self.compressed_reported = false;
+        self.decompress_failure_reported = false;
         self.pending_reset = false;
         self.pending_reset_proof = 0;
     }
@@ -897,7 +920,7 @@ impl GameSniffer {
         let messages = kcp.receive_segments(kcp_seg);
         let commands: Vec<GameCommand> = messages
             .into_iter()
-            .flat_map(|data| self.receive_commands(data))
+            .flat_map(|data| self.receive_commands(direction, data))
             .collect();
         self.note_lane_decoded(direction, &commands);
         Some(commands)
@@ -995,15 +1018,20 @@ impl GameSniffer {
 
         let commands: Vec<GameCommand> = messages
             .into_iter()
-            .flat_map(|data| self.receive_commands(data))
+            .flat_map(|data| self.receive_commands(direction, data))
             .collect();
         self.note_lane_decoded(direction, &commands);
         commands
     }
 
-    /// Decrypt one KCP message and parse every command it carries.
+    /// Decrypt one KCP message that arrived from `direction`, parse every
+    /// command it carries and decompress the compressed ones.
     #[instrument(skip_all, fields(len = data.len()))]
-    fn receive_commands(&mut self, mut data: Vec<u8>) -> Vec<GameCommand> {
+    fn receive_commands(
+        &mut self,
+        direction: PacketDirection,
+        mut data: Vec<u8>,
+    ) -> Vec<GameCommand> {
         // Every key branch below reads `data[0]`, `data[1]`, `data[len - 2]` and
         // `data[len - 1]`, and a real command carries a 10-byte header plus a
         // 2-byte tail anyway, so a runt message is dropped before it can index
@@ -1028,7 +1056,10 @@ impl GameSniffer {
         };
         decrypt_command(key_bytes, &mut data);
 
-        let commands = GameCommand::parse_message(&data);
+        let mut commands = GameCommand::parse_message(&data);
+        // Before anything reads a payload: the token response, whose seeds the
+        // session key is recovered from, can itself arrive compressed.
+        commands.retain_mut(|command| self.decompress(direction, command));
 
         for command in &commands {
             let span = info_span!("command", ?command);
@@ -1278,7 +1309,6 @@ impl GameSniffer {
         }
 
         let Some(seeds) = matches_get_player_token_rsp(&command.proto_data, &self.rsa_keys) else {
-            self.report_compressed(command);
             return;
         };
 
@@ -1312,28 +1342,91 @@ impl GameSniffer {
 }
 
 impl GameSniffer {
-    /// Log, once per connection, a login message the server compressed.
+    /// Decompress `command` in place if its header says it was compressed.
+    /// `false` means it has to be dropped: its payload could not be
+    /// recovered, and handing the compressed bytes on would let a
+    /// shape-matching matcher read them as protobuf.
     ///
-    /// The token response is the one that matters: its seeds are what the
-    /// session key is recovered from, and compressed they are unreadable.
-    fn report_compressed(&mut self, command: &GameCommand) {
-        if self.compressed_reported {
+    /// Runs on every command of `direction` in arrival order, stored ones
+    /// included (field 8 equal to the payload's length): the sender's models
+    /// went through those too, and the decoder has to follow.
+    fn decompress(&mut self, direction: PacketDirection, command: &mut GameCommand) -> bool {
+        let Some(raw_len) = compressed_len(command) else {
+            return true;
+        };
+        let lane = self.lane(direction);
+        if lane.decompressor_broken {
+            debug!(
+                command_id = command.command_id,
+                "skipping a compressed message: this conversation's stream state is lost"
+            );
+            return false;
+        }
+
+        let decoder = lane.decompressor.get_or_insert_with(TcpDecoder::new);
+        match decoder.decode(&command.proto_data, raw_len) {
+            Ok(raw) => {
+                trace!(
+                    command_id = command.command_id,
+                    sent = command.proto_data.len(),
+                    decompressed = raw.len(),
+                    "decompressed"
+                );
+                // `decode` caps the length far below `u32::MAX`.
+                command.data_len = raw.len() as u32;
+                command.proto_data = raw;
+                true
+            }
+            Err(error) => {
+                lane.decompressor = None;
+                lane.decompressor_broken = true;
+                self.report_decompress_failure(direction, command, raw_len, error);
+                false
+            }
+        }
+    }
+
+    /// Log, once per connection, a compressed message that did not decode.
+    ///
+    /// Sizes and the command id only: the payload is account data.
+    fn report_decompress_failure(
+        &mut self,
+        direction: PacketDirection,
+        command: &GameCommand,
+        raw_len: usize,
+        error: oodle::DecodeError,
+    ) {
+        if self.decompress_failure_reported {
+            debug!(
+                ?direction,
+                command_id = command.command_id,
+                %error,
+                "another compressed message did not decode"
+            );
             return;
         }
-        let Ok(header) = command.parse_header::<PacketHead>() else {
-            return;
-        };
-        let Some(Varint(declared)) = header.unknown_fields().get(COMPRESSED_LEN_FIELD) else {
-            return;
-        };
-        self.compressed_reported = true;
+        self.decompress_failure_reported = true;
         warn!(
+            ?direction,
             command_id = command.command_id,
             sent = command.proto_data.len(),
-            decompressed = declared,
-            "a login message arrived compressed (packet header field 8), which this build cannot \
-             read; if it is the token response, this login's session key cannot be recovered"
+            decompressed = raw_len,
+            %error,
+            "a compressed message (packet header field 8) did not decode; later compressed \
+             messages in this direction are skipped until the next connection, and if this was \
+             the token response, this login's session key cannot be recovered"
         );
+    }
+}
+
+/// The decompressed length a command's header declares, if it was sent
+/// compressed. A length past `usize` comes back as `usize::MAX`, which the
+/// decoder refuses like any other over-long one.
+fn compressed_len(command: &GameCommand) -> Option<usize> {
+    let header = command.parse_header::<PacketHead>().ok()?;
+    match header.unknown_fields().get(COMPRESSED_LEN_FIELD)? {
+        Varint(declared) => Some(usize::try_from(declared).unwrap_or(usize::MAX)),
+        _ => None,
     }
 }
 
@@ -1345,6 +1438,8 @@ pub enum CommandMatch {
     Properties(HashMap<u32, u64>),
     Avatars(Vec<AvatarInfo>),
     Achievements(Vec<Achievement>),
+    /// The Travel Accounts book, in full: see [`matches_anecdote_packet`].
+    Anecdotes(AnecdoteData),
     /// Guids the game says are gone. Candidates, not gospel -- see
     /// [`matches_item_del_packet`] for why the caller must intersect them with
     /// an inventory it actually holds.
@@ -1359,6 +1454,7 @@ impl CommandMatch {
             Self::Properties(_) => "properties",
             Self::Avatars(_) => "avatars",
             Self::Achievements(_) => "achievements",
+            Self::Anecdotes(_) => "anecdotes",
             Self::DeletedItems(_) => "deleted items",
         }
     }
@@ -1369,7 +1465,7 @@ impl CommandMatch {
 /// The individual `matches_*_packet` functions stay available, but a caller that
 /// tries them in an `else if` chain can never notice that two of them claimed the
 /// same command -- which is exactly how a shape collision turns into silently
-/// missing data. This runs all four and logs when more than one claims a command,
+/// missing data. This runs them all and logs when more than one claims a command,
 /// then returns the first claim in the historical priority order.
 pub fn classify_command(game_command: &GameCommand) -> Option<CommandMatch> {
     let mut claims = Vec::new();
@@ -1384,6 +1480,9 @@ pub fn classify_command(game_command: &GameCommand) -> Option<CommandMatch> {
     }
     if let Some(achievements) = matches_achievement_packet(game_command) {
         claims.push(CommandMatch::Achievements(achievements));
+    }
+    if let Some(anecdotes) = matches_anecdote_packet(game_command) {
+        claims.push(CommandMatch::Anecdotes(anecdotes));
     }
     // Last on purpose. Its shape -- one packed uint64 list beside a scalar or
     // two -- is the least specific of the five, so anything another matcher can
@@ -1420,6 +1519,35 @@ pub fn matches_achievement_packet(game_command: &GameCommand) -> Option<Vec<Achi
         );
     }
     Some(achievements)
+}
+
+/// Recover the Travel Accounts book from an `AnecdoteGetDataRsp`, or `None` if
+/// this is not one.
+///
+/// Observed command id: 28234 in 7.1, kept as documentation only. The
+/// message is recognised by shape (see [`matches_anecdote_get_data_rsp`]), and
+/// the first match logs the command id, so a patch that moves it shows up in
+/// the log rather than as missing anecdotes.
+pub fn matches_anecdote_packet(game_command: &GameCommand) -> Option<AnecdoteData> {
+    let data = matches_anecdote_get_data_rsp(&game_command.proto_data)?;
+
+    if first_time(&ANECDOTE_RSP_LOGGED) {
+        info!(
+            command_id = game_command.command_id,
+            count = data.anecdotes.len(),
+            areas = data.unlocked_areas.len(),
+            reward = data.reward.is_some(),
+            wish = data.wish.is_some(),
+            "discovered AnecdoteGetDataRsp"
+        );
+    } else {
+        debug!(
+            command_id = game_command.command_id,
+            count = data.anecdotes.len(),
+            "anecdote packet"
+        );
+    }
+    Some(data)
 }
 
 /// Recover the achievement list from a command, reporting why it did not match.
@@ -1467,7 +1595,7 @@ pub fn matches_item_packet(game_command: &GameCommand) -> Option<Vec<Item>> {
 /// Requires the buffer to be consumed exactly: a trailing partial varint means
 /// this blob is a submessage or a string that happened to start with
 /// varint-shaped bytes, not a packed list.
-fn decode_packed_varints(bytes: &[u8]) -> Option<Vec<u64>> {
+pub(crate) fn decode_packed_varints(bytes: &[u8]) -> Option<Vec<u64>> {
     let mut values = Vec::new();
     let mut offset = 0usize;
 
@@ -2200,7 +2328,9 @@ mod tests {
 
         for len in 0..GameCommand::HEADER_LEN + GameCommand::TAIL_LEN {
             assert!(
-                sniffer.receive_commands(vec![0u8; len]).is_empty(),
+                sniffer
+                    .receive_commands(PacketDirection::Received, vec![0u8; len])
+                    .is_empty(),
                 "len {len}"
             );
         }
@@ -2214,7 +2344,11 @@ mod tests {
         let mut sniffer = GameSniffer::new();
         sniffer.key = Some(Dispatch(new_key_from_seed(1)));
 
-        assert!(sniffer.receive_commands(vec![0u8; 64]).is_empty());
+        assert!(
+            sniffer
+                .receive_commands(PacketDirection::Received, vec![0u8; 64])
+                .is_empty()
+        );
         assert!(sniffer.session_seeds.is_none());
     }
 
@@ -2225,7 +2359,11 @@ mod tests {
         sniffer.key = Some(Key::Session(key.clone()));
 
         for _ in 0..MAX_SESSION_FAILURES * 4 {
-            assert!(sniffer.receive_commands(vec![0u8; 64]).is_empty());
+            assert!(
+                sniffer
+                    .receive_commands(PacketDirection::Received, vec![0u8; 64])
+                    .is_empty()
+            );
         }
 
         match &sniffer.key {
@@ -2240,12 +2378,16 @@ mod tests {
         let mut sniffer = GameSniffer::new();
         sniffer.key = Some(Key::Session(key.clone()));
 
-        assert!(sniffer.receive_commands(vec![0u8; 64]).is_empty());
+        assert!(
+            sniffer
+                .receive_commands(PacketDirection::Received, vec![0u8; 64])
+                .is_empty()
+        );
         assert_eq!(sniffer.session_failures, 1);
 
         let mut message = command_bytes(99, &[], &field_varint(1, 1));
         decrypt_command(&key, &mut message);
-        let commands = sniffer.receive_commands(message);
+        let commands = sniffer.receive_commands(PacketDirection::Received, message);
 
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].command_id, 99);
@@ -2263,7 +2405,7 @@ mod tests {
         decrypt_command(&key, &mut message);
 
         let ids: Vec<u16> = sniffer
-            .receive_commands(message)
+            .receive_commands(PacketDirection::Received, message)
             .iter()
             .map(|command| command.command_id)
             .collect();
@@ -2559,13 +2701,153 @@ mod tests {
     const LOGIN_MS: u64 = 1_759_553_801_000;
     const HOUR_MS: u64 = 3_600_000;
 
+    /// A command whose header declares `raw_len` in [`COMPRESSED_LEN_FIELD`].
+    fn compressed_command(command_id: u16, raw_len: usize, sent: &[u8]) -> Vec<u8> {
+        let mut header = field_varint(3, 1);
+        header.extend(field_varint(COMPRESSED_LEN_FIELD, raw_len as u64));
+        command_bytes(command_id, &header, sent)
+    }
+
+    /// Bytes that do not decode as a compressed message declaring 25,563
+    /// bytes, the size of the 2026-10-05 token response.
+    fn undecodable_payload() -> Vec<u8> {
+        [0x09, 0, 0xa8, 0x45, 0xf3, 0x09, 0x37, 0xf2, 0xdf, 0x7f]
+            .into_iter()
+            .chain((0..200u32).map(|i| (i * 37 + 11) as u8))
+            .collect()
+    }
+
     #[test]
-    fn a_compressed_token_response_is_reported_as_a_lost_key_at_once() {
+    fn compressed_commands_come_out_decompressed() {
+        // The first messages of a stream the Oodle SDK compressed, sent the
+        // way the server sends them: field 8 is the decompressed length.
+        let stream = crate::test_support::oodle_vectors("login_then_traffic");
+        let key = new_key_from_seed(21);
+        let mut sniffer = GameSniffer::new();
+        sniffer.key = Some(Key::Session(key.clone()));
+
+        for (i, (raw, sent)) in stream.iter().take(3).enumerate() {
+            assert!(sent.len() < raw.len(), "message {i} is compressed");
+            let mut message = compressed_command(50, raw.len(), sent);
+            // A plain command beside it is not touched.
+            message.extend(command_bytes(51, &[], &field_varint(1, 1)));
+            decrypt_command(&key, &mut message);
+
+            let commands = sniffer.receive_commands(PacketDirection::Received, message);
+            assert_eq!(commands.len(), 2, "message {i}");
+            assert!(commands[0].proto_data == *raw, "message {i} decoded wrong");
+            assert_eq!(commands[0].data_len as usize, raw.len());
+            assert_eq!(commands[1].proto_data, field_varint(1, 1));
+        }
+    }
+
+    #[test]
+    fn a_failed_decompression_skips_the_conversations_later_compressed_commands() {
+        let stream = crate::test_support::oodle_vectors("login_then_traffic");
+        let (raw, sent) = &stream[0];
+        let key = new_key_from_seed(22);
+        let mut sniffer = GameSniffer::new();
+        sniffer.key = Some(Key::Session(key.clone()));
+        let deliver = |sniffer: &mut GameSniffer, direction, plain: Vec<u8>| {
+            let mut message = plain;
+            decrypt_command(&key, &mut message);
+            sniffer.receive_commands(direction, message)
+        };
+
+        let logged = warnings(|| {
+            let bad = compressed_command(60, 25_563, &undecodable_payload());
+            assert!(deliver(&mut sniffer, PacketDirection::Received, bad).is_empty());
+
+            // The stream state went with that message: a message that would
+            // have decoded is skipped, plain commands still flow.
+            let good = compressed_command(61, raw.len(), sent);
+            assert!(deliver(&mut sniffer, PacketDirection::Received, good.clone()).is_empty());
+            let plain = command_bytes(62, &[], &field_varint(1, 1));
+            assert_eq!(
+                deliver(&mut sniffer, PacketDirection::Received, plain).len(),
+                1
+            );
+
+            // The other direction has its own stream.
+            let other = deliver(&mut sniffer, PacketDirection::Sent, good);
+            assert!(other.len() == 1 && other[0].proto_data == *raw);
+        });
+        assert_eq!(
+            logged
+                .iter()
+                .filter(|l| l.contains("did not decode"))
+                .count(),
+            1,
+            "{logged:#?}"
+        );
+
+        // A new connection starts a fresh stream in every direction.
+        sniffer.reset_session("test");
+        sniffer.key = Some(Key::Session(key.clone()));
+        let good = compressed_command(61, raw.len(), sent);
+        let decoded = deliver(&mut sniffer, PacketDirection::Received, good);
+        assert!(decoded.len() == 1 && decoded[0].proto_data == *raw);
+    }
+
+    #[test]
+    fn an_over_long_declared_length_is_a_failed_decompression() {
+        let key = new_key_from_seed(23);
+        let mut sniffer = GameSniffer::new();
+        sniffer.key = Some(Key::Session(key.clone()));
+        let mut message = compressed_command(70, usize::MAX, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        decrypt_command(&key, &mut message);
+
+        assert!(
+            sniffer
+                .receive_commands(PacketDirection::Received, message)
+                .is_empty()
+        );
+        assert!(sniffer.recv.decompressor_broken);
+    }
+
+    #[test]
+    fn a_stored_token_response_still_yields_its_seeds() {
+        // Field 8 equal to the payload's length: the server's compressor gave
+        // up and sent it as is. It still passes through the decoder (whose
+        // state follows it), and the seeds come out unchanged.
+        let mut sniffer = connected_sniffer();
+        let mut conn = Conn::new(131_848);
+        let dispatch = dispatch_key();
+        let combined = 0x1111_2222_3333_4444;
+        sniffer.receive_packet(handshake_frame());
+
+        let request = command_bytes(TOKEN_REQ, &[], &field_varint(1, 1));
+        conn.push(PacketDirection::Sent, &dispatch, &request);
+        let payload = token_rsp_payload(&sniffer, client_draw(LOGIN_MS, 0) ^ combined);
+        let mut header = field_varint(6, LOGIN_MS);
+        header.extend(field_varint(COMPRESSED_LEN_FIELD, payload.len() as u64));
+        let response = command_bytes(TOKEN_RSP, &header, &payload);
+        assert_eq!(
+            command_ids(
+                &mut sniffer,
+                conn.push(PacketDirection::Received, &dispatch, &response)
+            ),
+            vec![TOKEN_RSP]
+        );
+        assert!(sniffer.recv.decompressor.is_some(), "it went through");
+        assert_eq!(
+            command_ids(
+                &mut sniffer,
+                conn.server_message(&new_key_from_seed(combined), SESSION_MESSAGE)
+            ),
+            vec![SESSION_MESSAGE]
+        );
+    }
+
+    #[test]
+    fn a_token_response_that_does_not_decompress_is_reported_as_a_lost_key_at_once() {
         // 2026-10-05 02:33 and 11:21: some gate servers send the
         // `GetPlayerTokenRsp` compressed -- header field 8 is its decompressed
-        // length, the payload is not protobuf. It decrypts under the dispatch
-        // key and parses as a command, yields no seeds, and every message after
-        // it was dropped at debug level: no warning, no "key lost", nothing.
+        // length. Before this build could decompress it, it yielded no seeds
+        // and every message after it was dropped at debug level: no warning,
+        // no "key lost", nothing. A token response that fails to decompress
+        // (a truncated or misread one) must still end the same way: said at
+        // once, and said once.
         let mut sniffer = connected_sniffer();
         let mut conn = Conn::new(131_847);
         let dispatch = dispatch_key();
@@ -2579,24 +2861,19 @@ mod tests {
             ),
             vec![TOKEN_REQ]
         );
-        // Not protobuf: wire type 7 right after the first field.
-        let compressed: Vec<u8> = [0x09, 0, 0xa8, 0x45, 0xf3, 0x09, 0x37, 0xf2, 0xdf, 0x7f]
-            .into_iter()
-            .chain((0..200u32).map(|i| (i * 37 + 11) as u8))
-            .collect();
         let mut header = field_varint(3, 1);
         header.extend(field_varint(6, LOGIN_MS));
         header.extend(field_varint(COMPRESSED_LEN_FIELD, 25_563));
-        let response = command_bytes(TOKEN_RSP, &header, &compressed);
+        let response = command_bytes(TOKEN_RSP, &header, &undecodable_payload());
 
         let logged = crate::test_support::warnings(|| {
-            assert_eq!(
+            assert!(
                 command_ids(
                     &mut sniffer,
                     conn.push(PacketDirection::Received, &dispatch, &response)
-                ),
-                vec![TOKEN_RSP],
-                "the response still decrypts under the dispatch key"
+                )
+                .is_empty(),
+                "a payload that did not decompress is dropped"
             );
             assert!(sniffer.session_seeds.is_none());
             assert!(!sniffer.key_recovery_failed(), "nothing is lost yet");
@@ -2613,7 +2890,10 @@ mod tests {
         assert!(sniffer.key_recovery_failed(), "the UI can say so at once");
         assert_eq!(sniffer.key_state(), KeyState::Dispatch);
         assert_eq!(
-            logged.iter().filter(|l| l.contains("compressed")).count(),
+            logged
+                .iter()
+                .filter(|l| l.contains("did not decode"))
+                .count(),
             1,
             "{logged:#?}"
         );
@@ -2629,6 +2909,7 @@ mod tests {
         // A new login starts clean.
         sniffer.receive_packet(handshake_frame());
         assert!(!sniffer.key_recovery_failed());
+        assert!(!sniffer.decompress_failure_reported);
     }
 
     #[test]
@@ -3265,7 +3546,12 @@ mod tests {
         for sent in 1..=PENDING_RESET_DISARM_MESSAGES {
             let mut message = command_bytes(1, &[], &field_varint(1, 1));
             decrypt_command(&key, &mut message);
-            assert_eq!(sniffer.receive_commands(message).len(), 1);
+            assert_eq!(
+                sniffer
+                    .receive_commands(PacketDirection::Received, message)
+                    .len(),
+                1
+            );
             assert_eq!(
                 sniffer.pending_reset,
                 sent < PENDING_RESET_DISARM_MESSAGES,
@@ -3363,7 +3649,7 @@ mod tests {
         sniffer.receive_packet(handshake_frame());
 
         for _ in 0..MAX_SESSION_FAILURES {
-            sniffer.receive_commands(vec![0u8; 64]);
+            sniffer.receive_commands(PacketDirection::Received, vec![0u8; 64]);
         }
 
         assert!(sniffer.key.is_none(), "a corroborated handshake must reset");

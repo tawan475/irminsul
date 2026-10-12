@@ -198,7 +198,7 @@ const MIN_ACHIEVEMENT_ENTRIES: usize = 10;
 
 /// Wed Dec 31 2014 23:00:00 GMT+0000 — the game did not exist yet, so a field
 /// holding values above this is a unix timestamp rather than a progress counter.
-const MIN_PLAUSIBLE_FINISH_TIMESTAMP: u64 = 1_420_066_800;
+pub(crate) const MIN_PLAUSIBLE_FINISH_TIMESTAMP: u64 = 1_420_066_800;
 
 /// `Achievement.Status` runs `INVALID`, `UNFINISHED`, `FINISHED`,
 /// `REWARD_TAKEN` — so a status field never exceeds 3.

@@ -88,6 +88,12 @@ pub struct Good {
     /// Only characters with at least one known value appear.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gi_characters: Option<BTreeMap<String, GiCharacter>>,
+    /// The Travel Accounts book, as the game last sent it. Omitted when the
+    /// book's data was not captured, never sent empty: an absent key leaves
+    /// the tracker's copy alone and keeps the content hash of a file without
+    /// it unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gi_anecdotes: Option<GiAnecdotes>,
 }
 
 /// How `gi_player.uid` was read off the item guids (see
@@ -142,6 +148,58 @@ pub struct GiCharacter {
     /// When the character joined the account, in unix seconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub obtained_at: Option<u32>,
+}
+
+/// `gi_anecdotes`: the Travel Accounts book. The contract with the tracker is
+/// `GI_ANECDOTES.md` (v1, 2026-10-12); append fields only.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GiAnecdotes {
+    /// Every anecdote the player has met, keyed by id (a JSON object key, so a
+    /// string). An id that is absent was never met -- not "not done".
+    pub anecdotes: BTreeMap<u32, GiAnecdote>,
+    /// The book's unlocked area tabs, sorted and unique.
+    pub unlocked_areas: Vec<u32>,
+    /// The reward track. Omitted when its counters could not be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reward: Option<GiAnecdoteReward>,
+    /// The last wish. Omitted when none was made (or none was read).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wish: Option<GiAnecdoteWish>,
+}
+
+/// One entry of `gi_anecdotes.anecdotes`. Both values are always written; a
+/// state the game left off the wire is 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GiAnecdote {
+    /// 3 = recorded, 2 = in progress, 0 = idle (inferred, see the contract).
+    pub state: u32,
+    /// Times completed; above 1 only for the repeatable loops.
+    pub finish_count: u32,
+}
+
+/// `gi_anecdotes.reward`: every `target` recorded anecdotes trade for a reward.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GiAnecdoteReward {
+    /// Which exchange is next.
+    pub index: u32,
+    /// Anecdotes recorded toward it.
+    pub progress: u32,
+    /// Anecdotes it needs (10 in 7.1).
+    pub target: u32,
+}
+
+/// `gi_anecdotes.wish`: the NPC the player asked the book about.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GiAnecdoteWish {
+    /// Omitted when no wish is active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub npc_id: Option<u32>,
+    /// When the last wish was made, in unix seconds.
+    pub last_wish_time: u32,
 }
 
 /// Account values GOOD has no place for: `gi_player`.
@@ -356,6 +414,34 @@ mod tests {
                     obtained_at: Some(1_646_092_800),
                 },
             )])),
+            gi_anecdotes: Some(GiAnecdotes {
+                anecdotes: BTreeMap::from([
+                    (
+                        100_001,
+                        GiAnecdote {
+                            state: 3,
+                            finish_count: 1,
+                        },
+                    ),
+                    (
+                        101_604,
+                        GiAnecdote {
+                            state: 0,
+                            finish_count: 3,
+                        },
+                    ),
+                ]),
+                unlocked_areas: vec![1, 2, 3],
+                reward: Some(GiAnecdoteReward {
+                    index: 12,
+                    progress: 4,
+                    target: 10,
+                }),
+                wish: Some(GiAnecdoteWish {
+                    npc_id: Some(9801),
+                    last_wish_time: 1_791_000_000,
+                }),
+            }),
         };
 
         let json = serde_json::to_value(&good).expect("Good must serialize");
@@ -382,6 +468,7 @@ mod tests {
                 "format",
                 "gi_achievement_times",
                 "gi_achievements",
+                "gi_anecdotes",
                 "gi_characters",
                 "gi_player",
                 "materials",
@@ -481,6 +568,32 @@ mod tests {
             keys(&json["gi_characters"]["HuTao"]),
             ["friendship", "obtainedAt"]
         );
+
+        // `GI_ANECDOTES.md`: anecdote ids are object keys (strings); the
+        // state is written even when 0.
+        assert_eq!(
+            keys(&json["gi_anecdotes"]),
+            ["anecdotes", "reward", "unlockedAreas", "wish"]
+        );
+        assert_eq!(
+            json["gi_anecdotes"]["anecdotes"],
+            serde_json::json!({
+                "100001": { "state": 3, "finishCount": 1 },
+                "101604": { "state": 0, "finishCount": 3 },
+            })
+        );
+        assert_eq!(
+            json["gi_anecdotes"]["unlockedAreas"],
+            serde_json::json!([1, 2, 3])
+        );
+        assert_eq!(
+            json["gi_anecdotes"]["reward"],
+            serde_json::json!({ "index": 12, "progress": 4, "target": 10 })
+        );
+        assert_eq!(
+            json["gi_anecdotes"]["wish"],
+            serde_json::json!({ "npcId": 9801, "lastWishTime": 1_791_000_000 })
+        );
     }
 
     #[test]
@@ -503,6 +616,7 @@ mod tests {
             gi_player: None,
             gi_achievement_times: None,
             gi_characters: None,
+            gi_anecdotes: None,
         };
 
         let json = serde_json::to_value(&good).expect("Good must serialize");
@@ -512,6 +626,7 @@ mod tests {
         assert!(!object.contains_key("gi_player"));
         assert!(!object.contains_key("gi_achievement_times"));
         assert!(!object.contains_key("gi_characters"));
+        assert!(!object.contains_key("gi_anecdotes"));
     }
 
     #[test]
@@ -529,6 +644,32 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&character).unwrap(),
             r#"{"obtainedAt":1646092800}"#
+        );
+
+        // A book with no reward read and no wish made, and a wish with no NPC.
+        let book = GiAnecdotes {
+            anecdotes: BTreeMap::from([(
+                107_302,
+                GiAnecdote {
+                    state: 2,
+                    finish_count: 0,
+                },
+            )]),
+            unlocked_areas: vec![7],
+            reward: None,
+            wish: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&book).unwrap(),
+            r#"{"anecdotes":{"107302":{"state":2,"finishCount":0}},"unlockedAreas":[7]}"#
+        );
+        let wish = GiAnecdoteWish {
+            npc_id: None,
+            last_wish_time: 1_791_000_000,
+        };
+        assert_eq!(
+            serde_json::to_string(&wish).unwrap(),
+            r#"{"lastWishTime":1791000000}"#
         );
     }
 }
