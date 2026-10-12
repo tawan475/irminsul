@@ -333,9 +333,14 @@ impl DataReplacement {
         key: KeyState,
         classified: &[(u16, CommandMatch)],
     ) -> DataVerdict {
-        let replaces = classified
-            .iter()
-            .any(|(_, found)| !matches!(found, CommandMatch::DeletedItems(_)));
+        // A delete notify only removes from what is held, and the wish
+        // history messages are not account data at all.
+        let replaces = classified.iter().any(|(_, found)| {
+            !matches!(
+                found,
+                CommandMatch::DeletedItems(_) | CommandMatch::AuthKey(_) | CommandMatch::Wish(_)
+            )
+        });
         self.verdict(key, replaces)
     }
 }
@@ -898,6 +903,10 @@ pub struct Monitor {
     pcapng: Option<crate::pcapng::PcapngWriter>,
 
     ctx: egui::Context,
+
+    /// Where captured wish history keys and wishes go; see
+    /// [`crate::wish_history`].
+    wish_hub: Option<crate::wish_history::WishHub>,
 }
 
 impl Monitor {
@@ -990,7 +999,31 @@ impl Monitor {
             #[cfg(debug_assertions)]
             pcapng,
             ctx,
+            wish_hub: None,
         })
+    }
+
+    /// Hand wish history keys and wishes to `hub`.
+    pub(crate) fn with_wish_hub(mut self, hub: crate::wish_history::WishHub) -> Self {
+        self.wish_hub = Some(hub);
+        self
+    }
+
+    /// Take the wish history messages out of `classified` and hand them on.
+    ///
+    /// Not while replaying a recording: its key is old, and nothing may sync.
+    fn forward_wish_events(&self, classified: &mut Vec<(u16, CommandMatch)>) {
+        let events = crate::wish_history::take_wish_events(classified);
+        if events.is_empty() {
+            return;
+        }
+        if !uploads_allowed(&self.capture_source) {
+            tracing::debug!("not handing wish history messages on during a replay");
+            return;
+        }
+        if let Some(hub) = &self.wish_hub {
+            hub.forward(events);
+        }
     }
 
     pub async fn run(mut self) {
@@ -1467,6 +1500,10 @@ impl Monitor {
         if log_packets {
             for command in &commands {
                 let _span = tracing::info_span!("command", id = command.command_id).entered();
+                // The wish history key is a password: never on disk.
+                if auto_artifactarium::matches_get_authkey_rsp(&command.proto_data).is_some() {
+                    continue;
+                }
                 if let Err(e) = self.packet_log.append(command) {
                     tracing::info!("error logging command {e}");
                 }
@@ -1477,7 +1514,8 @@ impl Monitor {
         // connection's data has to be settled before its timestamps are taken,
         // because replacing restarts the automation cycle they are compared
         // against.
-        let classified = classify_commands(&commands);
+        let mut classified = classify_commands(&commands);
+        self.forward_wish_events(&mut classified);
         if classified.is_empty() {
             return;
         }

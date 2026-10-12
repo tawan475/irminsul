@@ -31,6 +31,7 @@ mod replay;
 mod signin;
 mod update;
 mod wish;
+mod wish_history;
 
 const APP_ID: &str = "Irminsul";
 
@@ -70,11 +71,10 @@ pub enum Message {
         oneshot::Sender<Result<(String, ExportCounts)>>,
     ),
     ExportAchievements(oneshot::Sender<Result<Vec<u32>>>),
-    /// Only sent by the wish UI, which exists on Windows and on Linux (through
-    /// a Proton/Wine prefix) — the platforms where the game writes the
-    /// `output_log.txt` the URL is recovered from. `monitor.rs` still handles
-    /// it everywhere.
-    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+    /// Look for the wish URL in the game's web cache: the wish UI's fallback
+    /// while no key has been captured from the traffic. The cache exists on
+    /// Windows and, through a Proton/Wine prefix, on Linux; elsewhere the
+    /// answer is an error saying so.
     FindWishUrl(oneshot::Sender<Result<String>>),
     VerifyTrackerKey(
         String,

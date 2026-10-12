@@ -285,7 +285,7 @@ fn find_wish_url(haystack: &str) -> Option<String> {
 /// The gacha URL's `authkey` grants read access to the account's entire wish
 /// history for roughly a day. `latest.log` is the file users are told to
 /// attach to public bug reports, so the raw URL must never be written to it.
-fn redact_url(url: &str) -> String {
+pub(crate) fn redact_url(url: &str) -> String {
     let Ok(mut parsed) = Url::parse(url) else {
         return "<unparsable wish url, redacted>".to_owned();
     };

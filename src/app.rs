@@ -30,7 +30,7 @@ type AsyncRuntimeHandles = (
     mpsc::UnboundedSender<Message>,
     mpsc::UnboundedSender<UpdateAnswer>,
     watch::Receiver<AppState>,
-    watch::Receiver<Option<String>>,
+    crate::wish_history::WishView,
     mpsc::UnboundedReceiver<(String, bool)>,
     JoinHandle<()>,
 );
@@ -552,8 +552,8 @@ pub struct IrminsulApp {
     /// what stops the update check from eating unrelated startup messages.
     update_answer_tx: mpsc::UnboundedSender<UpdateAnswer>,
     state_rx: watch::Receiver<AppState>,
-    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
-    wish_url_rx: watch::Receiver<Option<String>>,
+    /// The wish URL (built from a captured key, or scraped) and the sync.
+    wishes: crate::wish_history::WishView,
     log_packets_tx: watch::Sender<bool>,
     saved_state_tx: watch::Sender<SavedAppState>,
     tracing_reload_handle: ReloadHandle,
@@ -576,7 +576,6 @@ pub struct IrminsulApp {
     optimizer_settings_open: bool,
     optimizer_export_rx: Option<oneshot::Receiver<Result<(String, ExportCounts)>>>,
     achievements_export_rx: Option<oneshot::Receiver<Result<Vec<u32>>>>,
-    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
     wish_url_rx_oneshot: Option<oneshot::Receiver<Result<String>>>,
     wish_link_failed_for: Option<String>,
     pending_open_url: Option<String>,
@@ -873,6 +872,16 @@ fn start_async_runtime(
 
     let (state_tx, state_rx) = watch::channel(AppState::new());
     let (wish_url_tx, wish_url_rx) = watch::channel(None);
+    let crate::wish_history::WishChannels {
+        hub: wish_hub,
+        view: wish_view,
+        sync: wish_sync,
+    } = crate::wish_history::channels(
+        wish_url_rx,
+        saved_state_rx.clone(),
+        toast_tx.clone(),
+        egui_ctx.clone(),
+    );
     let mut updater_state_rx = state_rx.clone();
     let updater_ctx = egui_ctx.clone();
     let monitor_handle = thread::spawn(move || {
@@ -924,6 +933,9 @@ fn start_async_runtime(
                 }
             });
 
+            // Wish history from captured keys; ends with the monitor.
+            tokio::spawn(wish_sync.run());
+
             tracing::info!("Starting monitor");
             let monitor = match Monitor::new(
                 cancel_token,
@@ -939,7 +951,7 @@ fn start_async_runtime(
             )
             .await
             {
-                Ok(monitor) => monitor,
+                Ok(monitor) => monitor.with_wish_hub(wish_hub),
                 Err(e) => {
                     tracing::error!("error loading monitor task: {e}");
                     return;
@@ -953,7 +965,7 @@ fn start_async_runtime(
         ui_message_tx,
         update_answer_tx,
         state_rx,
-        wish_url_rx,
+        wish_view,
         toast_rx,
         monitor_handle,
     )
@@ -1004,7 +1016,7 @@ impl IrminsulApp {
         );
         let auth_status_rx = tracker_auth.status();
 
-        let (ui_message_tx, update_answer_tx, state_rx, wish_url_rx, toast_rx, monitor_handle) =
+        let (ui_message_tx, update_answer_tx, state_rx, wishes, toast_rx, monitor_handle) =
             start_async_runtime(
                 cancel_token.clone(),
                 cc.egui_ctx.clone(),
@@ -1197,7 +1209,7 @@ impl IrminsulApp {
             uid_match_logged: None,
             tray_icon,
             state_rx,
-            wish_url_rx,
+            wishes,
             minimize_modal_open: false,
             minimize_modal_remember: true,
             app_settings_open: false,
@@ -1541,7 +1553,6 @@ impl IrminsulApp {
     /// frame. Called once at the top of `update`.
     fn poll_background_results(&mut self, ctx: &Context) {
         self.optimizer_handle_export(ctx).toast_error(self);
-        #[cfg(any(windows, target_os = "linux"))]
         self.wish_handle_find_url(ctx).toast_error(self);
         self.achievements_handle_export(ctx).toast_error(self);
         self.poll_tracker_sign_in(ctx);
@@ -1788,15 +1799,11 @@ impl IrminsulApp {
         }
         self.capture_ui(ui, app_state);
         ui.separator();
-        // Wish history is recovered from the game's own `output_log.txt`, which
-        // exists on Windows and, through a Proton/Wine prefix, on Linux.
-        // Anywhere else the section could only ever be an empty box whose
-        // buttons always fail, so it is honestly absent instead.
-        #[cfg(any(windows, target_os = "linux"))]
-        {
-            self.wish_ui(ui);
-            ui.separator();
-        }
+        // The wish URL is built from the key the game sends when its wish
+        // history is opened, so the section works wherever capture does; the
+        // web-cache fallback is the part that needs a Windows or Wine client.
+        self.wish_ui(ui);
+        ui.separator();
         self.achievement_ui(ui, app_state);
         ui.separator();
         self.automation_ui(ui);
@@ -2124,21 +2131,23 @@ impl IrminsulApp {
         self.optimizer_export_rx = Some(rx);
     }
 
-    #[cfg(any(windows, target_os = "linux"))]
     fn wish_ui(&mut self, ui: &mut egui::Ui) {
-        let wish_url = self.wish_url_rx.borrow_and_update().clone();
+        let now = Instant::now();
+        let wish_url = self.wishes.wish_url(now);
         ui.vertical(|ui| {
             egui::Sides::new().show(
                 ui,
                 |ui| {
                     Self::section_header(ui, "Wish History");
-                    ui.label(egui_material_icons::icons::ICON_HELP)
-                        .on_hover_text("Click the Copy icon to copy the wish URL to the clipboard.  Paste this into paimon.moe using the Manual auto-import method.");
+                    ui.label(egui_material_icons::icons::ICON_HELP).on_hover_text(
+                        "Open Wish → History in game and Irminsul builds your wish URL.                          Click the Copy icon to copy it, then paste it into paimon.moe                          (Manual import) or StarDB. With the Tracker set up and uploads on,                          new wishes are sent to it as well.",
+                    );
                 },
                 |ui| {
                     ui.add_enabled_ui(self.wish_url_rx_oneshot.is_none(), |ui| {
                         if ui
                             .button(egui_material_icons::icons::ICON_CONTENT_PASTE_GO)
+                            .on_hover_text("Copy wish URL")
                             .clicked()
                         {
                             if let Some(url) = &wish_url {
@@ -2156,6 +2165,10 @@ impl IrminsulApp {
                     });
                 },
             );
+            ui.label(RichText::new(self.wishes.key_line(now)).weak());
+            if let Some(line) = self.wishes.sync_line() {
+                ui.label(RichText::new(line).weak());
+            }
             ui.horizontal(|ui| {
                 if ui.link("Open Paimon.moe").clicked() {
                     self.handle_wish_open_button(ui, wish_url.clone(), "https://paimon.moe/wish/import");
@@ -2173,7 +2186,6 @@ impl IrminsulApp {
     /// whole window for a full HTTPS round trip to
     /// `hk4e-api-os.hoyoverse.com` — indefinitely, on a network where that host
     /// is blackholed.
-    #[cfg(any(windows, target_os = "linux"))]
     fn wish_handle_find_url(&mut self, ctx: &Context) -> Result<()> {
         let url = match poll_oneshot(&mut self.wish_url_rx_oneshot) {
             Polled::Pending => return Ok(()),
@@ -2206,7 +2218,6 @@ impl IrminsulApp {
         Ok(())
     }
 
-    #[cfg(any(windows, target_os = "linux"))]
     fn handle_wish_open_button(
         &mut self,
         ui: &mut egui::Ui,

@@ -1,0 +1,618 @@
+//! The sync run against a fake wish history API and a fake tracker, both
+//! served in process by [`TestServer`]. Every record and key here is
+//! synthetic (UID 811111111).
+
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+
+use super::Banner;
+use super::gacha_log::{LogClient, Pacing, Sleeper, WishKey};
+use super::run::{Partial, Run, RunError, RunReport};
+use super::test_server::{Reply, Request, TestServer};
+use super::tracker::{Tracker, TrackerCredential};
+
+const AUTHKEY: &str = "SyNtHeTiCwIsHkEy+0123456789/abcdefghij==";
+const IMPORT_KEY: &str = "gdt_uk_synthetic";
+const UID: &str = "811111111";
+const LOG_PATH: &str = "/gacha_info/api/getGachaLog";
+
+fn id_of(banner: Banner, index: u64) -> u64 {
+    // Newest first: index 0 is the newest record of the banner.
+    1_790_000_000_000_000_000 + u64::from(banner) * 100_000 - index
+}
+
+fn record(banner: Banner, index: u64, uid: &str) -> Value {
+    let gacha_type = if banner == 301 && index % 2 == 1 {
+        "400".to_owned()
+    } else {
+        banner.to_string()
+    };
+    json!({
+        "uid": uid, "gacha_type": gacha_type, "item_id": "", "count": "1",
+        "time": "2026-10-12 21:04:11", "name": format!("Item {index}"), "lang": "en-us",
+        "item_type": "Weapon", "rank_type": "3", "id": id_of(banner, index).to_string(),
+    })
+}
+
+/// What the fake API and tracker hold and do.
+struct World {
+    history: BTreeMap<Banner, Vec<Value>>,
+    /// The tracker's newest id per banner.
+    newest: BTreeMap<Banner, u64>,
+    /// Answers to override, by the number of the log request (1-based).
+    faults: BTreeMap<usize, Reply>,
+    /// The tracker's answer to the cursor, if not the cursor.
+    cursor_reply: Option<Reply>,
+    import_status: u16,
+    log_requests: usize,
+}
+
+impl World {
+    fn new(counts: &[(Banner, u64)]) -> Self {
+        let history = counts
+            .iter()
+            .map(|&(banner, count)| {
+                (
+                    banner,
+                    (0..count).map(|index| record(banner, index, UID)).collect(),
+                )
+            })
+            .collect();
+        Self {
+            history,
+            newest: BTreeMap::new(),
+            faults: BTreeMap::new(),
+            cursor_reply: None,
+            import_status: 200,
+            log_requests: 0,
+        }
+    }
+
+    fn answer(&mut self, request: &Request) -> Reply {
+        if request.path == LOG_PATH {
+            self.log_requests += 1;
+            if let Some(reply) = self.faults.remove(&self.log_requests) {
+                return reply;
+            }
+            let banner: Banner = request.param("gacha_type").unwrap().parse().unwrap();
+            let size: usize = request.param("size").unwrap().parse().unwrap();
+            let end_id: u64 = request.param("end_id").unwrap().parse().unwrap();
+            let list: Vec<Value> = self
+                .history
+                .get(&banner)
+                .into_iter()
+                .flatten()
+                .filter(|record| {
+                    end_id == 0 || record["id"].as_str().unwrap().parse::<u64>().unwrap() < end_id
+                })
+                .take(size)
+                .cloned()
+                .collect();
+            return Reply::json(
+                200,
+                json!({"retcode": 0, "message": "OK", "data": {
+                    "page": request.param("page").unwrap(), "size": size.to_string(),
+                    "region": "os_asia", "list": list,
+                }})
+                .to_string(),
+            );
+        }
+        if request.path == "/api/wishes/cursor" {
+            if let Some(reply) = self.cursor_reply.take() {
+                return reply;
+            }
+            let mut newest = serde_json::Map::new();
+            for banner in super::BANNERS {
+                let value = match self.newest.get(&banner) {
+                    Some(id) => Value::String(id.to_string()),
+                    None => Value::Null,
+                };
+                newest.insert(banner.to_string(), value);
+            }
+            return Reply::json(
+                200,
+                json!({"uid": request.param("uid"), "accountId": 12, "newest": newest}).to_string(),
+            );
+        }
+        if request.path == "/api/wishes/import" {
+            if self.import_status != 200 {
+                return Reply::json(
+                    self.import_status,
+                    r#"{"error":{"code":"daily_upload_limit","message":"Try again tomorrow"}}"#,
+                );
+            }
+            let body: Value = serde_json::from_str(&request.body).unwrap();
+            let records = body["records"].as_array().unwrap();
+            for record in records {
+                let id: u64 = record["id"].as_str().unwrap().parse().unwrap();
+                let banner = match record["gacha_type"].as_str().unwrap() {
+                    "400" => 301,
+                    other => other.parse().unwrap(),
+                };
+                let newest = self.newest.entry(banner).or_insert(0);
+                *newest = (*newest).max(id);
+            }
+            return Reply::json(
+                200,
+                json!({"accountId": 12, "added": records.len(), "known": 0, "newest": {}})
+                    .to_string(),
+            );
+        }
+        Reply::json(404, r#"{"error":{"code":"not_found"}}"#)
+    }
+}
+
+/// Waits nothing, remembers what it was asked to wait.
+#[derive(Clone, Default)]
+struct RecordingSleeper(Arc<Mutex<Vec<Duration>>>);
+
+impl Sleeper for RecordingSleeper {
+    fn sleep(&self, duration: Duration) -> impl Future<Output = ()> + Send {
+        self.0.lock().unwrap().push(duration);
+        std::future::ready(())
+    }
+}
+
+impl RecordingSleeper {
+    fn waits(&self) -> Vec<Duration> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+struct Fixture {
+    world: Arc<Mutex<World>>,
+    server: TestServer,
+    sleeper: RecordingSleeper,
+    partials: BTreeMap<Banner, Partial>,
+    page_cap: u32,
+}
+
+impl Fixture {
+    fn new(world: World) -> Self {
+        let world = Arc::new(Mutex::new(world));
+        let served = Arc::clone(&world);
+        let server = TestServer::start(move |request| served.lock().unwrap().answer(request));
+        Self {
+            world,
+            server,
+            sleeper: RecordingSleeper::default(),
+            partials: BTreeMap::new(),
+            page_cap: super::run::PAGES_PER_RUN,
+        }
+    }
+
+    fn world(&self) -> std::sync::MutexGuard<'_, World> {
+        self.world.lock().unwrap()
+    }
+
+    async fn run(&mut self, banners: &[Banner]) -> RunReport {
+        capture_logs();
+        let http = crate::http_client_builder().build().unwrap();
+        let mut log = LogClient::new(
+            http.clone(),
+            format!("{}{LOG_PATH}", self.server.base),
+            WishKey::new(AUTHKEY, "hk4e_global", Instant::now()),
+            self.sleeper.clone(),
+            Pacing {
+                request: Duration::from_secs(1),
+                banner: Duration::from_secs(2),
+                backoff: vec![Duration::from_secs(5), Duration::from_secs(15)],
+            },
+        );
+        let tracker = Tracker {
+            http,
+            base_url: format!("{}/api/", self.server.base),
+            credential: TrackerCredential::ImportKey(IMPORT_KEY.to_owned()),
+        };
+        let progress = |_: Banner, _: u32| {};
+        let report = Run::new(&mut log, &tracker, &progress, self.page_cap)
+            .sync(banners, &mut self.partials)
+            .await;
+        // No key anywhere: not in the outcome, not in a log line, not in
+        // anything sent to the tracker.
+        let rendered = format!("{report:?} {:?}", self.partials);
+        assert!(!rendered.contains("SyNtHeTiC"), "{rendered}");
+        assert!(
+            !logs().contains("SyNtHeTiC"),
+            "the key reached the log: {}",
+            logs()
+        );
+        for request in self.requests("/api/") {
+            assert!(!request.raw().contains("SyNtHeTiC"), "{}", request.raw());
+        }
+        report
+    }
+
+    fn requests(&self, prefix: &str) -> Vec<Request> {
+        self.server
+            .requests()
+            .into_iter()
+            .filter(|request| request.path.starts_with(prefix))
+            .collect()
+    }
+
+    fn log_requests(&self) -> Vec<(Banner, u32, u64)> {
+        self.requests(LOG_PATH)
+            .iter()
+            .map(|request| {
+                (
+                    request.param("gacha_type").unwrap().parse().unwrap(),
+                    request.param("page").unwrap().parse().unwrap(),
+                    request.param("end_id").unwrap().parse().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn imports(&self) -> Vec<Value> {
+        self.requests("/api/wishes/import")
+            .iter()
+            .map(|request| serde_json::from_str(&request.body).unwrap())
+            .collect()
+    }
+
+    fn imported_ids(&self) -> Vec<u64> {
+        self.imports()
+            .iter()
+            .flat_map(|body| body["records"].as_array().unwrap().clone())
+            .map(|record| record["id"].as_str().unwrap().parse().unwrap())
+            .collect()
+    }
+}
+
+/// Every log line of the test binary, whichever test logged it.
+fn logs() -> String {
+    String::from_utf8_lossy(&LOGS.lock().unwrap()).into_owned()
+}
+
+static LOGS: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+struct LogWriter;
+
+impl Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        LOGS.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Route every event at every level to [`LOGS`].
+fn capture_logs() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(|| LogWriter)
+            .with_ansi(false)
+            .try_init();
+    });
+}
+
+const ALL: [Banner; 5] = super::BANNERS;
+
+#[tokio::test]
+async fn one_page_per_banner_when_nothing_is_new() {
+    let mut world = World::new(&[(301, 30), (200, 5)]);
+    world.newest.insert(301, id_of(301, 0));
+    world.newest.insert(200, id_of(200, 0));
+    let mut fixture = Fixture::new(world);
+
+    let report = fixture.run(&ALL).await;
+
+    assert_eq!(report.error, None);
+    assert_eq!(report.sent, 0);
+    assert_eq!(
+        fixture.log_requests(),
+        vec![
+            (301, 1, 0),
+            (302, 1, 0),
+            (500, 1, 0),
+            (200, 1, 0),
+            (100, 1, 0)
+        ]
+    );
+    assert_eq!(fixture.requests("/api/wishes/cursor").len(), 1);
+    assert!(fixture.imports().is_empty());
+    // A second between pages would be owed; between banners it is two.
+    assert_eq!(fixture.sleeper.waits(), vec![Duration::from_secs(2); 4]);
+}
+
+#[tokio::test]
+async fn pages_until_a_record_the_tracker_has_and_sends_only_the_new_ones() {
+    let mut world = World::new(&[(301, 45)]);
+    world.newest.insert(301, id_of(301, 42));
+    let mut fixture = Fixture::new(world);
+
+    let report = fixture.run(&[301]).await;
+
+    assert_eq!(report.error, None);
+    assert_eq!(report.sent, 42);
+    assert_eq!(report.imported.added, 42);
+    assert_eq!(report.uid.as_deref(), Some(UID));
+    assert_eq!(
+        fixture.log_requests(),
+        vec![
+            (301, 1, 0),
+            (301, 2, id_of(301, 19)),
+            (301, 3, id_of(301, 39)),
+        ]
+    );
+    assert_eq!(
+        fixture.sleeper.waits(),
+        vec![Duration::from_secs(1), Duration::from_secs(1)]
+    );
+
+    // Oldest first, exactly the 42 new ones.
+    let ids = fixture.imported_ids();
+    let expected: Vec<u64> = (0..42).rev().map(|index| id_of(301, index)).collect();
+    assert_eq!(ids, expected);
+
+    let cursor = &fixture.requests("/api/wishes/cursor")[0];
+    assert_eq!(cursor.param("uid"), Some(UID));
+    assert_eq!(cursor.header("x-import-key"), Some(IMPORT_KEY));
+    let import = &fixture.requests("/api/wishes/import")[0];
+    assert_eq!(import.header("x-import-key"), Some(IMPORT_KEY));
+    assert_eq!(import.method, "POST");
+}
+
+#[tokio::test]
+async fn the_import_body_follows_the_contract() {
+    let mut fixture = Fixture::new(World::new(&[(301, 2)]));
+    fixture.run(&[301]).await;
+
+    let body = &fixture.imports()[0];
+    assert_eq!(body["uid"], UID);
+    assert_eq!(body["region"], "os_asia");
+    assert_eq!(body["lang"], "en-us");
+    assert_eq!(body["timezone"], 8);
+    // The older record is the 400 one, and it keeps its own banner type.
+    assert_eq!(
+        body["records"][0],
+        json!({
+            "id": id_of(301, 1).to_string(), "gacha_type": "400",
+            "time": "2026-10-12 21:04:11", "name": "Item 1", "item_type": "Weapon",
+            "rank_type": "3", "item_id": "",
+        })
+    );
+    assert_eq!(body["records"][1]["gacha_type"], "301");
+    let keys: Vec<&String> = body.as_object().unwrap().keys().collect();
+    assert_eq!(keys.len(), 5, "{keys:?}");
+}
+
+#[tokio::test]
+async fn an_empty_page_ends_a_banner_the_tracker_has_nothing_of() {
+    let mut fixture = Fixture::new(World::new(&[(302, 30)]));
+
+    let report = fixture.run(&[302]).await;
+
+    assert_eq!(report.error, None);
+    assert_eq!(report.sent, 30);
+    assert_eq!(
+        fixture.log_requests(),
+        vec![
+            (302, 1, 0),
+            (302, 2, id_of(302, 19)),
+            (302, 3, id_of(302, 29)),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn an_expired_key_stops_the_run_and_the_next_key_finishes_without_a_gap() {
+    let mut world = World::new(&[(301, 45), (302, 3)]);
+    world.faults.insert(
+        2,
+        Reply::json(
+            200,
+            r#"{"retcode":-101,"message":"authkey timeout","data":null}"#,
+        ),
+    );
+    let mut fixture = Fixture::new(world);
+
+    let report = fixture.run(&[301, 302]).await;
+
+    assert_eq!(report.error, Some(RunError::KeyExpired));
+    // Half a banner is not sent: the tracker would then hide the other half.
+    assert!(fixture.imports().is_empty());
+    assert_eq!(report.unfinished, vec![301]);
+    assert_eq!(fixture.log_requests().len(), 2, "nothing after the timeout");
+
+    let report = fixture.run(&[301, 302]).await;
+
+    assert_eq!(report.error, None);
+    assert_eq!(report.sent, 48);
+    assert!(report.unfinished.is_empty());
+    let mut ids = fixture.imported_ids();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 48);
+    // The second run read page 1 to see what is new above the part it had,
+    // then carried on from where the first run stopped.
+    assert_eq!(
+        fixture.log_requests()[2..5],
+        [
+            (301, 1, 0),
+            (301, 2, id_of(301, 19)),
+            (301, 3, id_of(301, 39)),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_page_cap_hands_the_rest_to_the_next_run() {
+    let mut fixture = Fixture::new(World::new(&[(301, 50)]));
+    fixture.page_cap = 2;
+
+    let report = fixture.run(&[301]).await;
+
+    assert_eq!(report.error, None);
+    assert_eq!(report.sent, 0);
+    assert_eq!(report.unfinished, vec![301]);
+    assert_eq!(fixture.log_requests().len(), 2);
+
+    let report = fixture.run(&[301]).await;
+
+    assert_eq!(report.sent, 50);
+    assert!(report.unfinished.is_empty());
+    assert_eq!(
+        fixture.log_requests()[2..],
+        [
+            (301, 1, 0),
+            (301, 3, id_of(301, 39)),
+            (301, 4, id_of(301, 49)),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn new_wishes_above_an_unfinished_part_are_read_first() {
+    let mut fixture = Fixture::new(World::new(&[(301, 50)]));
+    fixture.page_cap = 2;
+    fixture.run(&[301]).await;
+
+    // Three wishes are made before the next run.
+    {
+        let mut world = fixture.world();
+        let records = world.history.get_mut(&301).unwrap();
+        for extra in 1..=3u64 {
+            let mut newer = record(301, 0, UID);
+            newer["id"] = Value::String((id_of(301, 0) + extra).to_string());
+            records.insert(0, newer);
+        }
+    }
+
+    let report = fixture.run(&[301]).await;
+
+    assert_eq!(report.sent, 53);
+    let mut ids = fixture.imported_ids();
+    ids.dedup();
+    assert_eq!(ids.len(), 53);
+}
+
+#[tokio::test]
+async fn throttling_backs_off_and_retries() {
+    let mut world = World::new(&[(301, 3)]);
+    world.faults.insert(
+        1,
+        Reply::json(
+            200,
+            r#"{"retcode":-110,"message":"visit too frequently","data":null}"#,
+        ),
+    );
+    world.faults.insert(2, Reply::json(429, "{}"));
+    let mut fixture = Fixture::new(world);
+
+    let report = fixture.run(&[301]).await;
+
+    assert_eq!(report.error, None);
+    assert_eq!(report.sent, 3);
+    assert_eq!(
+        fixture.sleeper.waits(),
+        vec![
+            Duration::from_secs(5),
+            Duration::from_secs(15),
+            Duration::from_secs(1),
+        ]
+    );
+    // The log capture works, so "no key in the log" above means something.
+    assert!(logs().contains("retrying in 15s"), "{}", logs());
+}
+
+#[tokio::test]
+async fn an_api_that_keeps_failing_ends_the_run_without_the_key_in_the_error() {
+    let mut world = World::new(&[(301, 3)]);
+    for n in 1..=3 {
+        world.faults.insert(n, Reply::json(502, "bad gateway"));
+    }
+    let mut fixture = Fixture::new(world);
+
+    let report = fixture.run(&[301, 302]).await;
+
+    let Some(RunError::Api(why)) = &report.error else {
+        panic!("expected an API error, got {:?}", report.error);
+    };
+    assert!(why.contains("502"), "{why}");
+    assert_eq!(fixture.log_requests().len(), 3, "two retries, then give up");
+    assert!(fixture.requests("/api/").is_empty());
+}
+
+#[tokio::test]
+async fn records_of_two_uids_are_not_sent() {
+    let mut world = World::new(&[(301, 3)]);
+    world
+        .history
+        .get_mut(&301)
+        .unwrap()
+        .push(record(301, 3, "822222222"));
+    let mut fixture = Fixture::new(world);
+
+    let report = fixture.run(&[301]).await;
+
+    assert!(
+        matches!(report.error, Some(RunError::Data(_))),
+        "{report:?}"
+    );
+    assert!(fixture.requests("/api/").is_empty());
+}
+
+#[tokio::test]
+async fn a_tracker_refusal_stops_the_run_with_its_code() {
+    let mut world = World::new(&[(301, 3), (302, 3)]);
+    world.cursor_reply = Some(Reply::json(
+        409,
+        r#"{"error":{"code":"uid_mismatch","message":"This key is for another UID"}}"#,
+    ));
+    let mut fixture = Fixture::new(world);
+
+    let report = fixture.run(&[301, 302]).await;
+
+    assert_eq!(
+        report.error,
+        Some(RunError::Tracker(
+            "tracker: HTTP 409 uid_mismatch (This key is for another UID)".to_owned()
+        ))
+    );
+    assert_eq!(fixture.log_requests(), vec![(301, 1, 0)]);
+    assert!(fixture.imports().is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_import_keeps_nothing_it_did_not_send() {
+    let mut world = World::new(&[(301, 50), (302, 3)]);
+    world.import_status = 429;
+    let mut fixture = Fixture::new(world);
+    fixture.page_cap = 2;
+
+    let report = fixture.run(&[301, 302]).await;
+
+    assert!(
+        matches!(&report.error, Some(RunError::Tracker(why)) if why.contains("daily_upload_limit")),
+        "{report:?}"
+    );
+    // 301 stopped at the cap; with the import of 302 refused, the run keeps no
+    // part of it, and the next run starts over from the tracker's cursor.
+    assert!(fixture.partials.is_empty());
+}
+
+#[tokio::test]
+async fn more_than_one_import_request_of_records_is_chunked_oldest_first() {
+    let mut fixture = Fixture::new(World::new(&[(301, 2_050)]));
+    fixture.page_cap = 200;
+
+    let report = fixture.run(&[301]).await;
+
+    assert_eq!(report.sent, 2_050);
+    let imports = fixture.imports();
+    assert_eq!(imports.len(), 2);
+    assert_eq!(imports[0]["records"].as_array().unwrap().len(), 2_000);
+    assert_eq!(imports[1]["records"].as_array().unwrap().len(), 50);
+    let ids = fixture.imported_ids();
+    assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+}
