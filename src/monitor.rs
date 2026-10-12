@@ -336,10 +336,7 @@ impl DataReplacement {
         // A delete notify only removes from what is held, and the wish
         // history messages are not account data at all.
         let replaces = classified.iter().any(|(_, found)| {
-            !matches!(
-                found,
-                CommandMatch::DeletedItems(_) | CommandMatch::AuthKey(_) | CommandMatch::Wish(_)
-            )
+            found.is_account_data() && !matches!(found, CommandMatch::DeletedItems(_))
         });
         self.verdict(key, replaces)
     }
@@ -1022,7 +1019,8 @@ impl Monitor {
             return;
         }
         if let Some(hub) = &self.wish_hub {
-            hub.forward(events);
+            let uid = self.player_data.gi_player().and_then(|player| player.uid);
+            hub.forward(events, uid);
         }
     }
 

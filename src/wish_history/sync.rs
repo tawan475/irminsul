@@ -414,11 +414,14 @@ mod tests {
         );
         let channels =
             super::super::channels(url_rx, state_rx, toast_tx, egui::Context::default(), auth);
-        channels.hub.forward(vec![WishEvent::Key(GachaAuthKey::new(
-            "GGGG",
-            "webview_gacha",
-            "hk4e_global",
-        ))]);
+        channels.hub.forward(
+            vec![WishEvent::Key(GachaAuthKey::new(
+                "GGGG",
+                "webview_gacha",
+                "hk4e_global",
+            ))],
+            None,
+        );
         let now = Instant::now();
         let key = channels.view.key(now).expect("the key was captured");
         let mut sync = channels.sync;

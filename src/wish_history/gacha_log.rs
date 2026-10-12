@@ -39,15 +39,53 @@ const RETCODE_AUTHKEY_TIMEOUT: i64 = -101;
 /// The retcode of "visit too frequently".
 const RETCODE_TOO_FREQUENT: i64 = -110;
 
-/// A wish history key captured from the game, with when it arrived.
+/// The start of the link's query when no banner list was seen: the history
+/// link's fixed parameters, as the game writes them, without the banner's
+/// `gacha_id` and `timestamp` (the API does not need them).
+pub(crate) const FALLBACK_RECORD_QUERY: &str = "win_mode=fullscreen&no_joypad_close=1&authkey_ver=1\
+     &sign_type=2&auth_appid=webview_gacha&init_type=301";
+
+/// What the game puts in the wish history link besides the key, as captured
+/// before the key arrived. Nothing here is secret.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LinkParts {
+    /// The history link query the server gave the banner (`GetGachaInfoRsp`):
+    /// `win_mode=…&init_type=301&gacha_id=…&timestamp=…`, verbatim.
+    pub(crate) record_query: Option<String>,
+    /// The client's version (`game_version`), from its login.
+    pub(crate) game_version: Option<String>,
+    /// The server region (`region`): `os_asia`, `os_usa`, `os_euro`,
+    /// `os_cht`, `cn_gf01`, `cn_qd01`.
+    pub(crate) region: Option<String>,
+}
+
+/// Percent-encode a query value the way the game does: everything but
+/// `A-Z a-z 0-9 - _ . ~`, with lowercase hex (`%2f`, `%2b`, `%3d`).
+pub(crate) fn encode_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() * 3 / 2);
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02x}"));
+        }
+    }
+    out
+}
+
+/// A wish history key captured from the game, with when it arrived and what
+/// the game's link carries besides it.
 ///
 /// Memory only: never logged (its `Debug` prints no key), never persisted,
 /// never sent anywhere but the game's own API.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct WishKey {
     authkey: String,
+    /// Chooses the endpoint (`hk4e_cn` → the Chinese one). The link itself
+    /// carries an empty `game_biz=`, as the game's does.
     game_biz: String,
     received_at: Instant,
+    link: LinkParts,
 }
 
 impl WishKey {
@@ -56,7 +94,13 @@ impl WishKey {
             authkey: authkey.to_owned(),
             game_biz: game_biz.to_owned(),
             received_at,
+            link: LinkParts::default(),
         }
+    }
+
+    pub(crate) fn with_link(mut self, link: LinkParts) -> Self {
+        self.link = link;
+        self
     }
 
     /// Whether this is the same key as `other`, whenever each arrived.
@@ -82,24 +126,48 @@ impl WishKey {
         }
     }
 
-    /// The wish URL people paste into paimon.moe ("Manual" import) or stardb.
+    /// The wish URL people paste into paimon.moe ("Manual" import) or
+    /// stardb: the link the game itself writes when its history opens.
     pub(crate) fn wish_url(&self) -> String {
-        self.url_at(self.endpoint(), &[]).into()
+        format!("{}?{}", self.endpoint(), self.link_query())
     }
 
-    /// The URL with the contract's fixed parameters, then `extra`.
+    /// The game's link query, in the game's order and encoding: the banner's
+    /// history link query (or [`FALLBACK_RECORD_QUERY`]), then `lang=en`,
+    /// `device_type=pc`, `game_version`, `region` (each left out when it was
+    /// not captured), the key and an empty `game_biz`.
+    fn link_query(&self) -> String {
+        let link = &self.link;
+        let mut query = link
+            .record_query
+            .clone()
+            .unwrap_or_else(|| FALLBACK_RECORD_QUERY.to_owned());
+        query.push_str("&lang=en&device_type=pc");
+        if let Some(version) = &link.game_version {
+            query.push_str("&game_version=");
+            query.push_str(&encode_value(version));
+        }
+        if let Some(region) = &link.region {
+            query.push_str("&region=");
+            query.push_str(&encode_value(region));
+        }
+        query.push_str("&authkey=");
+        query.push_str(&encode_value(&self.authkey));
+        query.push_str("&game_biz=");
+        query
+    }
+
+    /// The game's link on `endpoint`, then `extra` (what paimon.moe sets on
+    /// it to page: `gacha_type`, `size`, `page`, `end_id`).
     pub(crate) fn url_at(&self, endpoint: &str, extra: &[(&str, &str)]) -> Url {
-        let mut url = Url::parse(endpoint).expect("the wish history endpoints are valid URLs");
-        url.query_pairs_mut()
-            .append_pair("authkey_ver", "1")
-            .append_pair("sign_type", "2")
-            .append_pair("auth_appid", "webview_gacha")
-            .append_pair("init_type", "301")
-            .append_pair("lang", "en-us")
-            .append_pair("authkey", &self.authkey)
-            .append_pair("game_biz", &self.game_biz)
-            .extend_pairs(extra);
-        url
+        let mut url = format!("{endpoint}?{}", self.link_query());
+        for (name, value) in extra {
+            url.push('&');
+            url.push_str(name);
+            url.push('=');
+            url.push_str(&encode_value(value));
+        }
+        Url::parse(&url).expect("the wish history endpoints are valid URLs")
     }
 }
 
@@ -109,6 +177,7 @@ impl fmt::Debug for WishKey {
             .field("authkey", &"<redacted>")
             .field("game_biz", &self.game_biz)
             .field("received_at", &self.received_at)
+            .field("link", &self.link)
             .finish()
     }
 }
@@ -396,14 +465,50 @@ mod tests {
         WishKey::new(AUTHKEY, biz, Instant::now())
     }
 
+    /// What the game captured before the key: the banner's history link
+    /// query, the client version, the region. Synthetic values.
+    fn captured() -> LinkParts {
+        LinkParts {
+            record_query: Some(
+                "win_mode=fullscreen&no_joypad_close=1&authkey_ver=1&sign_type=2\
+                 &auth_appid=webview_gacha&init_type=301\
+                 &gacha_id=0123456789abcdef0123456789abcdef01234567&timestamp=1790000000"
+                    .to_owned(),
+            ),
+            game_version: Some("OSRELWin7.1.0_R11111111_S22222222_D33333333".to_owned()),
+            region: Some("os_asia".to_owned()),
+        }
+    }
+
     #[test]
-    fn the_global_url_carries_the_contracts_parameters_in_order() {
+    fn the_url_is_the_games_own_link_in_its_order_and_encoding() {
+        assert_eq!(
+            key("hk4e_global").with_link(captured()).wish_url(),
+            "https://public-operation-hk4e-sg.hoyoverse.com/gacha_info/api/getGachaLog\
+             ?win_mode=fullscreen&no_joypad_close=1&authkey_ver=1&sign_type=2\
+             &auth_appid=webview_gacha&init_type=301\
+             &gacha_id=0123456789abcdef0123456789abcdef01234567&timestamp=1790000000\
+             &lang=en&device_type=pc&game_version=OSRELWin7.1.0_R11111111_S22222222_D33333333\
+             &region=os_asia&authkey=SyNtHeTiC%2btEsT%2fkEy%3d%3d&game_biz="
+        );
+    }
+
+    #[test]
+    fn what_was_not_captured_is_left_out_of_the_url() {
         assert_eq!(
             key("hk4e_global").wish_url(),
             "https://public-operation-hk4e-sg.hoyoverse.com/gacha_info/api/getGachaLog\
-             ?authkey_ver=1&sign_type=2&auth_appid=webview_gacha&init_type=301&lang=en-us\
-             &authkey=SyNtHeTiC%2BtEsT%2FkEy%3D%3D&game_biz=hk4e_global"
+             ?win_mode=fullscreen&no_joypad_close=1&authkey_ver=1&sign_type=2\
+             &auth_appid=webview_gacha&init_type=301&lang=en&device_type=pc\
+             &authkey=SyNtHeTiC%2btEsT%2fkEy%3d%3d&game_biz="
         );
+    }
+
+    #[test]
+    fn values_are_encoded_like_the_game_with_lowercase_hex() {
+        assert_eq!(encode_value("a+b/c=d"), "a%2bb%2fc%3dd");
+        assert_eq!(encode_value("Az09-_.~"), "Az09-_.~");
+        assert_eq!(encode_value("a b&c"), "a%20b%26c");
     }
 
     #[test]
@@ -413,7 +518,27 @@ mod tests {
             url.starts_with("https://public-operation-hk4e.mihoyo.com/gacha_info/api/getGachaLog?"),
             "{url}"
         );
-        assert!(url.ends_with("&game_biz=hk4e_cn"), "{url}");
+        // Like the game's own link: the game is named by the host, and the
+        // parameter stays empty.
+        assert!(url.ends_with("&game_biz="), "{url}");
+    }
+
+    #[test]
+    fn requests_keep_the_link_byte_for_byte_and_add_the_paging() {
+        let key = key("hk4e_global").with_link(captured());
+        let url = key.url_at(
+            GLOBAL_LOG_URL,
+            &[
+                ("gacha_type", "301"),
+                ("size", "20"),
+                ("page", "2"),
+                ("end_id", "17"),
+            ],
+        );
+        assert_eq!(
+            url.as_str(),
+            format!("{}&gacha_type=301&size=20&page=2&end_id=17", key.wish_url())
+        );
     }
 
     #[test]
@@ -424,24 +549,6 @@ mod tests {
             .find(|(name, _)| name == "authkey")
             .map(|(_, value)| value.into_owned());
         assert_eq!(authkey.as_deref(), Some(AUTHKEY));
-    }
-
-    #[test]
-    fn a_page_request_adds_the_paging_parameters() {
-        let url = key("hk4e_global").url_at(
-            GLOBAL_LOG_URL,
-            &[
-                ("gacha_type", "301"),
-                ("size", "20"),
-                ("page", "2"),
-                ("end_id", "17"),
-            ],
-        );
-        assert!(
-            url.as_str()
-                .ends_with("&game_biz=hk4e_global&gacha_type=301&size=20&page=2&end_id=17"),
-            "{url}"
-        );
     }
 
     #[test]
