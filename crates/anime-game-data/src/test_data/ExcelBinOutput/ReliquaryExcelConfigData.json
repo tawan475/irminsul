@@ -1,0 +1,53 @@
+[
+  {
+    "addPropLevels": [
+      5,
+      9,
+      13,
+      17,
+      21
+    ],
+    "appendPropDepotId": 501,
+    "appendPropNum": 4,
+    "baseConvExp": 3780,
+    "descTextMapHash": 1860612512,
+    "destroyReturnMaterial": [],
+    "destroyReturnMaterialCount": [],
+    "destroyRule": "DESTROY_NONE",
+    "dropable": false,
+    "equipType": "EQUIP_DRESS",
+    "gadgetId": 70600045,
+    "globalItemLimit": 0,
+    "icon": "UI_RelicIcon_15031_3",
+    "id": 31534,
+    "initialLockState": 0,
+    "itemType": "ITEM_RELIQUARY",
+    "mainPropDepotId": 3000,
+    "maxLevel": 21,
+    "nameTextMapHash": 3162521596,
+    "rank": 10,
+    "rankLevel": 5,
+    "setId": 15031,
+    "showPic": "Eff_UI_RelicIcon_15031_3",
+    "storyId": 185313,
+    "useLevel": 0,
+    "weight": 1
+  },
+  {
+    "appendPropDepotId": 101,
+    "baseConvExp": 420,
+    "descTextMapHash": 1560366496,
+    "equipType": "EQUIP_NECKLACE",
+    "gadgetId": 70600041,
+    "icon": "UI_RelicIcon_10000_2",
+    "id": 20002,
+    "itemType": "ITEM_RELIQUARY",
+    "mainPropDepotId": 2000,
+    "maxLevel": 1,
+    "nameTextMapHash": 3920301092,
+    "rank": 10,
+    "rankLevel": 1,
+    "showPic": "Eff_UI_RelicIcon_10000_2",
+    "weight": 1
+  }
+]

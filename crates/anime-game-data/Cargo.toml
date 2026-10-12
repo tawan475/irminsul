@@ -1,0 +1,36 @@
+[package]
+name = "anime-game-data"
+version = "0.1.0"
+edition = "2024"
+authors = ["Erik Gilling <konkers@konkers.net>"]
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0.99"
+clap = { version = "4.5.46", features = ["derive"], optional = true }
+reqwest = { version = "0.12.23", features = ["gzip", "json"] }
+serde = { version = "1.0.219", features = ["derive", "alloc"] }
+serde_json = { version = "1.0.143", features = ["alloc"] }
+tokio = { version = "1.47.1", features = [
+	"rt",
+	"tokio-macros",
+	"macros",
+	"rt-multi-thread",
+], optional = true }
+tracing = "0.1.41"
+
+[dev-dependencies]
+tempfile = "3.21.0"
+tokio = { version = "1.47.1", features = [
+	"rt",
+	"tokio-macros",
+	"macros",
+	"rt-multi-thread",
+] }
+
+[features]
+cli = ["dep:clap", "dep:tokio"]
+
+[[bin]]
+name = "anime-game-data"
+required-features = ["cli"]

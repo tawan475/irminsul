@@ -196,12 +196,14 @@ dependencies = [
 [[package]]
 name = "anime-game-data"
 version = "0.1.0"
-source = "git+https://github.com/konkers/anime-game-data?rev=dfc03cdb5e27807a876b8d4dff17b3f67a320f5c#dfc03cdb5e27807a876b8d4dff17b3f67a320f5c"
 dependencies = [
  "anyhow",
+ "clap",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
+ "tokio",
  "tracing",
 ]
 

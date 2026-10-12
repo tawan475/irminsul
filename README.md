@@ -23,8 +23,9 @@ This repository is a Cargo workspace:
 
 - the root package is Irminsul itself;
 - [`crates/auto-artifactarium`](crates/auto-artifactarium) is the library that decrypts the game's traffic and parses its packets. It used to be a separate repository and was merged in with its history; Irminsul depends on it by path.
+- [`crates/anime-game-data`](crates/anime-game-data) downloads and indexes Dimbreath's game data dump (at build time, from `build.rs`) and looks it up at run time. It is Erik Gilling's [`anime-game-data`](https://github.com/konkers/anime-game-data), vendored at `dfc03cdb` and changed here since; Irminsul depends on it by path.
 
-`python check.py` runs the same checks as CI for both.
+`python check.py` runs the same checks as CI for all of them.
 
 ## Releasing
 
@@ -100,6 +101,7 @@ Irmunsil is built upon the work of many others.
 
 - [PJK136](https://github.com/PJK136) whose work on a [fork of `stardb-exporter`](https://github.com/PJK136/stardb-exporter) provided the main inspiration for Irminsul's development.
 - [juliuskreutz](https://github.com/juliuskreutz) whose [`stardb-exporter`](https://github.com/juliuskreutz/stardb-exporter) provided the foundation for PJK136's work as well as providing some examples for how to wrangle [`egui`](https://github.com/emilk/egui).
+- [Erik Gilling (konkers)](https://github.com/konkers) who wrote [`anime-game-data`](https://github.com/konkers/anime-game-data), vendored here as `crates/anime-game-data`, which turns Dimbreath's game data dump into what Irminsul needs to name things.
 - [hashblen](https://github.com/hashblen) whose [`auto-artifactarioum`](https://github.com/hashblen/auto-artifactarium) is used to interpret the network packets from Genshin.
 - [IceDynamix](https://github.com/IceDynamix/) whose work on Honkai Star Rail network scanning is at the root of many of the Genshin and HSR network scanning utilities.
 - [emmachase](https://github.com/emmachase) who wrote the packet capture library [`pktmon`](https://github.com/emmachase/pktmon) which Irminsul uses to allow packet capture without having to install a npcap driver as well as their contributions to some of the above projects.

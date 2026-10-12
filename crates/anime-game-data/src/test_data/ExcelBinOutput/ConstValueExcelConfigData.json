@@ -1,0 +1,90 @@
+[
+  {
+    "name": "CONST_VALUE_GAME_TIME_PER_DAY",
+    "value": [
+      "24",
+      "",
+      "",
+      "",
+      "",
+      ""
+    ]
+  },
+  {
+    "name": "CONST_VALUE_INIT_TEAM_AVATAR",
+    "value": [
+      "10000005",
+      "10000007",
+      "",
+      "",
+      "",
+      ""
+    ]
+  },
+  {
+    "name": "CONST_VALUE_CLIMB_COST_STAMINA",
+    "value": [
+      "59",
+      "1",
+      "91",
+      "2",
+      "105",
+      "3"
+    ]
+  },
+  {
+    "name": "CONST_VALUE_STAMINA_RECOVER_WAIT_TIME",
+    "value": [
+      "1.5",
+      "",
+      "",
+      "",
+      "",
+      ""
+    ]
+  },
+  {
+    "name": "CONST_VALUE_TEAM_ELEMENT_LIST",
+    "value": [
+      "Fire,Water,Grass,Electric,Ice,Frozen,Wind,Rock,AntiFire",
+      "",
+      "",
+      "",
+      "",
+      ""
+    ]
+  },
+  {
+    "name": "CONST_VALUE_TPS_AVATAR_CONFIG_ID_MALE",
+    "value": [
+      "10000134",
+      "",
+      "",
+      "",
+      "",
+      ""
+    ]
+  },
+  {
+    "name": "CONST_VALUE_TPS_AVATAR_CONFIG_ID_FEMALE",
+    "value": [
+      "10000135",
+      "",
+      "",
+      "",
+      "",
+      ""
+    ]
+  },
+  {
+    "name": "CONST_VALUE_OUTPUT_LIMIT_SWITCH",
+    "value": [
+      "",
+      "",
+      "",
+      "",
+      "",
+      ""
+    ]
+  }
+]

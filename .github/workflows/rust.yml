@@ -160,6 +160,10 @@ jobs:
         run: cargo doc --locked -p auto-artifactarium --no-deps --all-features
         env:
           RUSTDOCFLAGS: -Dwarnings
+      # crates/anime-game-data, the game data crate build.rs uses: pure Rust
+      # as well, so it rides along here. --all-features covers its `cli` bin.
+      - run: cargo clippy --locked -p anime-game-data --all-targets --all-features -- -Dwarnings
+      - run: cargo test --locked -p anime-game-data --all-features
 
   # update_rev.py is what turns "upstream pushed something" into a new pinned
   # revision in Cargo.toml, and its two guards -- refuse to run under an active

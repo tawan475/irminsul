@@ -1,0 +1,24 @@
+[
+  {
+    "name": "CONST_VALUE_GAME_TIME_PER_DAY",
+    "value": [
+      "24",
+      "",
+      "",
+      "",
+      "",
+      ""
+    ]
+  },
+  {
+    "name": "CONST_VALUE_STAMINA_RECOVER_WAIT_TIME",
+    "value": [
+      "1.5",
+      "",
+      "",
+      "",
+      "",
+      ""
+    ]
+  }
+]

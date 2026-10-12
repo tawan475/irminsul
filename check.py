@@ -35,6 +35,11 @@ FEATURE_SETS = {
 # irminsul feature set. Mirrors the `library` job in .github/workflows/rust.yml.
 LIBRARY = "auto-artifactarium"
 
+# crates/anime-game-data, the game data crate build.rs downloads the dump with.
+# Pure Rust like the library, so once per host too; `cli` is its debugging
+# binary. Mirrors the same steps in the `library` job.
+GAME_DATA = "anime-game-data"
+
 def run_command(cmd, step_name, env=None):
     print(f"\n[{step_name}] Running: {' '.join(cmd)}")
     try:
@@ -189,6 +194,13 @@ def main():
     doc_env["RUSTDOCFLAGS"] = "-Dwarnings"
     run_command(["cargo", "doc"] + lib + ["--no-deps", "--all-features"],
                 f"Docs [{LIBRARY}, RUSTDOCFLAGS=-Dwarnings]", env=doc_env)
+
+    # 6. The game data crate, once per host.
+    print(f"\n🔧 Checking crate: {GAME_DATA}")
+    game_data = ["-p", GAME_DATA]
+    run_command(["cargo", "clippy"] + game_data + ["--all-targets", "--all-features", "--", "-Dwarnings"],
+                f"Clippy Lints [{GAME_DATA}, all features]")
+    run_command(["cargo", "test"] + game_data + ["--all-features"], f"Unit Tests [{GAME_DATA}, all features]")
 
     print("\n🎉 All checks passed! You are ready to push.")
 

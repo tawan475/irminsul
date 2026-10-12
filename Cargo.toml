@@ -12,12 +12,13 @@ rust-version = "1.88"
 all-features = true
 targets = ["x86_64-unknown-linux-gnu"]
 
-# The packet-parsing library lives in this repository as a workspace member.
-# The root package stays the only default member, so a bare `cargo build`,
-# `cargo test` or `cargo clippy` here still means irminsul alone; check.py and
-# CI select the library with `-p auto-artifactarium`.
+# The packet-parsing library and the game data crate live in this repository
+# as workspace members. The root package stays the only default member, so a
+# bare `cargo build`, `cargo test` or `cargo clippy` here still means irminsul
+# alone; check.py and CI select the members with `-p auto-artifactarium` and
+# `-p anime-game-data`.
 [workspace]
-members = ["crates/auto-artifactarium"]
+members = ["crates/anime-game-data", "crates/auto-artifactarium"]
 
 # `build.rs` writes the game data blob that `src/monitor.rs` embeds, so these
 # three crates are used by both the build script and the binary and must not
@@ -25,7 +26,9 @@ members = ["crates/auto-artifactarium"]
 # the other. Declaring them once here and inheriting with `workspace = true`
 # makes that impossible to get wrong.
 [workspace.dependencies]
-anime-game-data = { git = "https://github.com/konkers/anime-game-data", rev = "dfc03cdb5e27807a876b8d4dff17b3f67a320f5c" }
+# Vendored from Erik Gilling's (konkers) anime-game-data at dfc03cdb (MIT, see
+# crates/anime-game-data/README.md); changed here since.
+anime-game-data = { path = "crates/anime-game-data" }
 flate2 = "1.1.9"
 tokio = { version = "1.47.1", features = [
 	"rt",
@@ -191,6 +194,7 @@ opt-level = 2
 [profile.dev.package.auto-artifactarium]
 opt-level = 2
 
-# Uncomment for local debugging
-# [patch."https://github.com/konkers/anime-game-data"]
-# anime-game-data = { path = "../anime-game-data" }
+# Same reason for the vendored game data crate (it was a git dependency too,
+# so `"*"` used to cover it).
+[profile.dev.package.anime-game-data]
+opt-level = 2
