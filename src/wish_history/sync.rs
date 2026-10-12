@@ -155,7 +155,7 @@ impl SyncStatus {
             Outcome::Sent { added, .. } => format!("Synced {at} · added {added}"),
             Outcome::UpToDate => format!("Synced {at} · up to date"),
             Outcome::Unfinished => format!("Synced {at} · more to come"),
-            Outcome::KeyExpired => format!("Sync {at}: the key expired; open Wish → History"),
+            Outcome::KeyExpired => format!("Sync {at}: the key expired"),
             Outcome::Failed(why) => format!("Sync failed {at}: {why}"),
         })
     }
@@ -402,7 +402,6 @@ mod tests {
 
         use super::super::WishEvent;
 
-        let (_url_tx, url_rx) = watch::channel(None);
         let (_state_tx, state_rx) = watch::channel(SavedAppState::default());
         let (toast_tx, _toast_rx) = mpsc::unbounded_channel();
         let auth = TrackerAuth::new(
@@ -412,8 +411,7 @@ mod tests {
             Arc::new(|_| {}),
             Arc::new(|| {}),
         );
-        let channels =
-            super::super::channels(url_rx, state_rx, toast_tx, egui::Context::default(), auth);
+        let channels = super::super::channels(state_rx, toast_tx, egui::Context::default(), auth);
         channels.hub.forward(
             vec![WishEvent::Key(GachaAuthKey::new(
                 "GGGG",
@@ -472,6 +470,10 @@ mod tests {
             format!("Synced {hm} · added 37")
         );
         assert_eq!(line(Outcome::UpToDate), format!("Synced {hm} · up to date"));
+        assert_eq!(
+            line(Outcome::KeyExpired),
+            format!("Sync {hm}: the key expired")
+        );
         assert_eq!(SyncStatus::default().line(), None);
         assert_eq!(
             SyncStatus {

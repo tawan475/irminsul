@@ -30,7 +30,6 @@ mod recording;
 mod replay;
 mod signin;
 mod update;
-mod wish;
 mod wish_history;
 
 const APP_ID: &str = "Irminsul";
@@ -71,11 +70,6 @@ pub enum Message {
         oneshot::Sender<Result<(String, ExportCounts)>>,
     ),
     ExportAchievements(oneshot::Sender<Result<Vec<u32>>>),
-    /// Look for the wish URL in the game's web cache: the wish UI's fallback
-    /// while no key has been captured from the traffic. The cache exists on
-    /// Windows and, through a Proton/Wine prefix, on Linux; elsewhere the
-    /// answer is an error saying so.
-    FindWishUrl(oneshot::Sender<Result<String>>),
     VerifyTrackerKey(
         String,
         String,
@@ -622,7 +616,11 @@ mod tests {
     fn every_http_client_is_built_through_the_shared_builder() {
         for (name, source) in [
             ("monitor.rs", include_str!("monitor.rs")),
-            ("wish.rs", include_str!("wish.rs")),
+            (
+                "wish_history/cache.rs",
+                include_str!("wish_history/cache.rs"),
+            ),
+            ("wish_history/sync.rs", include_str!("wish_history/sync.rs")),
             ("update.rs", include_str!("update.rs")),
             ("app.rs", include_str!("app.rs")),
             ("replay.rs", include_str!("replay.rs")),

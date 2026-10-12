@@ -46,7 +46,7 @@ use crate::player_data::{ExportCounts, ExportSettings};
 use crate::update::{InstallLock, UpdateAnswer, check_for_app_update};
 use crate::{
     AppState, ConfirmationType, DataUpdated, Message, ReloadHandle, State, TracingLevel,
-    open_log_dir, wish,
+    open_log_dir,
 };
 
 /// How long a capture backend may take to release its device or ETW session.
@@ -552,7 +552,7 @@ pub struct IrminsulApp {
     /// what stops the update check from eating unrelated startup messages.
     update_answer_tx: mpsc::UnboundedSender<UpdateAnswer>,
     state_rx: watch::Receiver<AppState>,
-    /// The wish URL (built from a captured key, or scraped) and the sync.
+    /// The wish URL (from the game's key, or its web cache) and the sync.
     wishes: crate::wish_history::WishView,
     log_packets_tx: watch::Sender<bool>,
     saved_state_tx: watch::Sender<SavedAppState>,
@@ -576,7 +576,7 @@ pub struct IrminsulApp {
     optimizer_settings_open: bool,
     optimizer_export_rx: Option<oneshot::Receiver<Result<(String, ExportCounts)>>>,
     achievements_export_rx: Option<oneshot::Receiver<Result<Vec<u32>>>>,
-    wish_url_rx_oneshot: Option<oneshot::Receiver<Result<String>>>,
+    wish_url_rx_oneshot: Option<oneshot::Receiver<std::result::Result<String, String>>>,
     wish_link_failed_for: Option<String>,
     pending_open_url: Option<String>,
     optimizer_save_dialog: Option<FileDialog>,
@@ -871,13 +871,12 @@ fn start_async_runtime(
     let (toast_tx, toast_rx) = mpsc::unbounded_channel::<(String, bool)>();
 
     let (state_tx, state_rx) = watch::channel(AppState::new());
-    let (wish_url_tx, wish_url_rx) = watch::channel(None);
     let crate::wish_history::WishChannels {
         hub: wish_hub,
         view: wish_view,
         sync: wish_sync,
+        cache: wish_cache,
     } = crate::wish_history::channels(
-        wish_url_rx,
         saved_state_rx.clone(),
         toast_tx.clone(),
         egui_ctx.clone(),
@@ -916,25 +915,11 @@ fn start_async_runtime(
                 tracing::error!("error checking for update: {e}");
             }
 
-            // Check for wish URL
-            tokio::spawn(async move {
-                let mut wish = match wish::Wish::new(wish_url_tx).await {
-                    Ok(wish) => wish,
-                    Err(e) => {
-                        // Not an error: "no Genshin log on this machine" is the
-                        // normal state on a box that has never run the game,
-                        // and the message names the paths that were probed.
-                        tracing::info!("wish monitoring unavailable: {e}");
-                        return;
-                    }
-                };
+            // Wish keys from the game's web cache: on start, when it changes,
+            // and when the UI asks; ends with the UI.
+            tokio::spawn(wish_cache.run());
 
-                if let Err(e) = wish.monitor().await {
-                    tracing::error!("Error monitoring for wishes: {e}");
-                }
-            });
-
-            // Wish history from captured keys; ends with the monitor.
+            // Wish history from the keys; ends with the monitor.
             tokio::spawn(wish_sync.run());
 
             tracing::info!("Starting monitor");
@@ -2140,9 +2125,14 @@ impl IrminsulApp {
                 ui,
                 |ui| {
                     Self::section_header(ui, "Wish History");
-                    ui.label(egui_material_icons::icons::ICON_HELP).on_hover_text(
-                        "Open Wish → History in game and Irminsul builds your wish URL.                          Click the Copy icon to copy it, then paste it into paimon.moe                          (Manual import) or StarDB. With the Tracker set up and uploads on,                          new wishes are sent to it as well.",
-                    );
+                    ui.label(egui_material_icons::icons::ICON_HELP)
+                        .on_hover_text(
+                            "Irminsul takes your wish key from the game when its wish history \
+                         page opens, or from a link the game left in its web cache that \
+                         still works. Click the Copy icon to copy the wish URL, then paste \
+                         it into paimon.moe (Manual import) or StarDB. With the Tracker set \
+                         up and uploads on, new wishes are sent to it as well.",
+                        );
                 },
                 |ui| {
                     ui.add_enabled_ui(self.wish_url_rx_oneshot.is_none(), |ui| {
@@ -2156,9 +2146,7 @@ impl IrminsulApp {
                                 self.toasts.info("Wish URL copied to clipboard");
                                 self.wish_link_failed_for = None;
                             } else {
-                                let (tx, rx) = oneshot::channel();
-                                let _ = self.ui_message_tx.send(Message::FindWishUrl(tx));
-                                self.wish_url_rx_oneshot = Some(rx);
+                                self.wish_url_rx_oneshot = Some(self.wishes.look_in_cache());
                                 self.pending_open_url = None;
                                 self.wish_link_failed_for = None;
                             }
@@ -2170,9 +2158,7 @@ impl IrminsulApp {
                 .player
                 .as_ref()
                 .is_some_and(|player| player.uid.is_some());
-            let status = self
-                .wishes
-                .status(now, app_state.game_status, uid_known);
+            let status = self.wishes.status(now, app_state.game_status, uid_known);
             ui.label(RichText::new(status.text).weak())
                 .on_hover_text(status.tooltip);
             if let Some(line) = self.wishes.sync_line() {
@@ -2180,30 +2166,38 @@ impl IrminsulApp {
             }
             ui.horizontal(|ui| {
                 if ui.link("Open Paimon.moe").clicked() {
-                    self.handle_wish_open_button(ui, wish_url.clone(), "https://paimon.moe/wish/import");
+                    self.handle_wish_open_button(
+                        ui,
+                        wish_url.clone(),
+                        "https://paimon.moe/wish/import",
+                    );
                 }
                 if ui.link("Open StarDB").clicked() {
-                    self.handle_wish_open_button(ui, wish_url.clone(), "https://stardb.gg/en/genshin/wish-import");
+                    self.handle_wish_open_button(
+                        ui,
+                        wish_url.clone(),
+                        "https://stardb.gg/en/genshin/wish-import",
+                    );
                 }
             });
         });
     }
 
-    /// Collect the result of a `FindWishUrl` request.
+    /// Collect the answer of a look in the game's web cache
+    /// (`WishView::look_in_cache`).
     ///
-    /// This used to `blocking_recv()` from inside the widget tree, freezing the
-    /// whole window for a full HTTPS round trip to
-    /// `hk4e-api-os.hoyoverse.com` — indefinitely, on a network where that host
-    /// is blackholed.
+    /// Polled, never awaited in the widget tree: the look can take an HTTPS
+    /// round trip to the game's wish history server.
     fn wish_handle_find_url(&mut self, ctx: &Context) -> Result<()> {
         let url = match poll_oneshot(&mut self.wish_url_rx_oneshot) {
             Polled::Pending => return Ok(()),
-            Polled::Ready(Ok(url)) => Some(url),
-            Polled::Ready(Err(_)) | Polled::Dropped => None,
+            Polled::Ready(Ok(url)) => Ok(url),
+            Polled::Ready(Err(why)) => Err(why),
+            Polled::Dropped => Err("the game's web cache could not be read".to_owned()),
         };
 
         match url {
-            Some(url) => {
+            Ok(url) => {
                 ctx.copy_text(url);
                 self.toasts.info("Wish URL copied to clipboard");
                 self.wish_link_failed_for = None;
@@ -2211,16 +2205,14 @@ impl IrminsulApp {
                     ctx.open_url(egui::OpenUrl::new_tab(target_url));
                 }
             }
-            None => {
+            Err(why) => {
                 if let Some(target_url) = self.pending_open_url.take() {
                     self.wish_link_failed_for = Some(target_url);
                     self.toasts
                         .error("Link not found, click again to open anyways");
                 } else {
                     self.wish_link_failed_for = None;
-                    self.toasts.error(
-                        "Could not find Wish URL. Please open the Wish History in-game first.",
-                    );
+                    self.toasts.error(format!("No wish key yet: {why}."));
                 }
             }
         }
@@ -2242,9 +2234,7 @@ impl IrminsulApp {
             ui.ctx().open_url(egui::OpenUrl::new_tab(target_url));
             self.wish_link_failed_for = None;
         } else {
-            let (tx, rx) = oneshot::channel();
-            let _ = self.ui_message_tx.send(Message::FindWishUrl(tx));
-            self.wish_url_rx_oneshot = Some(rx);
+            self.wish_url_rx_oneshot = Some(self.wishes.look_in_cache());
             self.pending_open_url = Some(target_url.to_string());
             self.wish_link_failed_for = None;
         }

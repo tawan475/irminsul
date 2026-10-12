@@ -1143,13 +1143,6 @@ impl Monitor {
                 let _ = reply_tx.send(self.player_data.export_achievements());
                 self.ctx.request_repaint();
             }
-            Message::FindWishUrl(reply_tx) => {
-                let ctx = self.ctx.clone();
-                tokio::spawn(async move {
-                    let _ = reply_tx.send(crate::wish::force_find_url().await);
-                    ctx.request_repaint();
-                });
-            }
             Message::VerifyTrackerKey(url, key, reply_tx) => {
                 let ctx = self.ctx.clone();
                 let client = self.http.clone();

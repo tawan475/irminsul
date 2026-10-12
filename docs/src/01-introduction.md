@@ -18,9 +18,10 @@ In it's current state Irminsul supports:
 - Simple, clean UI
 - Export settings to filter which data gets exported
 - Exports data either to the clipboard or saved to a file
-- Wish history: open Wish → History in game and Irminsul builds your wish
-  URL from the game's own traffic, ready to copy into paimon.moe or StarDB;
-  with a Genshin Data Tracker linked, new wishes are sent to it by themselves
+- Wish history: Irminsul takes the game's wish key from its traffic or from
+  its web cache and gives you the game's own wish URL, ready to copy into
+  paimon.moe or StarDB; with a Genshin Data Tracker linked, new wishes are
+  sent to it by themselves
 
 Planned features include:
 

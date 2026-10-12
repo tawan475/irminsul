@@ -1,9 +1,16 @@
-//! Wish history from the game's own traffic.
+//! Wish history from the game's own key.
 //!
-//! Opening Wish -> History in game makes the server send a web view key
-//! (`GetAuthkeyRsp`, recognised by auto-artifactarium). From it irminsul
+//! A wish history key comes from one of two places:
 //!
-//! * builds the wish URL that paimon.moe ("Manual" import) and stardb take,
+//! * the game's traffic: when its wish history page opens, the server sends
+//!   a web view key (`GetAuthkeyRsp`, recognised by auto-artifactarium);
+//! * the game's web cache, where that page leaves the game's own link, key
+//!   included, which works for the rest of the key's day -- see [`cache`].
+//!   A key from the traffic always wins over one from the cache.
+//!
+//! From the key irminsul
+//!
+//! * gives the wish URL that paimon.moe ("Manual" import) and stardb take,
 //!   for anyone to copy -- see [`WishView`]; and
 //! * when a tracker credential is set and uploads are on, syncs the history
 //!   to the tracker: only what the tracker does not have yet, paging no
@@ -17,6 +24,7 @@
 //! The monitor's only hooks are [`take_wish_events`] and [`WishHub::forward`];
 //! the UI reads a [`WishView`].
 
+mod cache;
 mod gacha_log;
 mod run;
 #[cfg(test)]
@@ -32,8 +40,10 @@ use std::time::Instant;
 use auto_artifactarium::{CommandMatch, GachaAuthKey, GachaRecordLink, GachaWish};
 use tokio::sync::{mpsc, watch};
 
-use self::gacha_log::LinkParts;
+pub(crate) use self::cache::CacheSource;
+use self::cache::{CacheReply, CacheState};
 pub(crate) use self::gacha_log::WishKey;
+use self::gacha_log::{KeySource, LinkParts};
 pub(crate) use self::sync::{SyncStatus, WishSync};
 use self::tracker::TrackerCredential;
 use crate::app::SavedAppState;
@@ -192,12 +202,15 @@ pub(crate) fn region_for_uid(uid: u32) -> Option<&'static str> {
 pub(crate) struct Seen {
     /// The banner list (`GetGachaInfoRsp`): the Wish screen was opened.
     pub(crate) banner_list: bool,
-    /// A wish history key (`webview_gacha`): Wish → History was opened.
+    /// A wish history key (`webview_gacha`) in the traffic: the game's wish
+    /// history page opened.
     pub(crate) wish_key: bool,
     /// Web view keys for something else (the login's `ugc_login`), ignored.
     pub(crate) other_keys: u32,
     /// The client's version, from its login.
     pub(crate) client_version: bool,
+    /// What the game's web cache showed last.
+    pub(crate) cached_link: CacheState,
 }
 
 /// Asks the UI to repaint: what the monitor hands on changes what it shows.
@@ -289,20 +302,63 @@ impl WishHub {
             "the wish history link's parts"
         );
         let key = WishKey::new(key.authkey(), &key.game_biz, now).with_link(link);
-        let new = self.key_tx.send_if_modified(|current| {
-            if current
-                .as_ref()
-                .is_some_and(|current| current.same_key(&key))
+        let mut new = false;
+        self.key_tx.send_if_modified(|current| match current {
+            // The same key, maybe found in the cache first: no new sync, but
+            // it is the game's key now, so the cache cannot replace it.
+            Some(current) if current.same_key(&key) => {
+                let from_cache = current.source() == KeySource::Cache;
+                current.mark_from_game();
+                from_cache
+            }
+            _ => {
+                *current = Some(key);
+                new = true;
+                true
+            }
+        });
+        if new {
+            tracing::info!("captured a wish history key");
+            let _ = self.trigger_tx.send(Trigger::NewKey);
+        }
+    }
+
+    /// The key held, while it is believed to work.
+    pub(crate) fn held_key(&self, now: Instant) -> Option<WishKey> {
+        self.key_tx
+            .borrow()
+            .as_ref()
+            .filter(|key| key.is_fresh(now))
+            .cloned()
+    }
+
+    /// Record what the game's web cache showed.
+    pub(crate) fn see_cache(&self, state: CacheState) {
+        if self.see(|seen| std::mem::replace(&mut seen.cached_link, state) != state) {
+            (self.notify)();
+        }
+    }
+
+    /// Take a key from the game's cache, that the game's server said works,
+    /// unless a key from the traffic is held (it always wins) or this key is
+    /// held already. `true` when taken: every banner syncs.
+    pub(crate) fn offer_cached(&self, key: WishKey, now: Instant) -> bool {
+        let taken = self.key_tx.send_if_modified(|current| {
+            if let Some(current) = current
+                && current.is_fresh(now)
+                && (current.source() == KeySource::Game || current.same_key(&key))
             {
                 return false;
             }
             *current = Some(key);
             true
         });
-        if new {
-            tracing::info!("captured a wish history key");
+        if taken {
+            tracing::info!("took a wish history key from the game's web cache");
             let _ = self.trigger_tx.send(Trigger::NewKey);
+            (self.notify)();
         }
+        taken
     }
 }
 
@@ -311,9 +367,8 @@ pub(crate) struct WishView {
     key_rx: watch::Receiver<Option<WishKey>>,
     status_rx: watch::Receiver<SyncStatus>,
     seen_rx: watch::Receiver<Seen>,
-    /// The URL the web-cache scraper found (`crate::wish`), the fallback while
-    /// no key has been captured.
-    scraped_url_rx: watch::Receiver<Option<String>>,
+    /// Asks the cache source to look now.
+    cache_tx: mpsc::UnboundedSender<CacheReply>,
 }
 
 impl WishView {
@@ -326,12 +381,18 @@ impl WishView {
             .cloned()
     }
 
-    /// The URL to copy: built from the captured key, else the scraped one.
+    /// The URL to copy: the game's link for the key held.
     pub(crate) fn wish_url(&self, now: Instant) -> Option<String> {
-        match self.key(now) {
-            Some(key) => Some(key.wish_url()),
-            None => self.scraped_url_rx.borrow().clone(),
-        }
+        self.key(now).map(|key| key.wish_url())
+    }
+
+    /// Look in the game's web cache now: answered with the wish URL, or why
+    /// there is none.
+    pub(crate) fn look_in_cache(&self) -> tokio::sync::oneshot::Receiver<Result<String, String>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // A closed channel drops `tx`, which the caller sees as no answer.
+        let _ = self.cache_tx.send(tx);
+        rx
     }
 
     /// The section's status line and its tooltip, by what is really the
@@ -358,45 +419,57 @@ pub(crate) struct WishLine {
     pub(crate) tooltip: String,
 }
 
-/// What the wish section says, by state:
+/// Where a key comes from, for the tooltips.
+const KEY_SOURCES: &str = "A wish key comes from the game when its wish history page opens, \
+     or from a link the game left in its web cache that still works. A key lasts about \
+     a day.";
+
+/// What the wish section says, by what is really the case:
 ///
-/// * a key is held: how long it is believed to last;
-/// * no key, and this session is not decrypting: nothing can be read, so
-///   say that (with the capture's own guidance), never "open the history";
-/// * no key, decrypting: open the history once.
+/// * a key is held: how long it is believed to last, and where it came from;
+/// * no key, and this session is not decrypting: waiting for the login
+///   (with the capture's own guidance);
+/// * no key, decrypting: no key yet.
+///
+/// Never an instruction: where keys come from is in the tooltip.
 pub(crate) fn status_line(key: Option<&WishKey>, now: Instant, game: GameStatus) -> WishLine {
     if let Some(key) = key {
         let hours = key.remaining(now).as_secs().div_ceil(3600);
+        let (from, tooltip) = match key.source() {
+            KeySource::Game => (
+                "from the game",
+                "The wish history key the game sent when its history page opened. \
+                 It lasts about a day; until then Copy wish URL gives the game's own \
+                 link, and new wishes sync by themselves when the Tracker is set up.",
+            ),
+            KeySource::Cache => (
+                "from the cache",
+                "The game's own wish history link, found in its web cache; the game's \
+                 server said it still works. Its key lasts about a day from when the game \
+                 got it (counted from the cache file's time); until then Copy wish URL \
+                 gives that link as it is, and new wishes sync by themselves when the \
+                 Tracker is set up.",
+            ),
+        };
         let text = if hours <= 1 {
-            "Key valid < 1 h".to_owned()
+            format!("Key valid < 1 h · {from}")
         } else {
-            format!("Key valid ~{hours} h")
+            format!("Key valid ~{hours} h · {from}")
         };
         return WishLine {
             text,
-            tooltip: "The wish history key the game sent when its history page opened. \
-                      It lasts about a day; until then Copy wish URL gives the game's own \
-                      link, and new wishes sync by themselves when the Tracker is set up."
-                .to_owned(),
+            tooltip: tooltip.to_owned(),
         };
     }
     if game != GameStatus::Decoding {
         return WishLine {
             text: "Waiting for the game's login".to_owned(),
-            tooltip: format!(
-                "{}\n{}\n\nThe wish key can only be read from a game session Irminsul \
-                 decrypts.",
-                game.label(),
-                game.tooltip()
-            ),
+            tooltip: format!("{}\n{}\n\n{KEY_SOURCES}", game.label(), game.tooltip()),
         };
     }
     WishLine {
-        text: "Open Wish → History once".to_owned(),
-        tooltip: "The key only comes when the game opens its wish history page; you can \
-                  close the page right away. It lasts about a day, and until then wishes \
-                  sync by themselves."
-            .to_owned(),
+        text: "No wish key yet".to_owned(),
+        tooltip: KEY_SOURCES.to_owned(),
     }
 }
 
@@ -407,9 +480,14 @@ pub(crate) fn seen_summary(seen: &Seen, uid_known: bool) -> String {
     let mut lines = vec![
         "Seen this session:".to_owned(),
         format!("{} banner list (Wish screen)", mark(seen.banner_list)),
-        format!("{} wish key (Wish → History)", mark(seen.wish_key)),
+        format!("{} wish key from the game", mark(seen.wish_key)),
         format!("{} client version", mark(seen.client_version)),
         format!("{} UID", mark(uid_known)),
+        format!(
+            "{} cached link: {}",
+            mark(seen.cached_link == CacheState::Valid),
+            seen.cached_link.label()
+        ),
     ];
     if seen.other_keys > 0 {
         lines.push(format!(
@@ -426,11 +504,12 @@ pub(crate) struct WishChannels {
     pub(crate) hub: WishHub,
     pub(crate) view: WishView,
     pub(crate) sync: WishSync,
+    pub(crate) cache: CacheSource,
 }
 
-/// Build the hub, the view and the sync task (not yet running).
+/// Build the hub, the view, the sync task and the cache source (neither
+/// running yet).
 pub(crate) fn channels(
-    scraped_url_rx: watch::Receiver<Option<String>>,
     saved_state_rx: watch::Receiver<SavedAppState>,
     toast_tx: mpsc::UnboundedSender<(String, bool)>,
     ctx: egui::Context,
@@ -443,6 +522,7 @@ pub(crate) fn channels(
     let (seen_tx, seen_rx) = watch::channel(Seen::default());
     let repaint = ctx.clone();
     let notify: Notify = Arc::new(move || repaint.request_repaint());
+    let (cache_tx, cache_rx) = mpsc::unbounded_channel();
     let sync = WishSync::new(
         trigger_rx,
         Arc::clone(&key_tx),
@@ -452,19 +532,21 @@ pub(crate) fn channels(
         ctx,
         auth,
     );
+    let hub = WishHub {
+        key_tx,
+        trigger_tx,
+        captured: Arc::default(),
+        seen_tx: Arc::new(seen_tx),
+        notify,
+    };
     WishChannels {
-        hub: WishHub {
-            key_tx,
-            trigger_tx,
-            captured: Arc::default(),
-            seen_tx: Arc::new(seen_tx),
-            notify,
-        },
+        cache: CacheSource::new(hub.clone(), cache_rx),
+        hub,
         view: WishView {
             key_rx,
             status_rx,
             seen_rx,
-            scraped_url_rx,
+            cache_tx,
         },
         sync,
     }
@@ -474,7 +556,7 @@ pub(crate) fn channels(
 mod tests {
     use super::*;
 
-    fn hub() -> (
+    pub(super) fn hub() -> (
         WishHub,
         watch::Receiver<Option<WishKey>>,
         mpsc::UnboundedReceiver<Trigger>,
@@ -530,6 +612,7 @@ mod tests {
                 wish_key: false,
                 other_keys: 2,
                 client_version: true,
+                cached_link: CacheState::None,
             }
         );
         assert_eq!(repaints.load(Ordering::SeqCst), 1, "one repaint per batch");
@@ -570,22 +653,49 @@ mod tests {
                 "{game:?}: {}",
                 line.tooltip
             );
-            assert!(!line.tooltip.contains("History"), "{game:?}");
+            assert!(line.tooltip.contains("web cache"), "{game:?}");
         }
-        // Decrypting, no key yet.
+        // Decrypting, no key yet: neutral, the sources in the tooltip.
         let line = status_line(None, now, GameStatus::Decoding);
-        assert_eq!(line.text, "Open Wish → History once");
-        assert!(line.tooltip.contains("close the page right away"));
-        // A key: how long it lasts, whatever the game does now.
+        assert_eq!(line.text, "No wish key yet");
+        assert!(line.tooltip.contains("wish history page opens"));
+        assert!(line.tooltip.contains("web cache that still works"));
+        assert!(line.tooltip.contains("about a day"));
+        // A key: how long it lasts and where from, whatever the game does now.
         let key = WishKey::new("LLLL", "hk4e_global", now);
         for game in [GameStatus::Decoding, GameStatus::NotRunning] {
-            assert_eq!(status_line(Some(&key), now, game).text, "Key valid ~24 h");
+            assert_eq!(
+                status_line(Some(&key), now, game).text,
+                "Key valid ~24 h · from the game"
+            );
         }
         let late = now + gacha_log::KEY_LIFETIME - std::time::Duration::from_secs(600);
         assert_eq!(
             status_line(Some(&key), late, GameStatus::Decoding).text,
-            "Key valid < 1 h"
+            "Key valid < 1 h · from the game"
         );
+        let cached = WishKey::from_game_link(
+            "https://example.invalid/getGachaLog?authkey=MMMM&game_biz=hk4e_global",
+            std::time::Duration::from_secs(4 * 3600),
+            now,
+        )
+        .unwrap();
+        let line = status_line(Some(&cached), now, GameStatus::NotRunning);
+        assert_eq!(line.text, "Key valid ~20 h · from the cache");
+        assert!(line.tooltip.contains("web cache"));
+        // Nowhere an instruction to open the history.
+        for line in [
+            status_line(None, now, GameStatus::Decoding),
+            status_line(None, now, GameStatus::NotRunning),
+            status_line(Some(&key), now, GameStatus::Decoding),
+            status_line(Some(&cached), now, GameStatus::Decoding),
+        ] {
+            let all = format!("{} {}", line.text, line.tooltip);
+            assert!(
+                !all.contains("Open Wish") && !all.contains("→ History"),
+                "{all}"
+            );
+        }
     }
 
     #[test]
@@ -597,17 +707,39 @@ mod tests {
             wish_key: false,
             other_keys: 1,
             client_version: true,
+            cached_link: CacheState::Expired,
         };
         assert_eq!(
             seen_summary(&seen, false),
             format!(
                 "Seen this session:\n{ICON_CHECK} banner list (Wish screen)\n\
-                 {ICON_CLOSE} wish key (Wish → History)\n{ICON_CHECK} client version\n\
-                 {ICON_CLOSE} UID\n1 other web key ignored"
+                 {ICON_CLOSE} wish key from the game\n{ICON_CHECK} client version\n\
+                 {ICON_CLOSE} UID\n{ICON_CLOSE} cached link: expired\n1 other web key ignored"
             )
         );
         assert!(!seen_summary(&Seen::default(), true).contains("ignored"));
-        assert!(seen_summary(&Seen::default(), true).ends_with(&format!("{ICON_CHECK} UID")));
+        assert!(seen_summary(&Seen::default(), true).contains(&format!("{ICON_CHECK} UID")));
+        for (state, label) in [
+            (CacheState::None, "none"),
+            (CacheState::Found, "found"),
+            (CacheState::Valid, "valid"),
+            (CacheState::Expired, "expired"),
+            (CacheState::Refused, "refused"),
+        ] {
+            let seen = Seen {
+                cached_link: state,
+                ..Seen::default()
+            };
+            let mark = if state == CacheState::Valid {
+                ICON_CHECK
+            } else {
+                ICON_CLOSE
+            };
+            assert!(
+                seen_summary(&seen, true).ends_with(&format!("{mark} cached link: {label}")),
+                "{state:?}"
+            );
+        }
     }
 
     fn authkey(app: &str, key: &str) -> GachaAuthKey {
@@ -745,45 +877,65 @@ mod tests {
     }
 
     #[test]
-    fn the_view_prefers_the_captured_key_and_says_how_long_it_lasts() {
+    fn the_view_gives_the_held_keys_link_and_says_how_long_it_lasts() {
         let (key_tx, key_rx) = watch::channel(None);
         let (_status_tx, status_rx) = watch::channel(SyncStatus::default());
-        let (scraped_tx, scraped_url_rx) = watch::channel(None);
         let (_seen_tx, seen_rx) = watch::channel(Seen::default());
+        let (cache_tx, _cache_rx) = mpsc::unbounded_channel();
         let view = WishView {
             key_rx,
             status_rx,
             seen_rx,
-            scraped_url_rx,
+            cache_tx,
         };
         let status = |at| view.status(at, GameStatus::Decoding, true).text;
         let now = Instant::now();
         assert_eq!(view.wish_url(now), None);
-        assert_eq!(status(now), "Open Wish → History once");
-
-        scraped_tx.send_replace(Some("https://example.invalid/scraped".to_owned()));
-        assert_eq!(
-            view.wish_url(now).as_deref(),
-            Some("https://example.invalid/scraped")
-        );
+        assert_eq!(status(now), "No wish key yet");
 
         key_tx.send_replace(Some(WishKey::new("EEEE", "hk4e_global", now)));
         let url = view.wish_url(now).unwrap();
         assert!(url.contains("authkey=EEEE"), "{url}");
-        assert_eq!(status(now), "Key valid ~24 h");
+        assert_eq!(status(now), "Key valid ~24 h · from the game");
         assert!(
             view.status(now, GameStatus::Decoding, true)
                 .tooltip
                 .contains("Seen this session:")
         );
 
-        // A day later the key is gone and the scraper's URL is back.
+        // A cached link is given as it is.
+        let link = "https://example.invalid/getGachaLog?authkey=FFFF&game_biz=hk4e_global";
+        key_tx.send_replace(WishKey::from_game_link(
+            link,
+            std::time::Duration::ZERO,
+            now,
+        ));
+        assert_eq!(view.wish_url(now).as_deref(), Some(link));
+
+        // A day later the key is gone.
         let later = now + gacha_log::KEY_LIFETIME;
-        assert_eq!(
-            view.wish_url(later).as_deref(),
-            Some("https://example.invalid/scraped")
-        );
-        assert_eq!(status(later), "Open Wish → History once");
+        assert_eq!(view.wish_url(later), None);
+        assert_eq!(status(later), "No wish key yet");
+    }
+
+    #[test]
+    fn looking_in_the_cache_without_a_cache_source_is_no_answer() {
+        let (_key_tx, key_rx) = watch::channel(None);
+        let (_status_tx, status_rx) = watch::channel(SyncStatus::default());
+        let (_seen_tx, seen_rx) = watch::channel(Seen::default());
+        let (cache_tx, cache_rx) = mpsc::unbounded_channel();
+        drop(cache_rx);
+        let view = WishView {
+            key_rx,
+            status_rx,
+            seen_rx,
+            cache_tx,
+        };
+        let mut answer = view.look_in_cache();
+        assert!(matches!(
+            answer.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
     }
 
     #[test]

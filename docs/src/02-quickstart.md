@@ -169,23 +169,36 @@ The gear icon opens the tracker window. Under **Advanced**:
 
 ## Wish history
 
-Open **Wish → History** in game while Irminsul is running. The game then
-fetches a key for its wish history page, and Irminsul picks it up from the
-traffic; the "Wish History" section then says "Key valid ~24 h" (keys last
-about a day; open the history again for a new one). Before that it says
-"Open Wish → History once", or "Waiting for the game's login" while Irminsul
-cannot read the game at all (for example when the game was started before
-Irminsul). Hover the line for details, including what Irminsul has seen this
-session: the banner list (the Wish screen), the wish key, the client version
-and the UID. If something stays missing, the same discoveries are in the log
-("Open log folder", `latest.log`); it never holds the key or the URL.
+Irminsul reads your wish history with the game's own wish key. A key lasts
+about a day, and it comes from one of two places:
 
-- **Copy wish URL** (the clipboard icon) copies the wish URL built from that
-  key. Paste it into [paimon.moe](https://paimon.moe/wish/import) ("Manual"
-  import) or [StarDB](https://stardb.gg/en/genshin/wish-import); the
-  "Open Paimon.moe" and "Open StarDB" links copy it and open the page in one
-  go. Until a key has been captured, Irminsul falls back to looking for the
-  URL in the game's web cache, as older versions did.
+- **The game**: whenever the game opens its wish history page, the server
+  sends it a key, and Irminsul picks it up from the traffic while it is
+  decrypting the session.
+- **The game's web cache**: that page leaves the game's own link, key
+  included, in the game's web cache. Irminsul looks there when it starts,
+  whenever the cache changes, and when you click Copy wish URL without a key.
+  It finds the game's folder in the game's log, takes the newest wish link
+  from the cache and checks it with one request to the game's wish history
+  server; a link that has expired is ignored. So the wishes of a day sync even
+  when Irminsul was not running, or not decrypting, when the page opened.
+
+A key from the traffic always wins over one from the cache, and the same key
+is never synced twice. The "Wish History" section says what is the case:
+"Key valid ~20 h · from the game" or "· from the cache"; "No wish key yet";
+or "Waiting for the game's login" while Irminsul cannot read the game (for
+example when the game was started before Irminsul) and has no key. Hover the
+line for details, including what Irminsul has seen this session: the banner
+list (the Wish screen), a wish key from the game, the client version, the UID
+and the cached link (none, found, valid, expired or refused). If something
+stays missing, the same discoveries are in the log ("Open log folder",
+`latest.log`); it never holds the key or the URL.
+
+- **Copy wish URL** (the clipboard icon) copies the game's own wish URL for
+  that key (a link from the cache exactly as the game wrote it). Paste it into
+  [paimon.moe](https://paimon.moe/wish/import) ("Manual" import) or
+  [StarDB](https://stardb.gg/en/genshin/wish-import); the "Open Paimon.moe"
+  and "Open StarDB" links copy it and open the page in one go.
 - **Sync to the tracker**: when Irminsul uploads to a Genshin Data Tracker by
   itself -- signed in (or with a verified import key) and "Auto export to
   tracker" ticked -- a new key also sends your wish history there. It asks the
