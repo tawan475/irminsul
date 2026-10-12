@@ -13,28 +13,30 @@ import unittest
 import update_rev
 
 PATH_DEPENDENCY = 'auto-artifactarium = { path = "crates/auto-artifactarium" }\n'
+# Vendored from a git repository, so a path now and nothing to pin.
+VENDORED_DEPENDENCY = 'anime-game-data = { path = "crates/anime-game-data" }\n'
 
 MANIFEST = """[package]
 name = "irminsul"
 
 [workspace]
-members = ["crates/auto-artifactarium"]
+members = ["crates/anime-game-data", "crates/auto-artifactarium"]
 
 [workspace.dependencies]
-anime-game-data = { git = "https://github.com/konkers/anime-game-data", rev = "0000000000000000000000000000000000000000" }
-
+""" + VENDORED_DEPENDENCY + """
 [dependencies]
 anime-game-data = { workspace = true }
-""" + PATH_DEPENDENCY + """unpinned = { git = "https://example.com/unpinned" }
+""" + PATH_DEPENDENCY + """kcp = { git = "https://github.com/hashblen/mhy-kcp", rev = "0000000000000000000000000000000000000000" }
+unpinned = { git = "https://example.com/unpinned" }
 
 # Uncomment for local debugging
-# [patch."https://github.com/konkers/anime-game-data"]
-# anime-game-data = { path = "../anime-game-data" }
+# [patch."https://github.com/hashblen/mhy-kcp"]
+# kcp = { path = "../mhy-kcp" }
 """
 
 PATCHED_MANIFEST = MANIFEST + """
-[patch."https://github.com/konkers/anime-game-data"]
-anime-game-data = { path = "../anime-game-data" }
+[patch."https://github.com/hashblen/mhy-kcp"]
+kcp = { path = "../mhy-kcp" }
 """
 
 NEW_SHA = "1234567890abcdef1234567890abcdef12345678"
@@ -75,7 +77,7 @@ class ActivePatchSectionsTest(unittest.TestCase):
     def test_uncommented_patch_block_is_reported(self):
         self.assertEqual(
             update_rev.active_patch_sections(PATCHED_MANIFEST),
-            ['[patch."https://github.com/konkers/anime-game-data"]'],
+            ['[patch."https://github.com/hashblen/mhy-kcp"]'],
         )
 
     def test_crates_io_and_bare_patch_headers(self):
@@ -94,7 +96,7 @@ class RewritePinsTest(unittest.TestCase):
         new_content, updated = update_rev.rewrite_pins(MANIFEST, resolve_head=resolve_stub)
         self.assertTrue(updated)
         self.assertIn(
-            'anime-game-data = { git = "https://github.com/konkers/anime-game-data", rev = "'
+            'kcp = { git = "https://github.com/hashblen/mhy-kcp", rev = "'
             + NEW_SHA
             + '" }',
             new_content,
@@ -107,8 +109,9 @@ class RewritePinsTest(unittest.TestCase):
         )
 
     def test_path_dependencies_are_left_alone(self):
-        # auto-artifactarium is a workspace member: there is no repository to
-        # ask for a HEAD and no pin to rewrite.
+        # auto-artifactarium and the vendored anime-game-data are workspace
+        # members: there is no repository to ask for a HEAD and no pin to
+        # rewrite.
         asked = []
 
         def resolve(url):
@@ -117,8 +120,9 @@ class RewritePinsTest(unittest.TestCase):
 
         new_content, _ = update_rev.rewrite_pins(MANIFEST, resolve_head=resolve)
         self.assertIn(PATH_DEPENDENCY, new_content)
+        self.assertIn(VENDORED_DEPENDENCY, new_content)
         self.assertEqual(
-            asked, ["https://github.com/konkers/anime-game-data", "https://example.com/unpinned"]
+            asked, ["https://github.com/hashblen/mhy-kcp", "https://example.com/unpinned"]
         )
 
     def test_commented_dependency_lines_are_left_alone(self):
@@ -196,7 +200,7 @@ class UpdateCargoTomlTest(unittest.TestCase):
             self.assertEqual(seen, [(os.path.dirname(manifest.path), "full")])
 
     def test_failed_verification_rolls_the_lockfile_back_too(self):
-        lock = 'version = 4\n\n[[package]]\nname = "anime-game-data"\n'
+        lock = 'version = 4\n\n[[package]]\nname = "kcp"\n'
         with TempManifest(MANIFEST, lock) as manifest:
 
             def verifier(manifest_dir, mode):

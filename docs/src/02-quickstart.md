@@ -98,9 +98,41 @@ This fork can also push a capture straight to a Genshin Data Tracker account,
 from the "Tracker" section of the main window. By default it talks to the hosted
 tracker at <https://genshin-tracker.475.dev>:
 
-1. In the tracker dashboard, generate an **Import Key** for the Genshin account you want to fill.
-2. In Irminsul, click the gear icon in the "Tracker" section, paste the key, and click "Save & Close". Irminsul verifies the key and shows the account name, UID and server it belongs to.
-3. With a capture completed, click the cloud upload icon to send the current data. Tick "Auto export to tracker" in the same section to upload every completed capture automatically.
+1. Click **Sign in** in the "Tracker" section. Your browser opens the tracker:
+   sign in there if you aren't already, choose where this PC's uploads go, and
+   click **Allow**. The page then says you can close it, and Irminsul shows
+   "Signed in as <your name>" and where uploads go.
+2. With a capture completed, click the cloud upload icon to send the current
+   data. Tick "Auto export to tracker" in the same section to upload every
+   completed capture automatically.
+
+Where uploads go is set on the tracker, not in Irminsul: **Auto (by UID)**
+(the default) files each capture under the account with that capture's UID and
+creates one for a new UID; **Always this account** sends everything to one
+account. Click **Configure** next to "Uploads:" to change it in the browser;
+Irminsul picks the change up when you come back to its window (and every few
+minutes while it is open). This PC also appears in the tracker's **Settings →
+Devices** as "Irminsul on <PC name>", where you can change the target or sign
+it out.
+
+The sign-out icon next to your name signs this PC out: it ends the session on
+the tracker and deletes what Irminsul stored. Signing out everywhere on the
+tracker, changing your password there, or signing this device out from its
+Devices page signs Irminsul out too; it then says "Signed out, sign in again".
+
+What is stored where: the sign-in's long-lived (refresh) token is kept in your
+system's credential store -- Windows Credential Manager, the macOS Keychain, or
+the Secret Service (GNOME Keyring, KWallet) on Linux -- under the name
+`irminsul`, one entry per tracker address. It is never written to Irminsul's
+settings file. The short-lived token uploads are sent with lives only in
+memory. On a Linux desktop without a Secret Service, the sign-in lasts until
+Irminsul closes (it says "Signed in for this session only").
+
+If the browser that opens is not the one you use (Irminsul runs as
+administrator on Windows, and a browser started from it can open as a separate,
+signed-out window), finish the sign-in there, or click the copy icon next to
+"Waiting for the browser…" and paste the link into the browser you normally
+use. Cancel stops waiting.
 
 An upload holds everything the capture saw -- every character, every artifact
 and weapon of any rarity and level, all materials and achievements -- whatever
@@ -108,20 +140,80 @@ the Genshin Optimizer export settings leave out, and it never fakes an
 artifact's fourth line. The toast names the counts it sent (for example
 "1,122 weapons"), so you can hold them against the game's own.
 
-The same modal has a **Tracker API base URL** field, so a self-hosted tracker
-needs no rebuild -- point it at your backend's API base and click "Save &
-Close". The default is `https://genshin-tracker.475.dev/api`; note the `/api`,
-under which the tracker serves its API. The compile-time `TRACKER_API_URL`
-replaces that default for a build and only supplies the value a fresh install
-starts with; once you have edited or saved the field the stored URL wins,
-including after an update to a build with a different baked-in default. The
-exceptions are an empty field and the old default `http://localhost:49000`,
-which Irminsul resets to the build's default when it starts (to keep using a
-local backend on that port, enter it as `http://127.0.0.1:49000`). "Reset URL
-to default" puts the build's own value back.
+### Advanced: tracker address and import key
 
-The key is stored with the rest of Irminsul's saved state on your machine and
-is sent only to the tracker it belongs to.
+The gear icon opens the tracker window. Under **Advanced**:
+
+- **Tracker address**, so a self-hosted tracker needs no rebuild: enter your
+  tracker's API base and click **Apply**. Irminsul asks "Uploads will now go to
+  <host>. Continue?" first -- every upload carries the whole account, so a
+  pasted lookalike address must not slip through -- and signs out of the old
+  address: a sign-in belongs to one address and its tokens are never sent to
+  another. The default is `https://genshin-tracker.475.dev/api`; note the
+  `/api`, under which the tracker serves its API. The compile-time
+  `TRACKER_API_URL` replaces that default for a build and only supplies the
+  value a fresh install starts with; once you have changed the address the
+  stored one wins, including after an update to a build with a different
+  baked-in default. The exceptions are an empty address and the old default
+  `http://localhost:49000`, which Irminsul resets to the build's default when
+  it starts (to keep using a local backend on that port, enter it as
+  `http://127.0.0.1:49000`). The reset icon next to the field puts the build's
+  own value back in the field.
+- **Import key**, the older way to link an account, which keeps working for as
+  long as you are not signed in: generate an **Import Key** in the tracker
+  dashboard, paste it here and click "Save & Close"; Irminsul verifies it and
+  shows the account name, UID and server it belongs to. Once you sign in, the
+  key is no longer used. The key is stored in plain text with the rest of
+  Irminsul's saved state on your machine and never expires, which is why
+  signing in is the recommended way; "Clear key" removes it.
+
+## Wish history
+
+Irminsul reads your wish history with the game's own wish key. Whenever the
+game opens its wish history page, the server sends it a key, and Irminsul
+picks it up from the traffic while it is decrypting the session. A key lasts
+about a day.
+
+A key belongs to the account it came with, and you may log in with several
+accounts on one PC. So **each login starts fresh**: a new login (or another
+account's UID appearing) clears the key, anything left of an unfinished sync,
+and what was seen, and stops a sync that is running before it sends anything.
+A key that arrives after a login is that login's: it syncs at once, and only
+wishes of that login's UID are ever sent ("the wish key belongs to another
+account" otherwise). If the UID is not known yet, the sync waits for it.
+Irminsul keeps the key in memory only.
+
+The "Wish History" section says what is the case: "Key valid ~20 h"; "No wish
+key yet"; or "Waiting for the game's login" while Irminsul cannot read the
+game (for example when the game was started before Irminsul) and has no key.
+Hover the line for details, including what Irminsul has seen this login: the
+banner list (the Wish screen), a wish key from the game, the client version,
+the UID and the link in the game's web cache. If something stays missing, the
+same discoveries are in the log ("Open log folder", `latest.log`); it never
+holds the key or the URL.
+
+- **Copy wish URL** (the clipboard icon) copies the game's own wish URL for
+  that key. Paste it into [paimon.moe](https://paimon.moe/wish/import)
+  ("Manual" import) or [StarDB](https://stardb.gg/en/genshin/wish-import); the
+  "Open Paimon.moe" and "Open StarDB" links copy it and open the page in one
+  go. Without a key it copies the link the game left in its web cache
+  instead, as it is. That link may be another account's (the cache belongs to
+  the PC, not the login), so it is never used to sync.
+- **Sync to the tracker**: when Irminsul uploads to a Genshin Data Tracker by
+  itself -- signed in (or with a verified import key) and "Auto export to
+  tracker" ticked -- a new key also sends your wish history there. It asks the
+  tracker which wishes it already has, then reads only the newest page of each
+  banner and goes further back only while the wishes are new, at a gentle pace
+  (a second between pages). A wish you make in game sends that banner's new
+  wishes about 20 seconds later. Nothing is fetched otherwise. The section shows
+  the last sync ("Synced 21:04 · added 37") or why it did not happen (for
+  example "the upload target no longer exists; choose one with Configure on
+  the tracker").
+
+The key works like a password for your wish history while it lasts: Irminsul
+keeps it in memory only, never writes it to its log or settings, and sends it
+only to the game's own wish history server -- never to the tracker, which
+only receives the wishes themselves.
 
 ## Start Irminsul when you sign in (Windows)
 

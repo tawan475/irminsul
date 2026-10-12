@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 use crate::capture::{self, BackendType, CaptureSource, create_capture};
 use crate::game_watch::{self, GameStatus, GameWatch, SystemProcessDetector};
 use crate::player_data::{ExportReport, ExportSettings, PlayerData};
+use crate::signin::{TrackerAuth, UploadCredential};
 use crate::{AppState, DataUpdated, Message, State};
 
 /// How long the automation trigger waits after the last new data before it
@@ -332,9 +333,11 @@ impl DataReplacement {
         key: KeyState,
         classified: &[(u16, CommandMatch)],
     ) -> DataVerdict {
-        let replaces = classified
-            .iter()
-            .any(|(_, found)| !matches!(found, CommandMatch::DeletedItems(_)));
+        // A delete notify only removes from what is held, and the wish
+        // history messages are not account data at all.
+        let replaces = classified.iter().any(|(_, found)| {
+            found.is_account_data() && !matches!(found, CommandMatch::DeletedItems(_))
+        });
         self.verdict(key, replaces)
     }
 }
@@ -872,6 +875,8 @@ pub struct Monitor {
     saved_state_rx: watch::Receiver<crate::app::SavedAppState>,
     toast_tx: mpsc::UnboundedSender<(String, bool)>,
     http: reqwest::Client,
+    /// The tracker sign-in (`signin.rs`); its HTTP goes through `http` too.
+    tracker_auth: TrackerAuth,
     packet_log: PacketLog,
 
     /// When the newest captured data arrived, in epoch milliseconds. Uploaded as
@@ -895,6 +900,10 @@ pub struct Monitor {
     pcapng: Option<crate::pcapng::PcapngWriter>,
 
     ctx: egui::Context,
+
+    /// Where captured wish history keys and wishes go; see
+    /// [`crate::wish_history`].
+    wish_hub: Option<crate::wish_history::WishHub>,
 }
 
 impl Monitor {
@@ -908,6 +917,7 @@ impl Monitor {
         capture_source: CaptureSource,
         saved_state_rx: watch::Receiver<crate::app::SavedAppState>,
         toast_tx: mpsc::UnboundedSender<(String, bool)>,
+        tracker_auth: TrackerAuth,
         ctx: egui::Context,
     ) -> Result<Self> {
         let mut app_state = AppStateManager::new(state_tx.borrow().clone(), state_tx.clone());
@@ -975,6 +985,7 @@ impl Monitor {
             saved_state_rx,
             toast_tx,
             http,
+            tracker_auth,
             packet_log: PacketLog::new(),
             capture_timestamp_ms: None,
             automation_pending_since: None,
@@ -985,7 +996,32 @@ impl Monitor {
             #[cfg(debug_assertions)]
             pcapng,
             ctx,
+            wish_hub: None,
         })
+    }
+
+    /// Hand wish history keys and wishes to `hub`.
+    pub(crate) fn with_wish_hub(mut self, hub: crate::wish_history::WishHub) -> Self {
+        self.wish_hub = Some(hub);
+        self
+    }
+
+    /// Take the wish history messages out of `classified` and hand them on.
+    ///
+    /// Not while replaying a recording: its key is old, and nothing may sync.
+    fn forward_wish_events(&self, classified: &mut Vec<(u16, CommandMatch)>) {
+        let events = crate::wish_history::take_wish_events(classified);
+        if events.is_empty() {
+            return;
+        }
+        if !uploads_allowed(&self.capture_source) {
+            tracing::debug!("not handing wish history messages on during a replay");
+            return;
+        }
+        if let Some(hub) = &self.wish_hub {
+            let uid = self.player_data.gi_player().and_then(|player| player.uid);
+            hub.forward(events, uid);
+        }
     }
 
     pub async fn run(mut self) {
@@ -1107,13 +1143,6 @@ impl Monitor {
                 let _ = reply_tx.send(self.player_data.export_achievements());
                 self.ctx.request_repaint();
             }
-            Message::FindWishUrl(reply_tx) => {
-                let ctx = self.ctx.clone();
-                tokio::spawn(async move {
-                    let _ = reply_tx.send(crate::wish::force_find_url().await);
-                    ctx.request_repaint();
-                });
-            }
             Message::VerifyTrackerKey(url, key, reply_tx) => {
                 let ctx = self.ctx.clone();
                 let client = self.http.clone();
@@ -1122,8 +1151,11 @@ impl Monitor {
                     ctx.request_repaint();
                 });
             }
-            Message::UploadToTracker(json, url, key, reply_tx) => {
-                self.spawn_tracker_upload(url, key, json, UploadReport::Reply(reply_tx));
+            Message::UploadToTracker(json, credential, reply_tx) => {
+                self.spawn_tracker_upload(credential, json, UploadReport::Reply(reply_tx));
+            }
+            Message::Tracker(request) => {
+                self.tracker_auth.handle(self.http.clone(), request);
             }
             _ => (),
         }
@@ -1459,6 +1491,10 @@ impl Monitor {
         if log_packets {
             for command in &commands {
                 let _span = tracing::info_span!("command", id = command.command_id).entered();
+                // The wish history key is a password: never on disk.
+                if auto_artifactarium::matches_get_authkey_rsp(&command.proto_data).is_some() {
+                    continue;
+                }
                 if let Err(e) = self.packet_log.append(command) {
                     tracing::info!("error logging command {e}");
                 }
@@ -1469,7 +1505,8 @@ impl Monitor {
         // connection's data has to be settled before its timestamps are taken,
         // because replacing restarts the automation cycle they are compared
         // against.
-        let classified = classify_commands(&commands);
+        let mut classified = classify_commands(&commands);
+        self.forward_wish_events(&mut classified);
         if classified.is_empty() {
             return;
         }
@@ -1513,6 +1550,10 @@ impl Monitor {
 
         self.capture_timestamp_ms = Some(Local::now().timestamp_millis());
         let player = self.player_data.gi_player();
+        // The login's UID binds its wish key; another UID is a new login.
+        if let Some(hub) = &self.wish_hub {
+            hub.note_uid(player.as_ref().and_then(|player| player.uid));
+        }
         self.app_state.update_captured(updated, player);
         self.check_automation_trigger();
     }
@@ -1553,9 +1594,14 @@ impl Monitor {
         }
     }
 
-    /// Forget everything captured about the account.
+    /// Forget everything captured about the account -- its wish key too: a
+    /// new connection's data may be another account's (alt swapping), and a
+    /// key only counts for the login it came after.
     fn replace_captured_data(&mut self, reason: &str) {
         tracing::info!(reason, "clearing captured data");
+        if let Some(hub) = &self.wish_hub {
+            hub.new_login();
+        }
         self.player_data.reset();
         self.app_state.update_captured(DataUpdated::new(), None);
         self.capture_timestamp_ms = None;
@@ -1703,13 +1749,14 @@ impl Monitor {
             }
         }
 
-        if let Some((json, report)) = tracker_export {
+        if let Some((json, report)) = tracker_export
+            && let Some(credential) = crate::app::upload_credential(&saved_state)
+        {
             let _ = self
                 .toast_tx
                 .send((format!("Uploading to Tracker: {}", report.counts()), false));
             self.spawn_tracker_upload(
-                import_url(&saved_state.tracker_api_url),
-                saved_state.tracker_import_key.clone(),
+                credential,
                 json,
                 UploadReport::Toast {
                     retry_tx: self.automation_retry_tx.clone(),
@@ -1782,19 +1829,33 @@ impl Monitor {
         Ok(path)
     }
 
-    fn spawn_tracker_upload(&self, url: String, key: String, json: String, report: UploadReport) {
+    fn spawn_tracker_upload(
+        &self,
+        credential: UploadCredential,
+        json: String,
+        report: UploadReport,
+    ) {
         let client = self.http.clone();
+        let auth = self.tracker_auth.clone();
         let ctx = self.ctx.clone();
         let toast_tx = self.toast_tx.clone();
         let captured_at = self.capture_timestamp_ms;
         let allowed = uploads_allowed(&self.capture_source);
 
         tokio::spawn(async move {
-            let result = if allowed {
-                upload_to_tracker(&client, &url, &key, json, captured_at).await
-            } else {
+            let result = if !allowed {
                 tracing::warn!("{REPLAY_UPLOAD_REFUSED}");
                 Err(REPLAY_UPLOAD_REFUSED.to_string())
+            } else {
+                match credential {
+                    UploadCredential::ImportKey { url, key } => {
+                        upload_to_tracker(&client, &url, &key, json, captured_at).await
+                    }
+                    UploadCredential::SignedIn { base } => {
+                        auth.upload(&client, &base, json, captured_at, TRACKER_UPLOAD_TIMEOUT)
+                            .await
+                    }
+                }
             };
             match report {
                 UploadReport::Reply(reply_tx) => {
@@ -1869,7 +1930,7 @@ async fn join_capture(
 }
 
 /// The tracker's snapshot import endpoint for a configured base URL.
-fn import_url(base_url: &str) -> String {
+pub(crate) fn import_url(base_url: &str) -> String {
     format!(
         "{}/genshin-accounts-public/import-by-key",
         base_url.trim_end_matches('/')
@@ -1888,20 +1949,7 @@ async fn upload_to_tracker(
     json: String,
     captured_at_ms: Option<i64>,
 ) -> std::result::Result<(), String> {
-    let part = reqwest::multipart::Part::bytes(json.into_bytes())
-        .file_name("irminsul_capture.json")
-        .mime_str("application/json")
-        .map_err(|e| format!("could not build the upload body: {e}"))?;
-
-    // Sent before the file part, because the backend reads it while streaming
-    // the upload. Without it a snapshot is stamped with the server's receive
-    // time, which both misdates a delayed upload and stops the server's
-    // duplicate check from ever firing on a re-upload of unchanged data.
-    let mut form = reqwest::multipart::Form::new();
-    if let Some(captured_at_ms) = captured_at_ms {
-        form = form.text("timestamp", captured_at_ms.to_string());
-    }
-    let form = form.part("file", part);
+    let form = snapshot_form(json, captured_at_ms)?;
 
     let response = client
         .post(url)
@@ -1926,6 +1974,28 @@ async fn upload_to_tracker(
         tracing::error!("Tracker upload failed ({}): {}", status, body);
         Err(format!("HTTP {} - {}", status, body))
     }
+}
+
+/// The multipart body of a snapshot upload, shared by the import-key path and
+/// the signed-in one (`signin.rs`), whose routes take the same body.
+pub(crate) fn snapshot_form(
+    json: String,
+    captured_at_ms: Option<i64>,
+) -> std::result::Result<reqwest::multipart::Form, String> {
+    let part = reqwest::multipart::Part::bytes(json.into_bytes())
+        .file_name("irminsul_capture.json")
+        .mime_str("application/json")
+        .map_err(|e| format!("could not build the upload body: {e}"))?;
+
+    // Sent before the file part, because the backend reads it while streaming
+    // the upload. Without it a snapshot is stamped with the server's receive
+    // time, which both misdates a delayed upload and stops the server's
+    // duplicate check from ever firing on a re-upload of unchanged data.
+    let mut form = reqwest::multipart::Form::new();
+    if let Some(captured_at_ms) = captured_at_ms {
+        form = form.text("timestamp", captured_at_ms.to_string());
+    }
+    Ok(form.part("file", part))
 }
 
 /// What the tracker says about an import key (`verify-key`).
@@ -2111,6 +2181,7 @@ pub(crate) mod tests {
             auto_export_to_tracker: true,
             tracker_import_key: "gdt_import_1_abc".to_string(),
             tracker_verified: true,
+            tracker_sign_in: crate::app::TrackerSignIn::SignedOut,
             export_settings: ExportSettings {
                 include_characters: false,
                 fake_initialize_4th_line: true,

@@ -1,0 +1,87 @@
+[
+  {
+    "addProps": [
+      {
+        "propType": "FIGHT_PROP_HEAL_ADD",
+        "value": 0.1
+      }
+    ],
+    "affixId": 2100010,
+    "descTextMapHash": 2033132115,
+    "id": 210001,
+    "nameTextMapHash": 35587211,
+    "paramList": [
+      0.1
+    ]
+  },
+  {
+    "addProps": [
+      {}
+    ],
+    "affixId": 2100011,
+    "descTextMapHash": 3232097227,
+    "id": 210001,
+    "level": 1,
+    "nameTextMapHash": 2364208339,
+    "paramList": [
+      0.2
+    ]
+  },
+  {
+    "addProps": [
+      {
+        "propType": "FIGHT_PROP_CRITICAL",
+        "value": 0.36
+      }
+    ],
+    "affixId": 2150310,
+    "descTextMapHash": 3162549107,
+    "id": 215031,
+    "nameTextMapHash": 730759547,
+    "paramList": [
+      0.36
+    ]
+  },
+  {
+    "addProps": [
+      {}
+    ],
+    "affixId": 2150311,
+    "descTextMapHash": 1264313859,
+    "id": 215031,
+    "level": 1,
+    "nameTextMapHash": 1249831355,
+    "paramList": [
+      0.12
+    ]
+  },
+  {
+    "addProps": [
+      {
+        "propType": "FIGHT_PROP_ATTACK_PERCENT",
+        "value": 0.18
+      }
+    ],
+    "affixId": 2150480,
+    "descTextMapHash": 2884824569,
+    "id": 215048,
+    "nameTextMapHash": 1048849443,
+    "paramList": [
+      0.18
+    ]
+  },
+  {
+    "addProps": [
+      {}
+    ],
+    "affixId": 2150481,
+    "descTextMapHash": 3645992313,
+    "id": 215048,
+    "level": 1,
+    "nameTextMapHash": 1035953267,
+    "openConfig": "Relic_7.0_StarSupport_4",
+    "paramList": [
+      0.12
+    ]
+  }
+]

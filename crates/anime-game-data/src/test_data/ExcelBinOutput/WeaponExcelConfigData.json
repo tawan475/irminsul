@@ -1,0 +1,60 @@
+[
+  {
+    "awakenCosts": [
+      2000,
+      4000,
+      8000,
+      16000
+    ],
+    "awakenIcon": "UI_EquipIcon_Sword_Morax_Awaken",
+    "awakenLightMapTexture": "ART/Equip/AvatarEquip/Equip_Sword_Morax/Equip_Sword_Morax_OverrideTexture/Equip_Sword_Morax_02_Tex_Lightmap",
+    "awakenMaterial": 0,
+    "awakenTexture": "ART/Equip/AvatarEquip/Equip_Sword_Morax/Equip_Sword_Morax_OverrideTexture/Equip_Sword_Morax_02_Tex_Diffuse",
+    "BOHNLMAMCCC": 0,
+    "descTextMapHash": 1273837837,
+    "destroyReturnMaterial": [
+      0
+    ],
+    "destroyReturnMaterialCount": [
+      0
+    ],
+    "destroyRule": "DESTROY_NONE",
+    "dropable": false,
+    "gachaCardNameHash": 14948704767876625565,
+    "gadgetId": 50011505,
+    "globalItemLimit": 0,
+    "icon": "UI_EquipIcon_Sword_Morax",
+    "id": 11505,
+    "initialLockState": 1,
+    "itemType": "ITEM_WEAPON",
+    "materialType": "WEAPON_MATERIAL_NONE",
+    "MIANGNNHMGH": "None",
+    "nameTextMapHash": 1345343763,
+    "ONLBHNHBLJL": false,
+    "rank": 10,
+    "rankLevel": 5,
+    "skillAffix": [
+      111505,
+      0
+    ],
+    "storyId": 191505,
+    "unRotate": false,
+    "useLevel": 0,
+    "weaponBaseExp": 300000,
+    "weaponPromoteId": 11505,
+    "weaponProp": [
+      {
+        "initValue": 44.3358,
+        "propType": "FIGHT_PROP_BASE_ATTACK",
+        "type": "GROW_CURVE_ATTACK_304"
+      },
+      {
+        "initValue": 0.096,
+        "propType": "FIGHT_PROP_CRITICAL",
+        "type": "GROW_CURVE_CRITICAL_301"
+      }
+    ],
+    "weaponType": "WEAPON_SWORD_ONE_HAND",
+    "weight": 1
+  }
+]

@@ -28,8 +28,9 @@ mod pcapng;
 mod player_data;
 mod recording;
 mod replay;
+mod signin;
 mod update;
-mod wish;
+mod wish_history;
 
 const APP_ID: &str = "Irminsul";
 
@@ -69,18 +70,21 @@ pub enum Message {
         oneshot::Sender<Result<(String, ExportCounts)>>,
     ),
     ExportAchievements(oneshot::Sender<Result<Vec<u32>>>),
-    /// Only sent by the wish UI, which exists on Windows and on Linux (through
-    /// a Proton/Wine prefix) — the platforms where the game writes the
-    /// `output_log.txt` the URL is recovered from. `monitor.rs` still handles
-    /// it everywhere.
-    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
-    FindWishUrl(oneshot::Sender<Result<String>>),
     VerifyTrackerKey(
         String,
         String,
         oneshot::Sender<Result<monitor::TrackerAccount>>,
     ),
-    UploadToTracker(String, String, String, oneshot::Sender<Result<(), String>>),
+    /// Upload a GOOD export, with an import key or the sign-in (see
+    /// `app::upload_credential`).
+    UploadToTracker(
+        String,
+        signin::UploadCredential,
+        oneshot::Sender<Result<(), String>>,
+    ),
+    /// Something for the tracker sign-in (`signin.rs`): sign in or out, a
+    /// whoami refresh, an address change. Answered through its status.
+    Tracker(signin::TrackerRequest),
     /// Terminate the running game, from the "game already running" modal.
     ///
     /// Handled in `monitor.rs` rather than in the UI because the process
@@ -612,7 +616,11 @@ mod tests {
     fn every_http_client_is_built_through_the_shared_builder() {
         for (name, source) in [
             ("monitor.rs", include_str!("monitor.rs")),
-            ("wish.rs", include_str!("wish.rs")),
+            (
+                "wish_history/cache.rs",
+                include_str!("wish_history/cache.rs"),
+            ),
+            ("wish_history/sync.rs", include_str!("wish_history/sync.rs")),
             ("update.rs", include_str!("update.rs")),
             ("app.rs", include_str!("app.rs")),
             ("replay.rs", include_str!("replay.rs")),

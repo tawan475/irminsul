@@ -1,0 +1,216 @@
+[
+  {
+    "cdTime": 8,
+    "CMGEIEOLPPL": 1433628987,
+    "costElemType": "Electric",
+    "costElemVal": 30,
+    "descTextMapHash": 1259105312,
+    "extraDescTextMapHash": 797473135,
+    "id": 10014,
+    "isAttackCameraLock": true,
+    "lockShape": "CircleLockEnemyR15H10HC",
+    "lockWeightParams": [
+      1,
+      1,
+      0.3,
+      0
+    ],
+    "maxChargeNum": 1,
+    "nameTextMapHash": 3173933501,
+    "skillIcon": "Skill_E_Kate",
+    "triggerID": 5
+  },
+  {
+    "cdTime": 12,
+    "CMGEIEOLPPL": 1535853747,
+    "costElemType": "Fire",
+    "costElemVal": 40,
+    "descTextMapHash": 1744784720,
+    "extraDescTextMapHash": 4130764255,
+    "id": 10017,
+    "isAttackCameraLock": true,
+    "lockShape": "CircleLockEnemyR15H10HC",
+    "lockWeightParams": [
+      1,
+      1,
+      0.3,
+      0
+    ],
+    "maxChargeNum": 1,
+    "nameTextMapHash": 4246808797,
+    "proudSkillGroupId": 2139,
+    "skillIcon": "Skill_E_Ambor",
+    "triggerID": 5
+  },
+  {
+    "cdTime": 10,
+    "CMGEIEOLPPL": 4092635235,
+    "descTextMapHash": 4048562608,
+    "extraDescTextMapHash": 1783473423,
+    "id": 10018,
+    "isAttackCameraLock": true,
+    "lockShape": "CircleLockEnemyR5H6HC",
+    "lockWeightParams": [
+      1,
+      1,
+      0.3,
+      0
+    ],
+    "maxChargeNum": 1,
+    "nameTextMapHash": 682887613,
+    "proudSkillGroupId": 232,
+    "skillIcon": "Skill_S_Ayaka_01",
+    "triggerID": 2
+  },
+  {
+    "cdTime": 20,
+    "CMGEIEOLPPL": 1165626611,
+    "costElemType": "Ice",
+    "costElemVal": 80,
+    "descTextMapHash": 3746604368,
+    "extraDescTextMapHash": 2439357583,
+    "id": 10019,
+    "isAttackCameraLock": true,
+    "lockShape": "CircleLockEnemyR15H10HC",
+    "lockWeightParams": [
+      1,
+      1,
+      0.3,
+      0
+    ],
+    "maxChargeNum": 1,
+    "nameTextMapHash": 81399925,
+    "proudSkillGroupId": 239,
+    "skillIcon": "Skill_E_Ayaka",
+    "triggerID": 5
+  },
+  {
+    "abilityName": "Avatar_Ayaka_ExtraAttack",
+    "CMGEIEOLPPL": 1431730411,
+    "descTextMapHash": 3246000152,
+    "extraDescTextMapHash": 976131535,
+    "id": 10024,
+    "isAttackCameraLock": true,
+    "lockShape": "CircleLockEnemyR5H6HC",
+    "lockWeightParams": [
+      1,
+      1,
+      0.3,
+      0
+    ],
+    "maxChargeNum": 1,
+    "nameTextMapHash": 813430205,
+    "proudSkillGroupId": 231,
+    "skillIcon": "Skill_A_01"
+  },
+  {
+    "abilityName": "Avatar_Qin_DandelionWind",
+    "cdTime": 20,
+    "CMGEIEOLPPL": 2184368235,
+    "costElemType": "Wind",
+    "costElemVal": 80,
+    "descTextMapHash": 1484586416,
+    "extraDescTextMapHash": 1246923047,
+    "id": 10034,
+    "isAttackCameraLock": true,
+    "lockShape": "CircleLockEnemyR15H10HC",
+    "lockWeightParams": [
+      1,
+      1,
+      0.3,
+      0
+    ],
+    "maxChargeNum": 1,
+    "nameTextMapHash": 1586562101,
+    "proudSkillGroupId": 339,
+    "skillIcon": "Skill_E_Qin_01",
+    "triggerID": 5
+  },
+  {
+    "cdTime": 20,
+    "CMGEIEOLPPL": 3857225107,
+    "costElemType": "Water",
+    "costElemVal": 80,
+    "descTextMapHash": 3483680792,
+    "extraDescTextMapHash": 3122637055,
+    "id": 10072,
+    "isAttackCameraLock": true,
+    "lockShape": "CircleLockEnemyR15H10HC",
+    "lockWeightParams": [
+      1,
+      1,
+      0.3,
+      0
+    ],
+    "maxChargeNum": 1,
+    "nameTextMapHash": 3238780077,
+    "proudSkillGroupId": 1439,
+    "skillIcon": "Skill_E_Barbara_01",
+    "triggerID": 5
+  },
+  {
+    "abilityName": "Avatar_Player_RockTide",
+    "cdTime": 15,
+    "CMGEIEOLPPL": 3222589443,
+    "costElemType": "Rock",
+    "costElemVal": 60,
+    "descTextMapHash": 3588021304,
+    "extraDescTextMapHash": 780002407,
+    "id": 10078,
+    "isAttackCameraLock": true,
+    "lockShape": "CircleLockEnemyR15H10HC",
+    "lockWeightParams": [
+      1,
+      1,
+      0.3,
+      0
+    ],
+    "maxChargeNum": 1,
+    "nameTextMapHash": 1608625253,
+    "PLBHFOJGOMM": true,
+    "proudSkillGroupId": 939,
+    "skillIcon": "Skill_E_PlayerRock_01",
+    "triggerID": 15
+  },
+  {
+    "cdTime": 20,
+    "CMGEIEOLPPL": 1060898883,
+    "costElemType": "Grass",
+    "costElemVal": 80,
+    "descTextMapHash": 2829037960,
+    "extraDescTextMapHash": 44259567,
+    "id": 10118,
+    "isAttackCameraLock": true,
+    "lockShape": "CircleLockEnemyR8H6HC",
+    "lockWeightParams": [
+      1,
+      1,
+      0.3,
+      0
+    ],
+    "maxChargeNum": 1,
+    "nameTextMapHash": 2504837493,
+    "proudSkillGroupId": 1139,
+    "skillIcon": "Skill_S_PlayerGrass_01",
+    "triggerID": 35
+  },
+  {
+    "abilityName": "Avatar_PlayerBoy_ExtraAttack_Common",
+    "CMGEIEOLPPL": 2838300939,
+    "descTextMapHash": 1517379584,
+    "extraDescTextMapHash": 3408858615,
+    "id": 100540,
+    "isAttackCameraLock": true,
+    "lockShape": "CircleLockEnemyR5H6HC",
+    "lockWeightParams": [
+      1,
+      1,
+      0.3,
+      0
+    ],
+    "maxChargeNum": 1,
+    "nameTextMapHash": 1952055533,
+    "proudSkillGroupId": 730,
+    "skillIcon": "Skill_A_01"
+  }
+]

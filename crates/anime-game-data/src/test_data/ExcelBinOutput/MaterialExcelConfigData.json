@@ -1,0 +1,74 @@
+[
+  {
+    "cdGroup": 0,
+    "cdTime": 0,
+    "closeBagAfterUsed": false,
+    "descTextMapHash": 1531906317,
+    "destroyReturnMaterial": [],
+    "destroyReturnMaterialCount": [],
+    "destroyRule": "DESTROY_RETURN_MATERIAL",
+    "DIICLGBFLIA": "Filter_HEAL",
+    "dropable": false,
+    "effectDescTextMapHash": 2977224863,
+    "effectGadgetID": 0,
+    "effectIcon": "UI_Buff_Item_Recovery_HpAdd",
+    "effectName": "",
+    "foodQuality": "FOOD_QUALITY_NONE",
+    "gadgetId": 70540021,
+    "globalItemLimit": 0,
+    "GNAPKFNLDHC": "None",
+    "icon": "UI_ItemIcon_100002",
+    "id": 100002,
+    "interactionTitleTextMapHash": 3748813039,
+    "isForceGetHint": false,
+    "isHidden": false,
+    "isSplitDrop": true,
+    "itemType": "ITEM_MATERIAL",
+    "itemUse": [
+      {
+        "useOp": "ITEM_USE_ADD_CUR_HP",
+        "useParam": [
+          "300",
+          "Eff_UI_AvatarIcon_Recovery_Once",
+          "",
+          "",
+          ""
+        ]
+      },
+      {
+        "useOp": "ITEM_USE_NONE",
+        "useParam": [
+          "",
+          ""
+        ]
+      },
+      {
+        "useOp": "ITEM_USE_NONE",
+        "useParam": [
+          "",
+          ""
+        ]
+      }
+    ],
+    "materialType": "MATERIAL_NOTICE_ADD_HP",
+    "maxUseCount": 99,
+    "nameTextMapHash": 4094258556,
+    "noFirstGetHint": false,
+    "picPath": [],
+    "playGainEffect": false,
+    "rank": 90000,
+    "rankLevel": 0,
+    "satiationParams": [
+      5,
+      15000
+    ],
+    "setID": 0,
+    "specialDescTextMapHash": 3162499369,
+    "stackLimit": 9999,
+    "typeDescTextMapHash": 115528718,
+    "useLevel": 0,
+    "useOnGain": false,
+    "useTarget": "ITEM_USE_TARGET_SPECIFY_ALIVE_AVATAR",
+    "weight": 1
+  }
+]

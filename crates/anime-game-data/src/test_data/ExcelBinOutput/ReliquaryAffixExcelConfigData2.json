@@ -1,0 +1,16 @@
+[
+  {
+    "depotId": 501,
+    "groupId": 2,
+    "id": 501022,
+    "propType": "FIGHT_PROP_HP",
+    "propValue": 240
+  },
+  {
+    "depotId": 982,
+    "groupId": 45,
+    "id": 982001,
+    "propType": "FIGHT_PROP_ROCK_ADD_HURT",
+    "propValue": 0.9
+  }
+]

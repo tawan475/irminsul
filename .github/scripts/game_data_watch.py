@@ -8,9 +8,14 @@ therefore already carries it, and a dump newer than the latest release is new
 characters, weapons, artifacts and materials waiting for a release to ship.
 
 .github/workflows/game-data-watch.yml runs this once a day. It reads the
-newest dump commit (one request to the GitLab API the crate itself reads), the
-latest release's publish date and the issues labelled `game-data`, and opens
-one issue per dump that no release carries yet.
+newest dump commit, the latest release's publish date and the issues labelled
+`game-data`, and opens one issue per dump that no release carries yet.
+
+The dump commit comes from git, as it does for the crate: a shallow clone of
+the repository that fetches the newest commit object and nothing else.
+gitlab.com's REST API, which this used to read, intermittently answers with a
+Cloudflare bot check (an HTTP 403 HTML page); it is still asked when git cannot
+answer.
 
 Usage: python .github/scripts/game_data_watch.py [--dry-run]
   GITHUB_TOKEN needs issues: write and contents: read. GITHUB_REPOSITORY
@@ -24,16 +29,24 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable
 
-# The request the anime-game-data crate makes to find the newest dump.
-DUMP_COMMITS_URL = "https://gitlab.com/api/v4/projects/83871005/repository/commits?per_page=1"
 DUMP_REPO_URL = "https://gitlab.com/Dimbreath/animegamedata2"
+DUMP_GIT_URL = f"{DUMP_REPO_URL}.git"
+# The fallback when git cannot answer.
+DUMP_COMMITS_URL = "https://gitlab.com/api/v4/projects/83871005/repository/commits?per_page=1"
+
+# What `git log` prints for the dump commit: sha, committer date (strict ISO
+# 8601) and subject, NUL-separated (a subject can hold anything but a NUL).
+LOG_FORMAT = "%H%x00%cI%x00%s"
+GIT_TIMEOUT_S = 120
 GITHUB_API = "https://api.github.com"
 DEFAULT_REPO = "tawan475/irminsul"
 
@@ -180,6 +193,52 @@ def decide(dump: Dump, release: Release | None, issues: list[Issue]) -> Decision
     )
 
 
+# --- git -----------------------------------------------------------------------
+
+# `run_git`'s signature: (args) -> stdout; raises RuntimeError on failure.
+Git = Callable[[list], str]
+
+
+def run_git(args: list) -> str:
+    """`git <args>`'s standard output. Raises RuntimeError when git is missing,
+    fails or takes longer than GIT_TIMEOUT_S."""
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    try:
+        result = subprocess.run(
+            ["git", *args], capture_output=True, text=True, timeout=GIT_TIMEOUT_S, env=env
+        )
+    except FileNotFoundError as error:
+        raise RuntimeError("git is not installed") from error
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"git {' '.join(args)} took longer than {GIT_TIMEOUT_S} s") from error
+    if result.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed ({result.returncode}): {result.stderr.strip()}")
+    return result.stdout
+
+
+def parse_log(output: str) -> tuple[str, datetime, str]:
+    """(sha, committed at, title) from `git log -1 --format=LOG_FORMAT`."""
+    fields = output.rstrip("\r\n").split("\0")
+    if len(fields) != 3 or not re.fullmatch(r"[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?", fields[0]):
+        raise RuntimeError(f"unexpected git log output: {output[:200]!r}")
+    sha, committed, title = fields
+    try:
+        committed_at = parse_time(committed)
+    except ValueError as error:
+        raise RuntimeError(f"unexpected commit date in git log output: {committed!r}") from error
+    return sha.lower(), committed_at, title
+
+
+def newest_dump_from_git(git: Git = run_git) -> Dump:
+    """The dump's newest commit, from a shallow, tree-less clone: one commit
+    object, about a kilobyte, whatever the size of the dump."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        repo = os.path.join(tmp, "dump.git")
+        git(["clone", "--quiet", "--bare", "--depth", "1", "--filter=tree:0", DUMP_GIT_URL, repo])
+        sha, committed_at, title = parse_log(git(["--git-dir", repo, "log", "-1", f"--format={LOG_FORMAT}"]))
+    return Dump(sha=sha, title=title, committed_at=committed_at, url=f"{DUMP_REPO_URL}/-/commit/{sha}")
+
+
 # --- the two APIs ---------------------------------------------------------------
 
 # `http_request`'s signature: (method, url, token, payload) -> (status, body).
@@ -203,22 +262,43 @@ def http_request(method: str, url: str, token: str = "", payload: object = None)
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             raw = response.read()
-            return response.status, json.loads(raw) if raw else None
+            content_type = response.headers.get("Content-Type")
+            status = response.status
     except urllib.error.HTTPError as error:
         if error.code == 404:
             return 404, None
-        detail = error.read().decode(errors="replace")[:500]
+        raw = error.read()
+        if looks_like_html(error.headers.get("Content-Type") if error.headers else None, raw):
+            raise RuntimeError(f"{method} {url} failed with {error.code}: {html_kind(raw)} instead of JSON") from error
+        detail = raw.decode(errors="replace")[:500]
         raise RuntimeError(f"{method} {url} failed with {error.code}: {detail}") from error
+    if looks_like_html(content_type, raw):
+        raise RuntimeError(f"{method} {url} answered {status} with {html_kind(raw)} instead of JSON")
+    return status, json.loads(raw) if raw else None
+
+
+def looks_like_html(content_type: str | None, raw: bytes) -> bool:
+    """An HTML page where JSON was asked for: how gitlab.com's Cloudflare front
+    answers a request it wants a browser for ("Just a moment...")."""
+    return "text/html" in (content_type or "").lower() or raw.lstrip()[:1] == b"<"
+
+
+def html_kind(raw: bytes) -> str:
+    if b"Just a moment" in raw or b"challenge-platform" in raw:
+        return "a Cloudflare bot check page"
+    return "an HTML page"
 
 
 class Api:
-    """Dimbreath's GitLab commits and this repository's GitHub releases and
-    issues. `request` is `http_request`, or a stub in the tests."""
+    """Dimbreath's newest dump commit and this repository's GitHub releases and
+    issues. `request` is `http_request` and `git` is `run_git`, or stubs in the
+    tests."""
 
-    def __init__(self, repo: str, token: str = "", request: Request = http_request):
+    def __init__(self, repo: str, token: str = "", request: Request = http_request, git: Git = run_git):
         self.repo = repo
         self.token = token
         self._request = request
+        self._git = git
 
     def _get(self, url: str) -> object:
         status, data = self._request("GET", url, self.token)
@@ -230,6 +310,19 @@ class Api:
         return f"{GITHUB_API}/repos/{self.repo}{path}"
 
     def newest_dump(self) -> Dump:
+        """From git; from the GitLab API only when git cannot answer."""
+        try:
+            return newest_dump_from_git(self._git)
+        except RuntimeError as git_error:
+            print(f"git could not read the dump ({git_error}); asking the GitLab API")
+            try:
+                return self.newest_dump_from_api()
+            except RuntimeError as api_error:
+                raise RuntimeError(
+                    f"unable to read the newest dump commit: git: {git_error}; GitLab API: {api_error}"
+                ) from api_error
+
+    def newest_dump_from_api(self) -> Dump:
         commits = self._get(DUMP_COMMITS_URL)
         if not isinstance(commits, list) or not commits:
             raise RuntimeError(f"GitLab returned no commits for the dump: {commits!r}")

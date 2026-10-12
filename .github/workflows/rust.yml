@@ -63,7 +63,9 @@ jobs:
           echo "set man-db/auto-update false" | sudo debconf-communicate
           sudo dpkg-reconfigure -f noninteractive man-db
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libappindicator3-dev libatk1.0-dev
+          # libdbus-1-dev: the keyring crate's Secret Service backend, where
+          # the tracker sign-in keeps its refresh token (src/signin.rs).
+          sudo apt-get install -y libgtk-3-dev libappindicator3-dev libatk1.0-dev libdbus-1-dev pkg-config
       - name: Setup libpcap
         if: runner.os == 'Linux'
         uses: ./.github/actions/setup-libpcap
@@ -160,6 +162,10 @@ jobs:
         run: cargo doc --locked -p auto-artifactarium --no-deps --all-features
         env:
           RUSTDOCFLAGS: -Dwarnings
+      # crates/anime-game-data, the game data crate build.rs uses: pure Rust
+      # as well, so it rides along here. --all-features covers its `cli` bin.
+      - run: cargo clippy --locked -p anime-game-data --all-targets --all-features -- -Dwarnings
+      - run: cargo test --locked -p anime-game-data --all-features
 
   # update_rev.py is what turns "upstream pushed something" into a new pinned
   # revision in Cargo.toml, and its two guards -- refuse to run under an active

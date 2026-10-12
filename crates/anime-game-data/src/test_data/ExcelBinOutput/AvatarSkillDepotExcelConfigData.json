@@ -1,0 +1,94 @@
+[
+  {
+    "attackModeSkill": 0,
+    "energySkill": 10019,
+    "extraAbilities": [
+      "",
+      "",
+      ""
+    ],
+    "id": 201,
+    "inherentProudSkillOpens": [
+      {
+        "needAvatarPromoteLevel": 1,
+        "proudSkillGroupId": 221
+      },
+      {
+        "needAvatarPromoteLevel": 4,
+        "proudSkillGroupId": 222
+      },
+      {
+        "needAvatarPromoteLevel": 0,
+        "proudSkillGroupId": 223
+      },
+      {
+        "needAvatarPromoteLevel": 0,
+        "proudSkillGroupId": 0
+      },
+      {
+        "needAvatarPromoteLevel": 0,
+        "proudSkillGroupId": 0
+      }
+    ],
+    "JAPGANPLPDP": 0,
+    "KFIDGDJLNJG": 0,
+    "leaderTalent": 211,
+    "LMKOLGFBOEN": "None",
+    "MGIHOLHNACB": 0,
+    "skillDepotAbilityGroup": "",
+    "skills": [
+      10024,
+      10018,
+      10013,
+      0
+    ],
+    "subSkills": [
+      10020,
+      10021,
+      10052,
+      10053,
+      10111,
+      10001,
+      5002010
+    ],
+    "talents": [
+      21,
+      22,
+      23,
+      24,
+      25,
+      26
+    ],
+    "talentStarName": "Talent_Ayaka"
+  },
+  {
+    "extraAbilities": [
+      "",
+      "",
+      ""
+    ],
+    "id": 501,
+    "skillDepotAbilityGroup": "Avatar_Player_AbilityGroup_Boy_Common",
+    "skills": [
+      100540,
+      0,
+      0,
+      0
+    ],
+    "subSkills": [
+      10035,
+      10101,
+      10001,
+      10102,
+      5005010
+    ],
+    "talents": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  }
+]
