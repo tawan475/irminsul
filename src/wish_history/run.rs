@@ -53,6 +53,21 @@ pub(crate) struct Partial {
     records: BTreeMap<u64, ApiRecord>,
 }
 
+#[cfg(test)]
+impl Partial {
+    /// Something unfinished, for tests that only count partials.
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            uid: "811111111".to_owned(),
+            floor: Known::default(),
+            top: 2,
+            end_id: 1,
+            next_page: 2,
+            records: BTreeMap::new(),
+        }
+    }
+}
+
 /// Why a run ended early.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RunError {
@@ -64,12 +79,15 @@ pub(crate) enum RunError {
     Tracker(String),
     /// The answers were not consistent (records of two UIDs, a bad id).
     Data(String),
+    /// The records are another UID's than the login the key came after.
+    OtherAccount,
 }
 
 impl std::fmt::Display for RunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::KeyExpired => write!(f, "the wish key expired"),
+            Self::OtherAccount => write!(f, "the wish key belongs to another account"),
             Self::Api(why) | Self::Tracker(why) | Self::Data(why) => write!(f, "{why}"),
         }
     }
@@ -138,6 +156,9 @@ pub(crate) struct Run<'a, S> {
     tracker: &'a Tracker,
     progress: &'a (dyn Fn(Banner, u32) + Sync),
     page_cap: u32,
+    /// The UID of the login the key came after: records of any other are
+    /// refused, before anything is sent.
+    expected_uid: Option<String>,
     uid: Option<String>,
     region: String,
     cursor: Option<Cursor>,
@@ -155,10 +176,17 @@ impl<'a, S: Sleeper> Run<'a, S> {
             tracker,
             progress,
             page_cap,
+            expected_uid: None,
             uid: None,
             region: String::new(),
             cursor: None,
         }
+    }
+
+    /// Send only records of `uid` (the key's login's).
+    pub(crate) fn for_uid(mut self, uid: String) -> Self {
+        self.expected_uid = Some(uid);
+        self
     }
 
     /// Sync `banners`, carrying on from and updating `partials`.
@@ -435,6 +463,13 @@ impl<'a, S: Sleeper> Run<'a, S> {
     /// Every record must be the same account's: the first one read decides.
     fn check_uid(&mut self, records: &[ApiRecord]) -> Result<(), RunError> {
         for record in records {
+            if self
+                .expected_uid
+                .as_ref()
+                .is_some_and(|expected| *expected != record.uid)
+            {
+                return Err(RunError::OtherAccount);
+            }
             match &self.uid {
                 None => self.uid = Some(record.uid.clone()),
                 Some(uid) if *uid == record.uid => {}

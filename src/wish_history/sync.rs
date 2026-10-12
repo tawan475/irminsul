@@ -109,6 +109,8 @@ pub(crate) enum Phase {
     Idle,
     /// Reading a banner's history.
     Syncing { banner: Banner, page: u32 },
+    /// A key is held but the user's settings keep it from syncing: why.
+    Off(&'static str),
 }
 
 /// How the last run ended.
@@ -147,6 +149,7 @@ impl SyncStatus {
             Phase::Syncing { banner, page } => {
                 return Some(format!("Syncing wishes: banner {banner}, page {page}…"));
             }
+            Phase::Off(why) => return Some(format!("Not synced: {why}")),
             Phase::Idle => {}
         }
         let last = self.last.as_ref()?;
@@ -164,6 +167,8 @@ impl SyncStatus {
 /// The sync task. See the module documentation of `wish_history`.
 pub(crate) struct WishSync {
     trigger_rx: mpsc::UnboundedReceiver<Trigger>,
+    /// Counts logins: a run in flight stops when it moves.
+    login_rx: watch::Receiver<u64>,
     key_tx: Arc<watch::Sender<Option<WishKey>>>,
     status_tx: watch::Sender<SyncStatus>,
     saved_state_rx: watch::Receiver<SavedAppState>,
@@ -175,11 +180,16 @@ pub(crate) struct WishSync {
     tracker_http: reqwest::Client,
     schedule: Schedule,
     partials: BTreeMap<Banner, Partial>,
+    /// Where pages are read instead of the key's own endpoint (tests).
+    log_endpoint: Option<String>,
+    pacing: Pacing,
 }
 
 impl WishSync {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         trigger_rx: mpsc::UnboundedReceiver<Trigger>,
+        login_rx: watch::Receiver<u64>,
         key_tx: Arc<watch::Sender<Option<WishKey>>>,
         status_tx: watch::Sender<SyncStatus>,
         saved_state_rx: watch::Receiver<SavedAppState>,
@@ -198,6 +208,7 @@ impl WishSync {
         };
         Self {
             trigger_rx,
+            login_rx,
             key_tx,
             status_tx,
             saved_state_rx,
@@ -208,7 +219,20 @@ impl WishSync {
             tracker_http: client(TRACKER_REQUEST_TIMEOUT),
             schedule: Schedule::default(),
             partials: BTreeMap::new(),
+            log_endpoint: None,
+            pacing: Pacing::default(),
         }
+    }
+
+    /// Read pages at `endpoint`, without waits between them (tests).
+    #[cfg(test)]
+    pub(crate) fn read_pages_at(&mut self, endpoint: String) {
+        self.log_endpoint = Some(endpoint);
+        self.pacing = Pacing {
+            request: Duration::ZERO,
+            banner: Duration::ZERO,
+            backoff: Vec::new(),
+        };
     }
 
     /// Run until the monitor's end of the channel is gone.
@@ -240,17 +264,52 @@ impl WishSync {
     }
 
     fn on_trigger(&mut self, trigger: Trigger, now: Instant) {
-        if self.fresh_key(now).is_none() {
+        if trigger == Trigger::Cleared {
+            self.clear();
             return;
         }
-        if !super::sync_enabled(&self.saved_state_rx.borrow()) {
-            tracing::debug!("wish sync is off (no tracker credential, or uploads are off)");
+        // Only a key of this login whose UID is known syncs (the hub sends
+        // `NewKey` again once the UID binds a waiting key).
+        if self.fresh_key(now).is_none_or(|key| key.uid().is_none()) {
             return;
+        }
+        if let Some(why) = self.blocked() {
+            tracing::info!("wish sync: not synced: {why}");
+            self.status_tx
+                .send_modify(|status| status.phase = Phase::Off(why));
+            self.ctx.request_repaint();
+            return;
+        }
+        if matches!(self.status_tx.borrow().phase, Phase::Off(_)) {
+            self.status_tx
+                .send_modify(|status| status.phase = Phase::Idle);
         }
         match trigger {
             Trigger::NewKey => self.schedule.on_new_key(now),
             Trigger::Wish(banner) => self.schedule.on_wish(now, banner),
+            Trigger::Cleared => unreachable!("handled above"),
         }
+    }
+
+    /// Why the user's settings keep a key from syncing: the same gate as
+    /// automated uploads, never overridden.
+    fn blocked(&self) -> Option<&'static str> {
+        let state = self.saved_state_rx.borrow();
+        if !state.auto_export_to_tracker {
+            return Some("uploads to the Tracker are off");
+        }
+        if !super::sync_enabled(&state) || credential_for(&state, &self.auth).is_none() {
+            return Some("no Tracker sign-in or verified import key");
+        }
+        None
+    }
+
+    /// A new login: nothing of the previous one's sync is kept.
+    fn clear(&mut self) {
+        self.schedule.clear();
+        self.partials.clear();
+        self.status_tx.send_replace(SyncStatus::default());
+        self.ctx.request_repaint();
     }
 
     async fn run_due(&mut self, now: Instant) {
@@ -259,6 +318,10 @@ impl WishSync {
             return;
         }
         let Some(key) = self.fresh_key(now) else {
+            self.schedule.clear();
+            return;
+        };
+        let Some(uid) = key.uid() else {
             self.schedule.clear();
             return;
         };
@@ -274,10 +337,12 @@ impl WishSync {
         };
         let mut log = LogClient::new(
             self.log_http.clone(),
-            key.endpoint().to_owned(),
+            self.log_endpoint
+                .clone()
+                .unwrap_or_else(|| key.endpoint().to_owned()),
             key.clone(),
             TokioSleeper,
-            Pacing::default(),
+            self.pacing.clone(),
         );
 
         tracing::info!(?banners, "syncing wish history");
@@ -287,9 +352,27 @@ impl WishSync {
             status_tx.send_modify(|status| status.phase = Phase::Syncing { banner, page });
             ctx.request_repaint();
         };
-        let report = Run::new(&mut log, &tracker, &progress, PAGES_PER_RUN)
-            .sync(&banners, &mut self.partials)
-            .await;
+        // A new login while this runs stops it before it sends: the key, and
+        // whatever was read with it, are the previous login's.
+        let login = *self.login_rx.borrow();
+        let mut login_rx = self.login_rx.clone();
+        let new_login = async move {
+            if login_rx.wait_for(|now| *now != login).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        };
+        let run = Run::new(&mut log, &tracker, &progress, PAGES_PER_RUN)
+            .for_uid(uid.to_string())
+            .sync(&banners, &mut self.partials);
+        let report = tokio::select! {
+            report = run => Some(report),
+            () = new_login => None,
+        };
+        let Some(report) = report else {
+            tracing::info!("wish: a new login; stopped the sync before it sent anything");
+            self.clear();
+            return;
+        };
         tracing::info!(
             requests = log.requests(),
             sent = report.sent,
@@ -302,21 +385,30 @@ impl WishSync {
         self.finish(&key, report, Instant::now());
     }
 
+    /// Forget `key`, unless a newer key arrived during the run.
+    fn drop_key(&self, key: &WishKey) {
+        self.key_tx.send_if_modified(|current| {
+            if current
+                .as_ref()
+                .is_some_and(|current| current.same_key(key))
+            {
+                *current = None;
+                return true;
+            }
+            false
+        });
+    }
+
     fn finish(&mut self, key: &WishKey, report: RunReport, now: Instant) {
         let outcome = match &report.error {
             Some(RunError::KeyExpired) => {
-                // Only if no newer key arrived during the run.
-                self.key_tx.send_if_modified(|current| {
-                    if current
-                        .as_ref()
-                        .is_some_and(|current| current.same_key(key))
-                    {
-                        *current = None;
-                        return true;
-                    }
-                    false
-                });
+                self.drop_key(key);
                 Outcome::KeyExpired
+            }
+            Some(RunError::OtherAccount) => {
+                tracing::info!("wish: the wish key belongs to another account; nothing sent");
+                self.drop_key(key);
+                Outcome::Failed(RunError::OtherAccount.to_string())
             }
             Some(error) => Outcome::Failed(error.to_string()),
             None if !report.unfinished.is_empty() => {
@@ -418,7 +510,7 @@ mod tests {
                 "webview_gacha",
                 "hk4e_global",
             ))],
-            None,
+            Some(811_111_111),
         );
         let now = Instant::now();
         let key = channels.view.key(now).expect("the key was captured");
@@ -438,7 +530,7 @@ mod tests {
                 channels.view.key(now).is_some(),
                 "{error:?} dropped the key"
             );
-            let line = channels.view.sync_line().unwrap();
+            let line = channels.view.sync_line(now).unwrap();
             assert!(line.contains(&error.to_string()), "{line}");
         }
 
@@ -487,5 +579,254 @@ mod tests {
             .as_deref(),
             Some("Syncing wishes: banner 302, page 3…")
         );
+    }
+
+    // ---- logins and the sync, against a fake API and tracker ----
+
+    use auto_artifactarium::GachaAuthKey;
+    use serde_json::json;
+
+    use super::super::WishEvent;
+    use super::super::test_server::{Reply, TestServer};
+
+    const LOGIN_UID: u32 = 811_111_111;
+
+    /// A fake wish history API (one record of `record_uid` per banner, each
+    /// answer after `delay`) and tracker (empty cursor, imports counted).
+    fn world(record_uid: &'static str, delay: Duration) -> TestServer {
+        TestServer::start(move |request| {
+            if request.path == "/gacha_info/api/getGachaLog" {
+                std::thread::sleep(delay);
+                let banner = request.param("gacha_type").unwrap_or("301").to_owned();
+                let list = if request.param("end_id") == Some("0") {
+                    json!([{"uid": record_uid, "gacha_type": banner, "item_id": "",
+                            "count": "1", "time": "2026-10-12 21:04:11", "name": "Item",
+                            "lang": "en-us", "item_type": "Weapon", "rank_type": "3",
+                            "id": format!("17900000000000{banner}")}])
+                } else {
+                    json!([])
+                };
+                return Reply::json(
+                    200,
+                    json!({"retcode": 0, "message": "OK",
+                           "data": {"region": "os_asia", "list": list}})
+                    .to_string(),
+                );
+            }
+            if request.path == "/api/wishes/cursor" {
+                return Reply::json(200, r#"{"uid":"811111111","accountId":12,"newest":{}}"#);
+            }
+            if request.path == "/api/wishes/import" {
+                return Reply::json(200, r#"{"accountId":12,"added":1,"known":0,"newest":{}}"#);
+            }
+            Reply::json(404, r#"{"error":{"code":"not_found"}}"#)
+        })
+    }
+
+    struct Setup {
+        channels: super::super::WishChannels,
+        state_tx: watch::Sender<SavedAppState>,
+    }
+
+    /// Wish channels whose sync reads `server` with a verified import key and
+    /// uploads on.
+    fn setup(server: &TestServer) -> Setup {
+        let api = format!("{}/api", server.base);
+        let state = SavedAppState {
+            auto_export_to_tracker: true,
+            tracker_api_url: api.clone(),
+            tracker_import_key: "gdt_uk_test".to_owned(),
+            tracker_verified: true,
+            tracker_sign_in: crate::app::TrackerSignIn::SignedOut,
+            ..Default::default()
+        };
+        let (state_tx, state_rx) = watch::channel(state);
+        let (toast_tx, _toast_rx) = mpsc::unbounded_channel();
+        let auth = TrackerAuth::new(
+            &api,
+            Arc::new(crate::signin::MemoryStore::default()),
+            "TEST-PC".to_owned(),
+            Arc::new(|_| {}),
+            Arc::new(|| {}),
+        );
+        let mut channels =
+            super::super::channels(state_rx, toast_tx, egui::Context::default(), auth);
+        channels
+            .sync
+            .read_pages_at(format!("{}/gacha_info/api/getGachaLog", server.base));
+        Setup { channels, state_tx }
+    }
+
+    fn key_event(key: &str) -> WishEvent {
+        WishEvent::Key(GachaAuthKey::new(key, "webview_gacha", "hk4e_global"))
+    }
+
+    /// Wait (up to 5 s) for `done`.
+    async fn until(mut done: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out");
+    }
+
+    fn imports(server: &TestServer) -> Vec<serde_json::Value> {
+        server
+            .requests()
+            .iter()
+            .filter(|request| request.path == "/api/wishes/import")
+            .map(|request| serde_json::from_str(&request.body).unwrap())
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_after_a_login_syncs_with_that_logins_uid() {
+        let server = world("811111111", Duration::ZERO);
+        let Setup {
+            channels,
+            state_tx: _state_tx,
+        } = setup(&server);
+        channels
+            .hub
+            .forward(vec![key_event("KKKK")], Some(LOGIN_UID));
+        let task = tokio::spawn(channels.sync.run());
+        until(|| !imports(&server).is_empty()).await;
+        let body = &imports(&server)[0];
+        assert_eq!(body["uid"], "811111111");
+        assert_eq!(body["records"].as_array().unwrap().len(), 5);
+        task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn records_of_another_uid_are_refused_and_the_key_dropped() {
+        let server = world("899999999", Duration::ZERO);
+        let Setup {
+            channels,
+            state_tx: _state_tx,
+        } = setup(&server);
+        channels
+            .hub
+            .forward(vec![key_event("LLLL")], Some(LOGIN_UID));
+        let view = channels.view;
+        let task = tokio::spawn(channels.sync.run());
+        until(|| view.key(Instant::now()).is_none()).await;
+        let line = view.sync_line(Instant::now()).unwrap();
+        assert!(
+            line.contains("the wish key belongs to another account"),
+            "{line}"
+        );
+        assert!(imports(&server).is_empty(), "nothing sent");
+        assert!(
+            server
+                .requests()
+                .iter()
+                .all(|request| request.path != "/api/wishes/cursor"),
+            "refused on the first page, before even the cursor"
+        );
+        task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_login_stops_a_run_in_flight_before_it_sends() {
+        let server = world("811111111", Duration::from_millis(800));
+        let Setup {
+            channels,
+            state_tx: _state_tx,
+        } = setup(&server);
+        channels
+            .hub
+            .forward(vec![key_event("MMMM")], Some(LOGIN_UID));
+        let view = channels.view;
+        let hub = channels.hub;
+        let task = tokio::spawn(channels.sync.run());
+        // The first page is being read.
+        until(|| !server.requests().is_empty() || view.sync_line(Instant::now()).is_some()).await;
+        hub.new_login();
+        assert!(view.key(Instant::now()).is_none());
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(imports(&server).is_empty(), "the run sent nothing");
+        assert_eq!(
+            view.sync_line(Instant::now()),
+            None,
+            "nothing of it is shown"
+        );
+        let log_requests = server
+            .requests()
+            .iter()
+            .filter(|request| request.path == "/gacha_info/api/getGachaLog")
+            .count();
+        assert!(
+            log_requests <= 1,
+            "stopped after the page in flight: {log_requests}"
+        );
+        task.abort();
+    }
+
+    #[test]
+    fn a_key_the_settings_keep_from_syncing_says_why() {
+        let server = world("811111111", Duration::ZERO);
+        let Setup {
+            mut channels,
+            state_tx,
+        } = setup(&server);
+        channels
+            .hub
+            .forward(vec![key_event("NNNN")], Some(LOGIN_UID));
+        let now = Instant::now();
+
+        state_tx.send_modify(|state| state.auto_export_to_tracker = false);
+        channels.sync.on_trigger(Trigger::NewKey, now);
+        assert_eq!(
+            channels.view.sync_line(now).as_deref(),
+            Some("Not synced: uploads to the Tracker are off")
+        );
+        assert_eq!(channels.sync.schedule.next_due(), None);
+
+        state_tx.send_modify(|state| {
+            state.auto_export_to_tracker = true;
+            state.tracker_verified = false;
+        });
+        channels.sync.on_trigger(Trigger::NewKey, now);
+        assert_eq!(
+            channels.view.sync_line(now).as_deref(),
+            Some("Not synced: no Tracker sign-in or verified import key")
+        );
+
+        state_tx.send_modify(|state| state.tracker_verified = true);
+        channels.sync.on_trigger(Trigger::NewKey, now);
+        assert_eq!(channels.view.sync_line(now), None);
+        assert_eq!(channels.sync.schedule.next_due(), Some(now));
+    }
+
+    #[test]
+    fn a_key_before_the_uid_waits_and_a_login_clears_the_schedule() {
+        let server = world("811111111", Duration::ZERO);
+        let Setup {
+            mut channels,
+            state_tx: _state_tx,
+        } = setup(&server);
+        let now = Instant::now();
+        channels.hub.forward(vec![key_event("OOOO")], None);
+        // Nothing to schedule: the key's account is not known.
+        channels.sync.on_trigger(Trigger::NewKey, now);
+        assert_eq!(channels.sync.schedule.next_due(), None);
+        assert_eq!(
+            channels.view.sync_line(now).as_deref(),
+            Some("Sync waits for the account's UID")
+        );
+
+        channels.hub.note_uid(Some(LOGIN_UID));
+        channels.sync.on_trigger(Trigger::NewKey, now);
+        assert_eq!(channels.sync.schedule.next_due(), Some(now));
+
+        channels
+            .sync
+            .partials
+            .insert(301, crate::wish_history::run::Partial::for_tests());
+        channels.sync.on_trigger(Trigger::Cleared, now);
+        assert_eq!(channels.sync.schedule.next_due(), None);
+        assert!(channels.sync.partials.is_empty());
     }
 }

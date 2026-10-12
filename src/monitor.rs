@@ -1550,6 +1550,10 @@ impl Monitor {
 
         self.capture_timestamp_ms = Some(Local::now().timestamp_millis());
         let player = self.player_data.gi_player();
+        // The login's UID binds its wish key; another UID is a new login.
+        if let Some(hub) = &self.wish_hub {
+            hub.note_uid(player.as_ref().and_then(|player| player.uid));
+        }
         self.app_state.update_captured(updated, player);
         self.check_automation_trigger();
     }
@@ -1590,9 +1594,14 @@ impl Monitor {
         }
     }
 
-    /// Forget everything captured about the account.
+    /// Forget everything captured about the account -- its wish key too: a
+    /// new connection's data may be another account's (alt swapping), and a
+    /// key only counts for the login it came after.
     fn replace_captured_data(&mut self, reason: &str) {
         tracing::info!(reason, "clearing captured data");
+        if let Some(hub) = &self.wish_hub {
+            hub.new_login();
+        }
         self.player_data.reset();
         self.app_state.update_captured(DataUpdated::new(), None);
         self.capture_timestamp_ms = None;

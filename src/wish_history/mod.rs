@@ -1,12 +1,20 @@
 //! Wish history from the game's own key.
 //!
-//! A wish history key comes from one of two places:
+//! When the game's wish history page opens, the server sends a web view key
+//! (`GetAuthkeyRsp`, recognised by auto-artifactarium). The key belongs to
+//! the account logged in, and one PC may log in with several accounts (alt
+//! swapping), so a key only ever counts for the login it came after:
 //!
-//! * the game's traffic: when its wish history page opens, the server sends
-//!   a web view key (`GetAuthkeyRsp`, recognised by auto-artifactarium);
-//! * the game's web cache, where that page leaves the game's own link, key
-//!   included, which works for the rest of the key's day -- see [`cache`].
-//!   A key from the traffic always wins over one from the cache.
+//! * every new login (a new connection's first account data, or another UID
+//!   mid-run) clears the key, the sync's unfinished banners and pending
+//!   triggers, and what was seen, and stops a sync in flight before it sends
+//!   ([`WishHub::new_login`]);
+//! * a key is bound to that login's UID; the sync sends nothing until the UID
+//!   is known, and refuses records of any other UID.
+//!
+//! The game's web cache also holds the game's link, but the cache is the
+//! PC's, not the login's: it is never a key for the sync, only what Copy wish
+//! URL falls back on while no key of this login is held (see [`cache`]).
 //!
 //! From the key irminsul
 //!
@@ -42,8 +50,8 @@ use tokio::sync::{mpsc, watch};
 
 pub(crate) use self::cache::CacheSource;
 use self::cache::{CacheReply, CacheState};
+use self::gacha_log::LinkParts;
 pub(crate) use self::gacha_log::WishKey;
-use self::gacha_log::{KeySource, LinkParts};
 pub(crate) use self::sync::{SyncStatus, WishSync};
 use self::tracker::TrackerCredential;
 use crate::app::SavedAppState;
@@ -140,6 +148,8 @@ pub(crate) enum Trigger {
     NewKey,
     /// A wish was made on this banner (`None`: on one that could not be told).
     Wish(Option<Banner>),
+    /// A new login: forget everything about the previous one's sync.
+    Cleared,
 }
 
 /// What the game's wish history link is made of besides the key, as seen
@@ -216,23 +226,85 @@ pub(crate) struct Seen {
 /// Asks the UI to repaint: what the monitor hands on changes what it shows.
 pub(crate) type Notify = Arc<dyn Fn() + Send + Sync>;
 
-/// The monitor's end: hands captured keys and wishes on.
+/// The monitor's end: hands captured keys and wishes on, and says when a new
+/// login begins.
 #[derive(Clone)]
 pub(crate) struct WishHub {
     key_tx: Arc<watch::Sender<Option<WishKey>>>,
     trigger_tx: mpsc::UnboundedSender<Trigger>,
     captured: Arc<std::sync::Mutex<Captured>>,
     seen_tx: Arc<watch::Sender<Seen>>,
+    /// The UID of the login the session is in, once known.
+    login_uid: Arc<std::sync::Mutex<Option<u32>>>,
+    /// Counts logins; the sync stops a run in flight when it moves.
+    login_tx: Arc<watch::Sender<u64>>,
     notify: Notify,
 }
 
 impl WishHub {
+    /// A new login began (a new connection's first account data, or the
+    /// user cleared the data): forget the previous login's key, the sync's
+    /// unfinished banners and pending triggers, and what was seen; a sync in
+    /// flight stops before it sends.
+    pub(crate) fn new_login(&self) {
+        *self.login_uid.lock().unwrap() = None;
+        self.clear();
+    }
+
+    fn clear(&self) {
+        self.key_tx.send_replace(None);
+        self.captured.lock().unwrap().banners.clear();
+        // The client's version came with this login's token request, before
+        // its account data: it stays.
+        self.seen_tx.send_modify(|seen| {
+            *seen = Seen {
+                client_version: seen.client_version,
+                ..Seen::default()
+            };
+        });
+        self.login_tx.send_modify(|logins| *logins += 1);
+        let _ = self.trigger_tx.send(Trigger::Cleared);
+        tracing::info!("wish: new login, cleared the wish key");
+        (self.notify)();
+    }
+
+    /// The session's player UID, as the captured data says it. Another UID
+    /// than the login's is a new login; the first one binds a key that
+    /// arrived before it, which then syncs.
+    pub(crate) fn note_uid(&self, uid: Option<u32>) {
+        let Some(uid) = uid else {
+            return;
+        };
+        let previous = self.login_uid.lock().unwrap().replace(uid);
+        match previous {
+            Some(previous) if previous == uid => return,
+            Some(_) => {
+                self.clear();
+                return;
+            }
+            None => {}
+        }
+        let bound = self.key_tx.send_if_modified(|key| match key {
+            Some(waiting) if waiting.uid().is_none() => {
+                *waiting = waiting.clone().with_uid(Some(uid));
+                true
+            }
+            _ => false,
+        });
+        if bound {
+            tracing::info!("wish: the key's account is known now; syncing");
+            let _ = self.trigger_tx.send(Trigger::NewKey);
+            (self.notify)();
+        }
+    }
+
     /// Hand `events` on; `uid` is the account's, when captured (for the
-    /// link's `region`).
+    /// link's `region`, and the key's account).
     pub(crate) fn forward(&self, events: Vec<WishEvent>, uid: Option<u32>) {
         if events.is_empty() {
             return;
         }
+        self.note_uid(uid);
         for event in events {
             match event {
                 WishEvent::Key(key) => self.key(key, uid, Instant::now()),
@@ -301,35 +373,29 @@ impl WishHub {
             region = link.region.as_deref(),
             "the wish history link's parts"
         );
-        let key = WishKey::new(key.authkey(), &key.game_biz, now).with_link(link);
-        let mut new = false;
-        self.key_tx.send_if_modified(|current| match current {
-            // The same key, maybe found in the cache first: no new sync, but
-            // it is the game's key now, so the cache cannot replace it.
-            Some(current) if current.same_key(&key) => {
-                let from_cache = current.source() == KeySource::Cache;
-                current.mark_from_game();
-                from_cache
+        let login_uid = *self.login_uid.lock().unwrap();
+        let key = WishKey::new(key.authkey(), &key.game_biz, now)
+            .with_link(link)
+            .with_uid(login_uid);
+        let new = self.key_tx.send_if_modified(|current| {
+            if current
+                .as_ref()
+                .is_some_and(|current| current.same_key(&key))
+            {
+                return false;
             }
-            _ => {
-                *current = Some(key);
-                new = true;
-                true
-            }
+            *current = Some(key);
+            true
         });
-        if new {
+        if !new {
+            return;
+        }
+        if login_uid.is_some() {
             tracing::info!("captured a wish history key");
             let _ = self.trigger_tx.send(Trigger::NewKey);
+        } else {
+            tracing::info!("captured a wish history key; its account's UID is not known yet");
         }
-    }
-
-    /// The key held, while it is believed to work.
-    pub(crate) fn held_key(&self, now: Instant) -> Option<WishKey> {
-        self.key_tx
-            .borrow()
-            .as_ref()
-            .filter(|key| key.is_fresh(now))
-            .cloned()
     }
 
     /// Record what the game's web cache showed.
@@ -337,28 +403,6 @@ impl WishHub {
         if self.see(|seen| std::mem::replace(&mut seen.cached_link, state) != state) {
             (self.notify)();
         }
-    }
-
-    /// Take a key from the game's cache, that the game's server said works,
-    /// unless a key from the traffic is held (it always wins) or this key is
-    /// held already. `true` when taken: every banner syncs.
-    pub(crate) fn offer_cached(&self, key: WishKey, now: Instant) -> bool {
-        let taken = self.key_tx.send_if_modified(|current| {
-            if let Some(current) = current
-                && current.is_fresh(now)
-                && (current.source() == KeySource::Game || current.same_key(&key))
-            {
-                return false;
-            }
-            *current = Some(key);
-            true
-        });
-        if taken {
-            tracing::info!("took a wish history key from the game's web cache");
-            let _ = self.trigger_tx.send(Trigger::NewKey);
-            (self.notify)();
-        }
-        taken
     }
 }
 
@@ -381,13 +425,14 @@ impl WishView {
             .cloned()
     }
 
-    /// The URL to copy: the game's link for the key held.
+    /// The URL to copy: the game's link for this login's key.
     pub(crate) fn wish_url(&self, now: Instant) -> Option<String> {
         self.key(now).map(|key| key.wish_url())
     }
 
-    /// Look in the game's web cache now: answered with the wish URL, or why
-    /// there is none.
+    /// Read the link in the game's web cache now (for Copy while no key is
+    /// held; it may be another account's): answered with it, or why there
+    /// is none.
     pub(crate) fn look_in_cache(&self) -> tokio::sync::oneshot::Receiver<Result<String, String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         // A closed channel drops `tx`, which the caller sees as no answer.
@@ -407,7 +452,10 @@ impl WishView {
 
     /// One line about the tracker sync, or `None` when there is nothing to
     /// say.
-    pub(crate) fn sync_line(&self) -> Option<String> {
+    pub(crate) fn sync_line(&self, now: Instant) -> Option<String> {
+        if self.key(now).is_some_and(|key| key.uid().is_none()) {
+            return Some("Sync waits for the account's UID".to_owned());
+        }
         self.status_rx.borrow().line()
     }
 }
@@ -420,13 +468,13 @@ pub(crate) struct WishLine {
 }
 
 /// Where a key comes from, for the tooltips.
-const KEY_SOURCES: &str = "A wish key comes from the game when its wish history page opens, \
-     or from a link the game left in its web cache that still works. A key lasts about \
-     a day.";
+const KEY_SOURCES: &str = "A wish key comes when the game opens its wish history page, and \
+     lasts about a day. Each login starts fresh: a new login (or another account) clears \
+     the key.";
 
 /// What the wish section says, by what is really the case:
 ///
-/// * a key is held: how long it is believed to last, and where it came from;
+/// * a key of this login is held: how long it is believed to last;
 /// * no key, and this session is not decrypting: waiting for the login
 ///   (with the capture's own guidance);
 /// * no key, decrypting: no key yet.
@@ -435,30 +483,18 @@ const KEY_SOURCES: &str = "A wish key comes from the game when its wish history 
 pub(crate) fn status_line(key: Option<&WishKey>, now: Instant, game: GameStatus) -> WishLine {
     if let Some(key) = key {
         let hours = key.remaining(now).as_secs().div_ceil(3600);
-        let (from, tooltip) = match key.source() {
-            KeySource::Game => (
-                "from the game",
-                "The wish history key the game sent when its history page opened. \
-                 It lasts about a day; until then Copy wish URL gives the game's own \
-                 link, and new wishes sync by themselves when the Tracker is set up.",
-            ),
-            KeySource::Cache => (
-                "from the cache",
-                "The game's own wish history link, found in its web cache; the game's \
-                 server said it still works. Its key lasts about a day from when the game \
-                 got it (counted from the cache file's time); until then Copy wish URL \
-                 gives that link as it is, and new wishes sync by themselves when the \
-                 Tracker is set up.",
-            ),
-        };
         let text = if hours <= 1 {
-            format!("Key valid < 1 h · {from}")
+            "Key valid < 1 h".to_owned()
         } else {
-            format!("Key valid ~{hours} h · {from}")
+            format!("Key valid ~{hours} h")
         };
         return WishLine {
             text,
-            tooltip: tooltip.to_owned(),
+            tooltip: "The wish history key the game sent when its history page opened \
+                      in this login. It lasts about a day; until then Copy wish URL gives \
+                      the game's own link, and new wishes sync by themselves when the \
+                      Tracker is set up. A new login clears it."
+                .to_owned(),
         };
     }
     if game != GameStatus::Decoding {
@@ -485,7 +521,7 @@ pub(crate) fn seen_summary(seen: &Seen, uid_known: bool) -> String {
         format!("{} UID", mark(uid_known)),
         format!(
             "{} cached link: {}",
-            mark(seen.cached_link == CacheState::Valid),
+            mark(seen.cached_link == CacheState::Found),
             seen.cached_link.label()
         ),
     ];
@@ -523,8 +559,10 @@ pub(crate) fn channels(
     let repaint = ctx.clone();
     let notify: Notify = Arc::new(move || repaint.request_repaint());
     let (cache_tx, cache_rx) = mpsc::unbounded_channel();
+    let (login_tx, login_rx) = watch::channel(0);
     let sync = WishSync::new(
         trigger_rx,
+        login_rx,
         Arc::clone(&key_tx),
         status_tx,
         saved_state_rx,
@@ -537,6 +575,8 @@ pub(crate) fn channels(
         trigger_tx,
         captured: Arc::default(),
         seen_tx: Arc::new(seen_tx),
+        login_uid: Arc::default(),
+        login_tx: Arc::new(login_tx),
         notify,
     };
     WishChannels {
@@ -579,6 +619,8 @@ mod tests {
                 trigger_tx,
                 captured: Arc::default(),
                 seen_tx: Arc::new(watch::channel(Seen::default()).0),
+                login_uid: Arc::default(),
+                login_tx: Arc::new(watch::channel(0).0),
                 notify,
             },
             key_rx,
@@ -653,42 +695,29 @@ mod tests {
                 "{game:?}: {}",
                 line.tooltip
             );
-            assert!(line.tooltip.contains("web cache"), "{game:?}");
+            assert!(line.tooltip.contains("Each login starts fresh"), "{game:?}");
         }
-        // Decrypting, no key yet: neutral, the sources in the tooltip.
+        // Decrypting, no key yet: neutral, where keys come from in the tooltip.
         let line = status_line(None, now, GameStatus::Decoding);
         assert_eq!(line.text, "No wish key yet");
-        assert!(line.tooltip.contains("wish history page opens"));
-        assert!(line.tooltip.contains("web cache that still works"));
+        assert!(line.tooltip.contains("wish history page"));
+        assert!(line.tooltip.contains("Each login starts fresh"));
         assert!(line.tooltip.contains("about a day"));
-        // A key: how long it lasts and where from, whatever the game does now.
+        // A key: how long it lasts, whatever the game does now.
         let key = WishKey::new("LLLL", "hk4e_global", now);
         for game in [GameStatus::Decoding, GameStatus::NotRunning] {
-            assert_eq!(
-                status_line(Some(&key), now, game).text,
-                "Key valid ~24 h · from the game"
-            );
+            assert_eq!(status_line(Some(&key), now, game).text, "Key valid ~24 h");
         }
         let late = now + gacha_log::KEY_LIFETIME - std::time::Duration::from_secs(600);
         assert_eq!(
             status_line(Some(&key), late, GameStatus::Decoding).text,
-            "Key valid < 1 h · from the game"
+            "Key valid < 1 h"
         );
-        let cached = WishKey::from_game_link(
-            "https://example.invalid/getGachaLog?authkey=MMMM&game_biz=hk4e_global",
-            std::time::Duration::from_secs(4 * 3600),
-            now,
-        )
-        .unwrap();
-        let line = status_line(Some(&cached), now, GameStatus::NotRunning);
-        assert_eq!(line.text, "Key valid ~20 h · from the cache");
-        assert!(line.tooltip.contains("web cache"));
         // Nowhere an instruction to open the history.
         for line in [
             status_line(None, now, GameStatus::Decoding),
             status_line(None, now, GameStatus::NotRunning),
             status_line(Some(&key), now, GameStatus::Decoding),
-            status_line(Some(&cached), now, GameStatus::Decoding),
         ] {
             let all = format!("{} {}", line.text, line.tooltip);
             assert!(
@@ -707,30 +736,27 @@ mod tests {
             wish_key: false,
             other_keys: 1,
             client_version: true,
-            cached_link: CacheState::Expired,
+            cached_link: CacheState::None,
         };
         assert_eq!(
             seen_summary(&seen, false),
             format!(
                 "Seen this session:\n{ICON_CHECK} banner list (Wish screen)\n\
                  {ICON_CLOSE} wish key from the game\n{ICON_CHECK} client version\n\
-                 {ICON_CLOSE} UID\n{ICON_CLOSE} cached link: expired\n1 other web key ignored"
+                 {ICON_CLOSE} UID\n{ICON_CLOSE} cached link: none\n1 other web key ignored"
             )
         );
         assert!(!seen_summary(&Seen::default(), true).contains("ignored"));
         assert!(seen_summary(&Seen::default(), true).contains(&format!("{ICON_CHECK} UID")));
         for (state, label) in [
             (CacheState::None, "none"),
-            (CacheState::Found, "found"),
-            (CacheState::Valid, "valid"),
-            (CacheState::Expired, "expired"),
-            (CacheState::Refused, "refused"),
+            (CacheState::Found, "found (may be another account)"),
         ] {
             let seen = Seen {
                 cached_link: state,
                 ..Seen::default()
             };
-            let mark = if state == CacheState::Valid {
+            let mark = if state == CacheState::Found {
                 ICON_CHECK
             } else {
                 ICON_CLOSE
@@ -746,24 +772,89 @@ mod tests {
         GachaAuthKey::new(key, app, "hk4e_global")
     }
 
+    const UID: Option<u32> = Some(811_111_111);
+
     #[test]
     fn only_wish_keys_are_kept_and_a_repeat_triggers_nothing() {
         let (hub, key_rx, mut triggers) = hub();
-        hub.forward(vec![WishEvent::Key(authkey("ugc_login", "AAAA"))], None);
+        hub.forward(vec![WishEvent::Key(authkey("ugc_login", "AAAA"))], UID);
         assert!(key_rx.borrow().is_none());
         assert!(triggers.try_recv().is_err());
 
-        hub.forward(vec![WishEvent::Key(authkey("webview_gacha", "BBBB"))], None);
-        assert!(key_rx.borrow().is_some());
+        hub.forward(vec![WishEvent::Key(authkey("webview_gacha", "BBBB"))], UID);
+        assert_eq!(key_rx.borrow().as_ref().unwrap().uid(), UID);
         assert_eq!(triggers.try_recv(), Ok(Trigger::NewKey));
 
-        hub.forward(vec![WishEvent::Key(authkey("webview_gacha", "BBBB"))], None);
+        hub.forward(vec![WishEvent::Key(authkey("webview_gacha", "BBBB"))], UID);
         assert!(
             triggers.try_recv().is_err(),
             "the same key again is not new"
         );
 
-        hub.forward(vec![WishEvent::Key(authkey("webview_gacha", "CCCC"))], None);
+        hub.forward(vec![WishEvent::Key(authkey("webview_gacha", "CCCC"))], UID);
+        assert_eq!(triggers.try_recv(), Ok(Trigger::NewKey));
+    }
+
+    #[test]
+    fn a_new_login_clears_the_key_and_what_was_seen_and_tells_the_sync() {
+        let (hub, key_rx, mut triggers) = hub();
+        let logins = hub.login_tx.subscribe();
+        hub.forward(
+            vec![
+                WishEvent::ClientVersion("OSRELWin7.1.0_R1_S2_D3".to_owned()),
+                WishEvent::Banners(vec![banner(301, "cccc")]),
+                WishEvent::Key(authkey("webview_gacha", "DDDD")),
+            ],
+            UID,
+        );
+        assert_eq!(triggers.try_recv(), Ok(Trigger::NewKey));
+        hub.see_cache(CacheState::Found);
+
+        hub.new_login();
+        assert!(key_rx.borrow().is_none());
+        assert_eq!(triggers.try_recv(), Ok(Trigger::Cleared));
+        assert!(logins.has_changed().unwrap(), "a run in flight is told");
+        let seen = hub.seen_tx.borrow().clone();
+        assert_eq!(
+            seen,
+            Seen {
+                client_version: true,
+                ..Seen::default()
+            }
+        );
+        assert!(hub.captured.lock().unwrap().banners.is_empty());
+
+        // A key now, before the new login's UID is known: held, not synced.
+        hub.forward(vec![WishEvent::Key(authkey("webview_gacha", "EEEE"))], None);
+        assert_eq!(key_rx.borrow().as_ref().unwrap().uid(), None);
+        assert!(triggers.try_recv().is_err());
+        // The UID arrives: the key is that login's, and syncs.
+        hub.note_uid(Some(822_222_222));
+        assert_eq!(key_rx.borrow().as_ref().unwrap().uid(), Some(822_222_222));
+        assert_eq!(triggers.try_recv(), Ok(Trigger::NewKey));
+        hub.note_uid(Some(822_222_222));
+        assert!(
+            triggers.try_recv().is_err(),
+            "the same UID again is nothing"
+        );
+    }
+
+    #[test]
+    fn another_uid_mid_run_is_a_new_login() {
+        let (hub, key_rx, mut triggers) = hub();
+        hub.forward(vec![WishEvent::Key(authkey("webview_gacha", "FFFF"))], UID);
+        assert_eq!(triggers.try_recv(), Ok(Trigger::NewKey));
+
+        hub.note_uid(Some(833_333_333));
+        assert!(key_rx.borrow().is_none());
+        assert_eq!(triggers.try_recv(), Ok(Trigger::Cleared));
+
+        // A key after it is the new account's.
+        hub.forward(
+            vec![WishEvent::Key(authkey("webview_gacha", "GGGG"))],
+            Some(833_333_333),
+        );
+        assert_eq!(key_rx.borrow().as_ref().unwrap().uid(), Some(833_333_333));
         assert_eq!(triggers.try_recv(), Ok(Trigger::NewKey));
     }
 
@@ -896,21 +987,18 @@ mod tests {
         key_tx.send_replace(Some(WishKey::new("EEEE", "hk4e_global", now)));
         let url = view.wish_url(now).unwrap();
         assert!(url.contains("authkey=EEEE"), "{url}");
-        assert_eq!(status(now), "Key valid ~24 h · from the game");
+        assert_eq!(status(now), "Key valid ~24 h");
+        assert_eq!(
+            view.sync_line(now).as_deref(),
+            Some("Sync waits for the account's UID")
+        );
+        key_tx.send_replace(Some(WishKey::new("EEEE", "hk4e_global", now).with_uid(UID)));
+        assert_eq!(view.sync_line(now), None);
         assert!(
             view.status(now, GameStatus::Decoding, true)
                 .tooltip
                 .contains("Seen this session:")
         );
-
-        // A cached link is given as it is.
-        let link = "https://example.invalid/getGachaLog?authkey=FFFF&game_biz=hk4e_global";
-        key_tx.send_replace(WishKey::from_game_link(
-            link,
-            std::time::Duration::ZERO,
-            now,
-        ));
-        assert_eq!(view.wish_url(now).as_deref(), Some(link));
 
         // A day later the key is gone.
         let later = now + gacha_log::KEY_LIFETIME;

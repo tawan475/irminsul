@@ -915,8 +915,8 @@ fn start_async_runtime(
                 tracing::error!("error checking for update: {e}");
             }
 
-            // Wish keys from the game's web cache: on start, when it changes,
-            // and when the UI asks; ends with the UI.
+            // The link in the game's web cache, read when the UI asks (Copy
+            // without a key); never a key for the sync. Ends with the UI.
             tokio::spawn(wish_cache.run());
 
             // Wish history from the keys; ends with the monitor.
@@ -2128,10 +2128,11 @@ impl IrminsulApp {
                     ui.label(egui_material_icons::icons::ICON_HELP)
                         .on_hover_text(
                             "Irminsul takes your wish key from the game when its wish history \
-                         page opens, or from a link the game left in its web cache that \
-                         still works. Click the Copy icon to copy the wish URL, then paste \
-                         it into paimon.moe (Manual import) or StarDB. With the Tracker set \
-                         up and uploads on, new wishes are sent to it as well.",
+                         page opens; each login starts fresh. Click the Copy icon to copy \
+                         the wish URL, then paste it into paimon.moe (Manual import) or \
+                         StarDB. Without a key it copies the link in the game's web cache, \
+                         which may be another account's. With the Tracker set up and \
+                         uploads on, new wishes are sent to it as well.",
                         );
                 },
                 |ui| {
@@ -2161,7 +2162,7 @@ impl IrminsulApp {
             let status = self.wishes.status(now, app_state.game_status, uid_known);
             ui.label(RichText::new(status.text).weak())
                 .on_hover_text(status.tooltip);
-            if let Some(line) = self.wishes.sync_line() {
+            if let Some(line) = self.wishes.sync_line(now) {
                 ui.label(RichText::new(line).weak());
             }
             ui.horizontal(|ui| {
@@ -2186,8 +2187,8 @@ impl IrminsulApp {
     /// Collect the answer of a look in the game's web cache
     /// (`WishView::look_in_cache`).
     ///
-    /// Polled, never awaited in the widget tree: the look can take an HTTPS
-    /// round trip to the game's wish history server.
+    /// Polled, never awaited in the widget tree: the look reads the game's
+    /// log and cache files.
     fn wish_handle_find_url(&mut self, ctx: &Context) -> Result<()> {
         let url = match poll_oneshot(&mut self.wish_url_rx_oneshot) {
             Polled::Pending => return Ok(()),
@@ -2199,7 +2200,8 @@ impl IrminsulApp {
         match url {
             Ok(url) => {
                 ctx.copy_text(url);
-                self.toasts.info("Wish URL copied to clipboard");
+                self.toasts
+                    .info("Wish URL copied from the game's cache (may be another account's)");
                 self.wish_link_failed_for = None;
                 if let Some(target_url) = self.pending_open_url.take() {
                     ctx.open_url(egui::OpenUrl::new_tab(target_url));

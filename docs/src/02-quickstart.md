@@ -169,36 +169,36 @@ The gear icon opens the tracker window. Under **Advanced**:
 
 ## Wish history
 
-Irminsul reads your wish history with the game's own wish key. A key lasts
-about a day, and it comes from one of two places:
+Irminsul reads your wish history with the game's own wish key. Whenever the
+game opens its wish history page, the server sends it a key, and Irminsul
+picks it up from the traffic while it is decrypting the session. A key lasts
+about a day.
 
-- **The game**: whenever the game opens its wish history page, the server
-  sends it a key, and Irminsul picks it up from the traffic while it is
-  decrypting the session.
-- **The game's web cache**: that page leaves the game's own link, key
-  included, in the game's web cache. Irminsul looks there when it starts,
-  whenever the cache changes, and when you click Copy wish URL without a key.
-  It finds the game's folder in the game's log, takes the newest wish link
-  from the cache and checks it with one request to the game's wish history
-  server; a link that has expired is ignored. So the wishes of a day sync even
-  when Irminsul was not running, or not decrypting, when the page opened.
+A key belongs to the account it came with, and you may log in with several
+accounts on one PC. So **each login starts fresh**: a new login (or another
+account's UID appearing) clears the key, anything left of an unfinished sync,
+and what was seen, and stops a sync that is running before it sends anything.
+A key that arrives after a login is that login's: it syncs at once, and only
+wishes of that login's UID are ever sent ("the wish key belongs to another
+account" otherwise). If the UID is not known yet, the sync waits for it.
+Irminsul keeps the key in memory only.
 
-A key from the traffic always wins over one from the cache, and the same key
-is never synced twice. The "Wish History" section says what is the case:
-"Key valid ~20 h · from the game" or "· from the cache"; "No wish key yet";
-or "Waiting for the game's login" while Irminsul cannot read the game (for
-example when the game was started before Irminsul) and has no key. Hover the
-line for details, including what Irminsul has seen this session: the banner
-list (the Wish screen), a wish key from the game, the client version, the UID
-and the cached link (none, found, valid, expired or refused). If something
-stays missing, the same discoveries are in the log ("Open log folder",
-`latest.log`); it never holds the key or the URL.
+The "Wish History" section says what is the case: "Key valid ~20 h"; "No wish
+key yet"; or "Waiting for the game's login" while Irminsul cannot read the
+game (for example when the game was started before Irminsul) and has no key.
+Hover the line for details, including what Irminsul has seen this login: the
+banner list (the Wish screen), a wish key from the game, the client version,
+the UID and the link in the game's web cache. If something stays missing, the
+same discoveries are in the log ("Open log folder", `latest.log`); it never
+holds the key or the URL.
 
 - **Copy wish URL** (the clipboard icon) copies the game's own wish URL for
-  that key (a link from the cache exactly as the game wrote it). Paste it into
-  [paimon.moe](https://paimon.moe/wish/import) ("Manual" import) or
-  [StarDB](https://stardb.gg/en/genshin/wish-import); the "Open Paimon.moe"
-  and "Open StarDB" links copy it and open the page in one go.
+  that key. Paste it into [paimon.moe](https://paimon.moe/wish/import)
+  ("Manual" import) or [StarDB](https://stardb.gg/en/genshin/wish-import); the
+  "Open Paimon.moe" and "Open StarDB" links copy it and open the page in one
+  go. Without a key it copies the link the game left in its web cache
+  instead, as it is. That link may be another account's (the cache belongs to
+  the PC, not the login), so it is never used to sync.
 - **Sync to the tracker**: when Irminsul uploads to a Genshin Data Tracker by
   itself -- signed in (or with a verified import key) and "Auto export to
   tracker" ticked -- a new key also sends your wish history there. It asks the

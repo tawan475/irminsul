@@ -1,12 +1,13 @@
-//! The game's web cache: the second source of wish keys.
+//! The game's web cache: the link Copy wish URL falls back on.
 //!
 //! When the game's wish history page opens, its web view caches the page's
 //! requests -- the game's own link, key included -- in
-//! `<game>/<…>_Data/webCaches/<version>/Cache/Cache_Data/data_2`. The key
-//! lasts about a day, so a link found there works for the rest of it even
-//! when Irminsul did not see the key in the traffic (it was not running, or
-//! not decrypting). A link is trusted only once ONE request to the game's
-//! server says it works; a key from the traffic always wins over it.
+//! `<game>/<…>_Data/webCaches/<version>/Cache/Cache_Data/data_2`. The cache
+//! is the PC's, not the login's: with several accounts on one PC the link
+//! there may be another account's. So it is never a key for the sync (that
+//! only takes a key the traffic shows after a login) and is not even checked
+//! with the game's server; it is read only when the user asks for the wish
+//! URL (Copy, paimon.moe, StarDB) while no key of this login is held.
 //!
 //! The game's folder comes from its log (`output_log.txt` or `Player.log`
 //! under `AppData/LocalLow/miHoYo/<Genshin Impact|原神>`): the newest log
@@ -21,15 +22,12 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::SystemTime;
 
-use async_watcher::notify::{RecommendedWatcher, RecursiveMode};
-use async_watcher::{AsyncDebouncer, DebouncedEvent};
 use regex::bytes::Regex;
 use tokio::sync::{mpsc, oneshot};
 
 use super::WishHub;
-use super::gacha_log::{KeySource, Probe, WishKey, probe};
 
 /// The game's data folder as its log names it: `X:/…/GenshinImpact_Data`
 /// (global) or `…/YuanShen_Data` (Chinese client), with either slash. The
@@ -57,12 +55,6 @@ const LOG_NAMES: [&str; 2] = ["output_log.txt", "Player.log"];
 
 /// The web view's cache file under a `webCaches/<version>` folder.
 const CACHE_FILE: [&str; 3] = ["Cache", "Cache_Data", "data_2"];
-
-/// Whole-request timeout for the one check of a cached link.
-const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Connect timeout for the same check.
-const CHECK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Why no link came from the cache. Its text is what the UI says.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -165,19 +157,6 @@ fn log_label(log: &Path) -> String {
     format!("{client}/{name}")
 }
 
-/// `(mtime, len)` of `path`.
-fn signature(path: &Path) -> Option<(SystemTime, u64)> {
-    let metadata = std::fs::metadata(path).ok()?;
-    Some((metadata.modified().ok()?, metadata.len()))
-}
-
-/// A link found in the cache, and how old the cache file is.
-#[derive(Clone, Debug)]
-pub(crate) struct FoundLink {
-    pub(crate) url: String,
-    pub(crate) age: Duration,
-}
-
 /// Finds the cache file through the game's logs.
 pub(crate) struct CacheReader {
     logs: Vec<PathBuf>,
@@ -185,8 +164,6 @@ pub(crate) struct CacheReader {
     data_dir: Option<PathBuf>,
     /// The newest log and its length when the folder was read from it.
     log_read: Option<(PathBuf, u64)>,
-    /// The cache file found last.
-    found: Option<PathBuf>,
 }
 
 impl CacheReader {
@@ -195,7 +172,6 @@ impl CacheReader {
             logs: log_candidates(roots),
             data_dir: None,
             log_read: None,
-            found: None,
         }
     }
 
@@ -206,23 +182,7 @@ impl CacheReader {
             logs: Vec::new(),
             data_dir: Some(data_dir),
             log_read: None,
-            found: None,
         }
-    }
-
-    /// The folders the logs live in.
-    fn log_dirs(&self) -> Vec<PathBuf> {
-        let mut dirs: Vec<PathBuf> = self
-            .logs
-            .iter()
-            .filter_map(|log| log.parent().map(Path::to_path_buf))
-            .collect();
-        dirs.dedup();
-        dirs
-    }
-
-    fn is_log(&self, path: &Path) -> bool {
-        self.logs.iter().any(|log| log == path)
     }
 
     /// The logs that exist with their length, newest first.
@@ -282,80 +242,52 @@ impl CacheReader {
     /// The cache file to read.
     pub(crate) fn cache_file(&mut self) -> Result<PathBuf, Miss> {
         let dir = self.locate()?;
-        let file = newest_cache_file(&dir).ok_or(Miss::NoCache)?;
-        self.found = Some(file.clone());
-        Ok(file)
+        newest_cache_file(&dir).ok_or(Miss::NoCache)
     }
 
     /// The link in `file`.
-    pub(crate) fn read_link(file: &Path) -> Result<FoundLink, Miss> {
+    pub(crate) fn read_link(file: &Path) -> Result<String, Miss> {
         let bytes =
             std::fs::read(file).map_err(|error| Miss::Unreadable(error.kind().to_string()))?;
-        let url = wish_link_in_cache(&bytes).ok_or(Miss::NoLink)?;
-        let age = std::fs::metadata(file)
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-            .unwrap_or_default();
-        Ok(FoundLink { url, age })
+        wish_link_in_cache(&bytes).ok_or(Miss::NoLink)
+    }
+
+    /// The link in the cache now.
+    pub(crate) fn find(&mut self) -> Result<String, Miss> {
+        let file = self.cache_file()?;
+        Self::read_link(&file)
     }
 }
 
-/// What the cache shows, for the UI's "seen" list.
+/// What the cache showed when last read, for the UI's "seen" list.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum CacheState {
     /// No link (or not looked yet).
     #[default]
     None,
-    /// A link, not checked: a key from the game is in use, or the check got
-    /// no answer.
+    /// A link; whose, the cache does not say.
     Found,
-    /// The game's server said the link works.
-    Valid,
-    /// The link's key expired.
-    Expired,
-    /// The game's server refused the link otherwise.
-    Refused,
 }
 
 impl CacheState {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::None => "none",
-            Self::Found => "found",
-            Self::Valid => "valid",
-            Self::Expired => "expired",
-            Self::Refused => "refused",
+            Self::Found => "found (may be another account)",
         }
     }
 }
 
-/// What a check of one link came to; kept so a link is checked once.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Checked {
-    Valid,
-    Expired,
-    Refused(i64),
-}
-
-/// A request from the UI: look now; answered with the wish URL or why not.
+/// A request from the UI: read the cache now; answered with the link or why
+/// there is none.
 pub(crate) type CacheReply = oneshot::Sender<Result<String, String>>;
 
-/// The cache source task: looks on start, when the logs or the cache file
-/// change, and when the UI asks.
+/// Answers the UI's requests for the cached link. Sends nothing anywhere.
 pub(crate) struct CacheSource {
     hub: WishHub,
     reader: CacheReader,
-    http: reqwest::Client,
-    /// Where checks go instead of the key's own endpoint (tests).
-    endpoint: Option<String>,
     requests: mpsc::UnboundedReceiver<CacheReply>,
-    /// The last link checked and what came of it. Memory only.
-    checked: Option<(String, Checked)>,
-    /// The cache file's `(path, mtime, len)` when last read.
-    read: Option<(PathBuf, (SystemTime, u64))>,
-    /// The last thing logged, so a file that keeps changing does not repeat
-    /// it.
+    /// The last thing logged, so asking again does not repeat it.
     reported: Option<String>,
 }
 
@@ -373,27 +305,12 @@ impl CacheSource {
         requests: mpsc::UnboundedReceiver<CacheReply>,
         reader: CacheReader,
     ) -> Self {
-        let http = crate::http_client_builder()
-            .timeout(CHECK_TIMEOUT)
-            .connect_timeout(CHECK_CONNECT_TIMEOUT)
-            .build()
-            .expect("the TLS backend must initialise for any HTTP request to work");
         Self {
             hub,
             reader,
-            http,
-            endpoint: None,
             requests,
-            checked: None,
-            read: None,
             reported: None,
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_endpoint(mut self, endpoint: String) -> Self {
-        self.endpoint = Some(endpoint);
-        self
     }
 
     /// Log `what` (info) unless it was the last thing logged.
@@ -404,204 +321,30 @@ impl CacheSource {
         }
     }
 
-    fn miss(&mut self, miss: Miss) -> String {
-        self.hub.see_cache(CacheState::None);
-        self.report(miss.to_string());
-        miss.to_string()
-    }
-
-    /// Look at the cache now: the wish URL in use afterwards, or why there
-    /// is none.
-    pub(crate) async fn look(&mut self) -> Result<String, String> {
-        let file = match self.reader.cache_file() {
-            Ok(file) => file,
-            Err(miss) => return Err(self.miss(miss)),
-        };
-        let file_signature = signature(&file);
-        let link = match CacheReader::read_link(&file) {
-            Ok(link) => link,
-            Err(miss) => {
-                if !matches!(miss, Miss::Unreadable(_)) {
-                    self.read = file_signature.map(|signature| (file.clone(), signature));
-                }
-                return Err(self.miss(miss));
-            }
-        };
-        self.read = file_signature.map(|signature| (file.clone(), signature));
-
-        let now = Instant::now();
-        let Some(key) = WishKey::from_game_link(&link.url, link.age, now) else {
-            return Err(self.miss(Miss::NoLink));
-        };
-        if let Some(held) = self.hub.held_key(now) {
-            if held.same_key(&key) {
-                self.hub.see_cache(CacheState::Valid);
-                self.report("the cached link holds the key in use".to_owned());
-                return Ok(held.wish_url());
-            }
-            if held.source() == KeySource::Game {
-                // A key from the traffic always wins: no request for this one.
+    /// Read the cache now: the link, or why there is none.
+    pub(crate) fn look(&mut self) -> Result<String, String> {
+        match self.reader.find() {
+            Ok(link) => {
                 self.hub.see_cache(CacheState::Found);
                 self.report(
-                    "found a wish link; the key from the game's traffic is used instead".to_owned(),
+                    "found a wish link (for Copy only; it may be another account's)".to_owned(),
                 );
-                return Ok(held.wish_url());
+                Ok(link)
             }
-        }
-
-        let before = match &self.checked {
-            Some((url, checked)) if *url == link.url => Some(*checked),
-            _ => None,
-        };
-        let checked = match before {
-            // Taken before and gone since: the sync found it expired.
-            Some(Checked::Valid) => Checked::Expired,
-            Some(checked) => checked,
-            None => {
-                self.report("found a wish link; checking it with the game's server".to_owned());
-                let endpoint = self
-                    .endpoint
-                    .clone()
-                    .unwrap_or_else(|| key.endpoint().to_owned());
-                match probe(&self.http, &endpoint, &key).await {
-                    Probe::Valid => Checked::Valid,
-                    Probe::Expired => Checked::Expired,
-                    Probe::Refused(retcode) => Checked::Refused(retcode),
-                    Probe::Failed(why) => {
-                        // Not remembered: the next look checks again.
-                        self.hub.see_cache(CacheState::Found);
-                        self.report(format!("could not check the cached link: {why}"));
-                        return Err(format!(
-                            "could not check the link in the game's cache ({why})"
-                        ));
-                    }
-                }
-            }
-        };
-        self.checked = Some((link.url, checked));
-        match checked {
-            Checked::Valid => {
-                self.hub.see_cache(CacheState::Valid);
-                let taken = self.hub.offer_cached(key, now);
-                self.report(format!(
-                    "the cached link works{}",
-                    if taken { "; using its key" } else { "" }
-                ));
-                self.hub
-                    .held_key(now)
-                    .map(|held| held.wish_url())
-                    .ok_or_else(|| "the link in the game's cache expired".to_owned())
-            }
-            Checked::Expired => {
-                self.hub.see_cache(CacheState::Expired);
-                self.report("the cached link expired".to_owned());
-                Err("the link in the game's cache expired".to_owned())
-            }
-            Checked::Refused(retcode) => {
-                self.hub.see_cache(CacheState::Refused);
-                self.report(format!(
-                    "the game's server refused the cached link ({retcode})"
-                ));
-                Err("the game's server refused the link in its cache".to_owned())
+            Err(miss) => {
+                self.hub.see_cache(CacheState::None);
+                self.report(miss.to_string());
+                Err(miss.to_string())
             }
         }
     }
 
-    /// The logs or the cache changed: look again, unless the cache file is
-    /// the one read last, unchanged.
-    async fn on_change(&mut self) {
-        if let Ok(file) = self.reader.cache_file()
-            && let Some(now) = signature(&file)
-            && self.read.as_ref() == Some(&(file, now))
-        {
-            return;
-        }
-        let _ = self.look().await;
-    }
-
-    /// Run until the UI's end of the request channel is gone.
+    /// Answer requests until the UI's end of the channel is gone.
     pub(crate) async fn run(mut self) {
-        let (mut debouncer, mut events) =
-            match AsyncDebouncer::<RecommendedWatcher>::new_with_channel(
-                Duration::from_secs(1),
-                Some(Duration::from_secs(1)),
-            )
-            .await
-            {
-                Ok((debouncer, events)) => (Some(debouncer), Some(events)),
-                Err(error) => {
-                    tracing::info!(
-                        "wish cache: cannot watch files ({error}); looking on start and on demand only"
-                    );
-                    (None, None)
-                }
-            };
-        if let Some(debouncer) = &mut debouncer {
-            for dir in self.reader.log_dirs() {
-                if dir.is_dir() {
-                    let _ = debouncer.watcher().watch(&dir, RecursiveMode::NonRecursive);
-                }
-            }
+        while let Some(reply) = self.requests.recv().await {
+            let answer = self.look();
+            let _ = reply.send(answer);
         }
-
-        let _ = self.look().await;
-        let mut watched: Option<PathBuf> = None;
-        loop {
-            // The cache file is watched by itself: a new game version makes a
-            // new `webCaches` folder.
-            if let Some(debouncer) = &mut debouncer
-                && watched != self.reader.found
-            {
-                if let Some(old) = watched.take() {
-                    let _ = debouncer.watcher().unwatch(&old);
-                }
-                if let Some(new) = &self.reader.found
-                    && debouncer
-                        .watcher()
-                        .watch(new, RecursiveMode::NonRecursive)
-                        .is_ok()
-                {
-                    watched = Some(new.clone());
-                }
-            }
-            tokio::select! {
-                request = self.requests.recv() => match request {
-                    Some(reply) => {
-                        let answer = self.look().await;
-                        let _ = reply.send(answer);
-                    }
-                    None => break,
-                },
-                batch = next_events(&mut events) => match batch {
-                    Some(Ok(batch)) => {
-                        if self.relevant(&batch) {
-                            self.on_change().await;
-                        }
-                    }
-                    Some(Err(errors)) => tracing::debug!(?errors, "wish cache: watch errors"),
-                    None => events = None,
-                },
-            }
-        }
-    }
-
-    fn relevant(&self, batch: &[DebouncedEvent]) -> bool {
-        batch.iter().any(|event| {
-            self.reader.is_log(&event.path)
-                || self.reader.found.as_deref() == Some(event.path.as_path())
-        })
-    }
-}
-
-type Events = mpsc::Receiver<Result<Vec<DebouncedEvent>, Vec<async_watcher::notify::Error>>>;
-
-/// The next batch of file events; never, without a watcher.
-async fn next_events(
-    events: &mut Option<Events>,
-) -> Option<Result<Vec<DebouncedEvent>, Vec<async_watcher::notify::Error>>> {
-    match events {
-        Some(events) => events.recv().await,
-        None => std::future::pending().await,
     }
 }
 
