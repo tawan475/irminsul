@@ -70,10 +70,11 @@ egui_extras = { version = "0.32.2", features = ["image", "svg", "webp"] }
 egui_material_icons = "0.4.0"
 futures = "0.3.31"
 # The PC's name, shown to the user on the tracker's consent screen and in its
-# Devices list ("Irminsul on <PC>"). Already in the tree (x11rb, tray-icon).
+# Devices list ("Irminsul on <PC>"). Already in the tree on Linux (x11rb);
+# a small new crate on Windows and macOS.
 gethostname = "1.1.0"
 # Random bytes for the sign-in's PKCE verifier and `state` (src/signin.rs).
-# Already in the tree at this version (through rand and ring).
+# Already in the tree at this version (ahash, rand_core).
 getrandom = "0.3.4"
 futures-util = "0.3.31"
 indexmap = "2.11.1"
@@ -105,7 +106,7 @@ self_update = { version = "0.42.0", features = ["compression-flate2"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.143", features = ["alloc"] }
 # SHA-256 for the sign-in's PKCE challenge (RFC 7636 S256). Already in the
-# tree at this version.
+# tree at this version (self_update's ed25519-dalek, the Linux keyring).
 sha2 = "0.10.9"
 # Only the `system` feature, and only for a process-name scan (see
 # `src/game_watch.rs`). This is not really a new dependency: `egui-file-dialog`
