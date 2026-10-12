@@ -13,16 +13,27 @@ pub(crate) fn warnings(f: impl FnOnce()) -> Vec<String> {
 
 /// Runs `f` and returns every event at exactly `level` it logged on this
 /// thread, each as its message followed by its other fields.
+///
+/// One global subscriber, installed on first use, routes each event to the
+/// capture running on the thread that logged it. A scoped subscriber per test
+/// (`with_default`) was not enough: `tracing` caches, per call site and for all
+/// threads at once, whether anyone listens, and on CI a warning call site that
+/// earlier tests reached without a capture stayed cached as unheard, so a test
+/// that did capture saw 0 events. A global subscriber that always listens
+/// leaves nothing to cache wrongly.
 pub(crate) fn logged(level: Level, f: impl FnOnce()) -> Vec<String> {
-    use std::sync::{Arc, Mutex};
+    use std::cell::RefCell;
+    use std::sync::Once;
 
     use tracing::field::{Field, Visit};
+    use tracing::metadata::LevelFilter;
     use tracing::span::{Attributes, Id, Record};
+    use tracing::subscriber::Interest;
     use tracing::{Event, Metadata, Subscriber};
 
-    struct Capture {
-        level: Level,
-        seen: Arc<Mutex<Vec<String>>>,
+    thread_local! {
+        /// The level being captured on this thread and what it caught.
+        static CAPTURE: RefCell<Option<(Level, Vec<String>)>> = const { RefCell::new(None) };
     }
 
     struct Fields(String);
@@ -37,7 +48,15 @@ pub(crate) fn logged(level: Level, f: impl FnOnce()) -> Vec<String> {
         }
     }
 
-    impl Subscriber for Capture {
+    struct Router;
+
+    impl Subscriber for Router {
+        fn register_callsite(&self, _: &'static Metadata<'static>) -> Interest {
+            Interest::always()
+        }
+        fn max_level_hint(&self) -> Option<LevelFilter> {
+            Some(LevelFilter::TRACE)
+        }
         fn enabled(&self, _: &Metadata<'_>) -> bool {
             true
         }
@@ -47,32 +66,41 @@ pub(crate) fn logged(level: Level, f: impl FnOnce()) -> Vec<String> {
         fn record(&self, _: &Id, _: &Record<'_>) {}
         fn record_follows_from(&self, _: &Id, _: &Id) {}
         fn event(&self, event: &Event<'_>) {
-            if *event.metadata().level() == self.level {
-                let mut fields = Fields(String::new());
-                event.record(&mut fields);
-                self.seen.lock().unwrap().push(fields.0);
-            }
+            CAPTURE.with(|capture| {
+                if let Some((level, seen)) = capture.borrow_mut().as_mut()
+                    && event.metadata().level() == level
+                {
+                    let mut fields = Fields(String::new());
+                    event.record(&mut fields);
+                    seen.push(fields.0);
+                }
+            });
         }
         fn enter(&self, _: &Id) {}
         fn exit(&self, _: &Id) {}
     }
 
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let capture = Capture {
-        level,
-        seen: Arc::clone(&seen),
-    };
-    tracing::subscriber::with_default(capture, || {
-        // `tracing` caches, per call site and for every thread at once,
-        // whether anyone listens. Tests capture in parallel on many threads,
-        // and a call site first reached while no capture was registered can
-        // stay cached as unheard, so a warning this test logs goes missing
-        // (seen on CI as a flaky count of 0). Rebuilding the cache with this
-        // capture registered makes every call site ask it again.
-        tracing::callsite::rebuild_interest_cache();
-        f();
+    /// Ends this thread's capture even if `f` panics.
+    struct Stop;
+
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            CAPTURE.with(|capture| capture.borrow_mut().take());
+        }
+    }
+
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        tracing::subscriber::set_global_default(Router)
+            .expect("no other global subscriber in the unit tests");
     });
-    seen.lock().unwrap().clone()
+
+    CAPTURE.with(|capture| *capture.borrow_mut() = Some((level, Vec::new())));
+    let stop = Stop;
+    f();
+    let seen = CAPTURE.with(|capture| capture.borrow_mut().take().map(|(_, seen)| seen));
+    drop(stop);
+    seen.unwrap_or_default()
 }
 
 /// The messages of one Oodle test vector stream in
