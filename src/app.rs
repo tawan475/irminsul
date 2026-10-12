@@ -1803,7 +1803,7 @@ impl IrminsulApp {
         // The wish URL is built from the key the game sends when its wish
         // history is opened, so the section works wherever capture does; the
         // web-cache fallback is the part that needs a Windows or Wine client.
-        self.wish_ui(ui);
+        self.wish_ui(ui, app_state);
         ui.separator();
         self.achievement_ui(ui, app_state);
         ui.separator();
@@ -2132,7 +2132,7 @@ impl IrminsulApp {
         self.optimizer_export_rx = Some(rx);
     }
 
-    fn wish_ui(&mut self, ui: &mut egui::Ui) {
+    fn wish_ui(&mut self, ui: &mut egui::Ui, app_state: &AppState) {
         let now = Instant::now();
         let wish_url = self.wishes.wish_url(now);
         ui.vertical(|ui| {
@@ -2166,7 +2166,15 @@ impl IrminsulApp {
                     });
                 },
             );
-            ui.label(RichText::new(self.wishes.key_line(now)).weak());
+            let uid_known = app_state
+                .player
+                .as_ref()
+                .is_some_and(|player| player.uid.is_some());
+            let status = self
+                .wishes
+                .status(now, app_state.game_status, uid_known);
+            ui.label(RichText::new(status.text).weak())
+                .on_hover_text(status.tooltip);
             if let Some(line) = self.wishes.sync_line() {
                 ui.label(RichText::new(line).weak());
             }

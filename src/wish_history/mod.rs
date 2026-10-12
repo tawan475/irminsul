@@ -37,6 +37,7 @@ pub(crate) use self::gacha_log::WishKey;
 pub(crate) use self::sync::{SyncStatus, WishSync};
 use self::tracker::TrackerCredential;
 use crate::app::SavedAppState;
+use crate::game_watch::GameStatus;
 use crate::signin::{TrackerAuth, UploadCredential};
 
 /// A banner as the wish history API and the tracker number it (UIGF): 301
@@ -185,26 +186,60 @@ pub(crate) fn region_for_uid(uid: u32) -> Option<&'static str> {
     }
 }
 
+/// What this session's traffic has shown the wish history so far: the UI's
+/// "seen" list, which says why a key or a part of the link is missing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Seen {
+    /// The banner list (`GetGachaInfoRsp`): the Wish screen was opened.
+    pub(crate) banner_list: bool,
+    /// A wish history key (`webview_gacha`): Wish → History was opened.
+    pub(crate) wish_key: bool,
+    /// Web view keys for something else (the login's `ugc_login`), ignored.
+    pub(crate) other_keys: u32,
+    /// The client's version, from its login.
+    pub(crate) client_version: bool,
+}
+
+/// Asks the UI to repaint: what the monitor hands on changes what it shows.
+pub(crate) type Notify = Arc<dyn Fn() + Send + Sync>;
+
 /// The monitor's end: hands captured keys and wishes on.
 #[derive(Clone)]
 pub(crate) struct WishHub {
     key_tx: Arc<watch::Sender<Option<WishKey>>>,
     trigger_tx: mpsc::UnboundedSender<Trigger>,
     captured: Arc<std::sync::Mutex<Captured>>,
+    seen_tx: Arc<watch::Sender<Seen>>,
+    notify: Notify,
 }
 
 impl WishHub {
     /// Hand `events` on; `uid` is the account's, when captured (for the
     /// link's `region`).
     pub(crate) fn forward(&self, events: Vec<WishEvent>, uid: Option<u32>) {
+        if events.is_empty() {
+            return;
+        }
         for event in events {
             match event {
                 WishEvent::Key(key) => self.key(key, uid, Instant::now()),
                 WishEvent::Banners(banners) => {
-                    tracing::debug!(banners = banners.len(), "banner list");
+                    // Info the first time: what a user's log shows when the
+                    // wish section stays empty.
+                    if self.see(|seen| !std::mem::replace(&mut seen.banner_list, true)) {
+                        tracing::info!(
+                            banners = banners.len(),
+                            "wish history: saw the banner list (the Wish screen opened)"
+                        );
+                    } else {
+                        tracing::debug!(banners = banners.len(), "banner list");
+                    }
                     self.captured.lock().unwrap().banners = banners;
                 }
                 WishEvent::ClientVersion(version) => {
+                    if self.see(|seen| !std::mem::replace(&mut seen.client_version, true)) {
+                        tracing::info!("wish history: saw the client version");
+                    }
                     self.captured.lock().unwrap().game_version = Some(version);
                 }
                 WishEvent::Wish(wish) => {
@@ -218,14 +253,34 @@ impl WishHub {
                 }
             }
         }
+        (self.notify)();
+    }
+
+    /// Update what was seen; `true` when `change` says it was news.
+    fn see(&self, change: impl FnOnce(&mut Seen) -> bool) -> bool {
+        let mut news = false;
+        self.seen_tx.send_modify(|seen| news = change(seen));
+        news
     }
 
     fn key(&self, key: GachaAuthKey, uid: Option<u32>, now: Instant) {
         if !key.is_wish_history_key() {
             // The login's keys (`ugc_login`) are for something else.
-            tracing::debug!(app = %key.auth_appid, "ignoring a web view key that is not for wishes");
+            let first = self.see(|seen| {
+                seen.other_keys += 1;
+                seen.other_keys == 1
+            });
+            if first {
+                tracing::info!(app = %key.auth_appid, "wish history: ignoring a web view key for another page");
+            } else {
+                tracing::debug!(app = %key.auth_appid, "ignoring a web view key that is not for wishes");
+            }
             return;
         }
+        self.see(|seen| {
+            seen.wish_key = true;
+            false
+        });
         let link = self.captured.lock().unwrap().link_parts(uid);
         tracing::info!(
             banner_link = link.record_query.is_some(),
@@ -255,6 +310,7 @@ impl WishHub {
 pub(crate) struct WishView {
     key_rx: watch::Receiver<Option<WishKey>>,
     status_rx: watch::Receiver<SyncStatus>,
+    seen_rx: watch::Receiver<Seen>,
     /// The URL the web-cache scraper found (`crate::wish`), the fallback while
     /// no key has been captured.
     scraped_url_rx: watch::Receiver<Option<String>>,
@@ -278,20 +334,14 @@ impl WishView {
         }
     }
 
-    /// "Open Wish → History in game" until a key exists, then how long it
-    /// lasts.
-    pub(crate) fn key_line(&self, now: Instant) -> String {
-        match self.key(now) {
-            None => "Open Wish → History in game".to_owned(),
-            Some(key) => {
-                let hours = key.remaining(now).as_secs().div_ceil(3600);
-                if hours <= 1 {
-                    "Wish key valid for less than an hour".to_owned()
-                } else {
-                    format!("Wish key valid about {hours} h")
-                }
-            }
-        }
+    /// The section's status line and its tooltip, by what is really the
+    /// case: see [`status_line`].
+    pub(crate) fn status(&self, now: Instant, game: GameStatus, uid_known: bool) -> WishLine {
+        let mut line = status_line(self.key(now).as_ref(), now, game);
+        line.tooltip.push_str("\n\n");
+        line.tooltip
+            .push_str(&seen_summary(&self.seen_rx.borrow(), uid_known));
+        line
     }
 
     /// One line about the tracker sync, or `None` when there is nothing to
@@ -299,6 +349,76 @@ impl WishView {
     pub(crate) fn sync_line(&self) -> Option<String> {
         self.status_rx.borrow().line()
     }
+}
+
+/// The status line and what its tooltip says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WishLine {
+    pub(crate) text: String,
+    pub(crate) tooltip: String,
+}
+
+/// What the wish section says, by state:
+///
+/// * a key is held: how long it is believed to last;
+/// * no key, and this session is not decrypting: nothing can be read, so
+///   say that (with the capture's own guidance), never "open the history";
+/// * no key, decrypting: open the history once.
+pub(crate) fn status_line(key: Option<&WishKey>, now: Instant, game: GameStatus) -> WishLine {
+    if let Some(key) = key {
+        let hours = key.remaining(now).as_secs().div_ceil(3600);
+        let text = if hours <= 1 {
+            "Key valid < 1 h".to_owned()
+        } else {
+            format!("Key valid ~{hours} h")
+        };
+        return WishLine {
+            text,
+            tooltip: "The wish history key the game sent when its history page opened. \
+                      It lasts about a day; until then Copy wish URL gives the game's own \
+                      link, and new wishes sync by themselves when the Tracker is set up."
+                .to_owned(),
+        };
+    }
+    if game != GameStatus::Decoding {
+        return WishLine {
+            text: "Waiting for the game's login".to_owned(),
+            tooltip: format!(
+                "{}\n{}\n\nThe wish key can only be read from a game session Irminsul \
+                 decrypts.",
+                game.label(),
+                game.tooltip()
+            ),
+        };
+    }
+    WishLine {
+        text: "Open Wish → History once".to_owned(),
+        tooltip: "The key only comes when the game opens its wish history page; you can \
+                  close the page right away. It lasts about a day, and until then wishes \
+                  sync by themselves."
+            .to_owned(),
+    }
+}
+
+/// The "seen this session" list for the tooltip.
+pub(crate) fn seen_summary(seen: &Seen, uid_known: bool) -> String {
+    use egui_material_icons::icons::{ICON_CHECK, ICON_CLOSE};
+    let mark = |yes: bool| if yes { ICON_CHECK } else { ICON_CLOSE };
+    let mut lines = vec![
+        "Seen this session:".to_owned(),
+        format!("{} banner list (Wish screen)", mark(seen.banner_list)),
+        format!("{} wish key (Wish → History)", mark(seen.wish_key)),
+        format!("{} client version", mark(seen.client_version)),
+        format!("{} UID", mark(uid_known)),
+    ];
+    if seen.other_keys > 0 {
+        lines.push(format!(
+            "{} other web key{} ignored",
+            seen.other_keys,
+            if seen.other_keys == 1 { "" } else { "s" }
+        ));
+    }
+    lines.join("\n")
 }
 
 /// Everything the wish history needs, made together.
@@ -320,6 +440,9 @@ pub(crate) fn channels(
     let key_tx = Arc::new(key_tx);
     let (trigger_tx, trigger_rx) = mpsc::unbounded_channel();
     let (status_tx, status_rx) = watch::channel(SyncStatus::default());
+    let (seen_tx, seen_rx) = watch::channel(Seen::default());
+    let repaint = ctx.clone();
+    let notify: Notify = Arc::new(move || repaint.request_repaint());
     let sync = WishSync::new(
         trigger_rx,
         Arc::clone(&key_tx),
@@ -334,10 +457,13 @@ pub(crate) fn channels(
             key_tx,
             trigger_tx,
             captured: Arc::default(),
+            seen_tx: Arc::new(seen_tx),
+            notify,
         },
         view: WishView {
             key_rx,
             status_rx,
+            seen_rx,
             scraped_url_rx,
         },
         sync,
@@ -353,6 +479,16 @@ mod tests {
         watch::Receiver<Option<WishKey>>,
         mpsc::UnboundedReceiver<Trigger>,
     ) {
+        hub_with(Arc::new(|| {}))
+    }
+
+    fn hub_with(
+        notify: Notify,
+    ) -> (
+        WishHub,
+        watch::Receiver<Option<WishKey>>,
+        mpsc::UnboundedReceiver<Trigger>,
+    ) {
         let (key_tx, key_rx) = watch::channel(None);
         let (trigger_tx, trigger_rx) = mpsc::unbounded_channel();
         (
@@ -360,10 +496,118 @@ mod tests {
                 key_tx: Arc::new(key_tx),
                 trigger_tx,
                 captured: Arc::default(),
+                seen_tx: Arc::new(watch::channel(Seen::default()).0),
+                notify,
             },
             key_rx,
             trigger_rx,
         )
+    }
+
+    #[test]
+    fn what_the_session_showed_is_counted_and_the_ui_is_repainted() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let repaints = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&repaints);
+        let (hub, _key_rx, _triggers) = hub_with(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(*hub.seen_tx.borrow(), Seen::default());
+
+        hub.forward(
+            vec![
+                WishEvent::ClientVersion("OSRELWin7.1.0_R1_S2_D3".to_owned()),
+                WishEvent::Key(authkey("ugc_login", "IIII")),
+                WishEvent::Key(authkey("ugc_login", "JJJJ")),
+            ],
+            None,
+        );
+        assert_eq!(
+            *hub.seen_tx.borrow(),
+            Seen {
+                banner_list: false,
+                wish_key: false,
+                other_keys: 2,
+                client_version: true,
+            }
+        );
+        assert_eq!(repaints.load(Ordering::SeqCst), 1, "one repaint per batch");
+
+        hub.forward(
+            vec![
+                WishEvent::Banners(vec![banner(301, "cccc")]),
+                WishEvent::Key(authkey("webview_gacha", "KKKK")),
+            ],
+            Some(811_111_111),
+        );
+        let seen = hub.seen_tx.borrow().clone();
+        assert!(seen.banner_list && seen.wish_key);
+        assert_eq!(repaints.load(Ordering::SeqCst), 2);
+
+        hub.forward(Vec::new(), None);
+        assert_eq!(
+            repaints.load(Ordering::SeqCst),
+            2,
+            "nothing new, no repaint"
+        );
+    }
+
+    #[test]
+    fn the_status_line_says_what_is_really_the_case() {
+        let now = Instant::now();
+        // Nothing decrypts: never "open the history".
+        for game in [
+            GameStatus::NotRunning,
+            GameStatus::AwaitingLogin,
+            GameStatus::KeyLost,
+            GameStatus::LaunchMissed(crate::game_watch::MissedLaunch::AlreadyRunning),
+        ] {
+            let line = status_line(None, now, game);
+            assert_eq!(line.text, "Waiting for the game's login", "{game:?}");
+            assert!(
+                line.tooltip.contains(game.tooltip()),
+                "{game:?}: {}",
+                line.tooltip
+            );
+            assert!(!line.tooltip.contains("History"), "{game:?}");
+        }
+        // Decrypting, no key yet.
+        let line = status_line(None, now, GameStatus::Decoding);
+        assert_eq!(line.text, "Open Wish → History once");
+        assert!(line.tooltip.contains("close the page right away"));
+        // A key: how long it lasts, whatever the game does now.
+        let key = WishKey::new("LLLL", "hk4e_global", now);
+        for game in [GameStatus::Decoding, GameStatus::NotRunning] {
+            assert_eq!(status_line(Some(&key), now, game).text, "Key valid ~24 h");
+        }
+        let late = now + gacha_log::KEY_LIFETIME - std::time::Duration::from_secs(600);
+        assert_eq!(
+            status_line(Some(&key), late, GameStatus::Decoding).text,
+            "Key valid < 1 h"
+        );
+    }
+
+    #[test]
+    fn the_seen_list_marks_each_part() {
+        use egui_material_icons::icons::{ICON_CHECK, ICON_CLOSE};
+
+        let seen = Seen {
+            banner_list: true,
+            wish_key: false,
+            other_keys: 1,
+            client_version: true,
+        };
+        assert_eq!(
+            seen_summary(&seen, false),
+            format!(
+                "Seen this session:\n{ICON_CHECK} banner list (Wish screen)\n\
+                 {ICON_CLOSE} wish key (Wish → History)\n{ICON_CHECK} client version\n\
+                 {ICON_CLOSE} UID\n1 other web key ignored"
+            )
+        );
+        assert!(!seen_summary(&Seen::default(), true).contains("ignored"));
+        assert!(seen_summary(&Seen::default(), true).ends_with(&format!("{ICON_CHECK} UID")));
     }
 
     fn authkey(app: &str, key: &str) -> GachaAuthKey {
@@ -505,14 +749,17 @@ mod tests {
         let (key_tx, key_rx) = watch::channel(None);
         let (_status_tx, status_rx) = watch::channel(SyncStatus::default());
         let (scraped_tx, scraped_url_rx) = watch::channel(None);
+        let (_seen_tx, seen_rx) = watch::channel(Seen::default());
         let view = WishView {
             key_rx,
             status_rx,
+            seen_rx,
             scraped_url_rx,
         };
+        let status = |at| view.status(at, GameStatus::Decoding, true).text;
         let now = Instant::now();
         assert_eq!(view.wish_url(now), None);
-        assert_eq!(view.key_line(now), "Open Wish → History in game");
+        assert_eq!(status(now), "Open Wish → History once");
 
         scraped_tx.send_replace(Some("https://example.invalid/scraped".to_owned()));
         assert_eq!(
@@ -523,7 +770,12 @@ mod tests {
         key_tx.send_replace(Some(WishKey::new("EEEE", "hk4e_global", now)));
         let url = view.wish_url(now).unwrap();
         assert!(url.contains("authkey=EEEE"), "{url}");
-        assert_eq!(view.key_line(now), "Wish key valid about 24 h");
+        assert_eq!(status(now), "Key valid ~24 h");
+        assert!(
+            view.status(now, GameStatus::Decoding, true)
+                .tooltip
+                .contains("Seen this session:")
+        );
 
         // A day later the key is gone and the scraper's URL is back.
         let later = now + gacha_log::KEY_LIFETIME;
@@ -531,7 +783,7 @@ mod tests {
             view.wish_url(later).as_deref(),
             Some("https://example.invalid/scraped")
         );
-        assert_eq!(view.key_line(later), "Open Wish → History in game");
+        assert_eq!(status(later), "Open Wish → History once");
     }
 
     #[test]

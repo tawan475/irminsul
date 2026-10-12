@@ -171,8 +171,14 @@ The gear icon opens the tracker window. Under **Advanced**:
 
 Open **Wish → History** in game while Irminsul is running. The game then
 fetches a key for its wish history page, and Irminsul picks it up from the
-traffic; the "Wish History" section says "Wish key valid about 24 h" (keys
-last about a day; open the history again for a new one).
+traffic; the "Wish History" section then says "Key valid ~24 h" (keys last
+about a day; open the history again for a new one). Before that it says
+"Open Wish → History once", or "Waiting for the game's login" while Irminsul
+cannot read the game at all (for example when the game was started before
+Irminsul). Hover the line for details, including what Irminsul has seen this
+session: the banner list (the Wish screen), the wish key, the client version
+and the UID. If something stays missing, the same discoveries are in the log
+("Open log folder", `latest.log`); it never holds the key or the URL.
 
 - **Copy wish URL** (the clipboard icon) copies the wish URL built from that
   key. Paste it into [paimon.moe](https://paimon.moe/wish/import) ("Manual"
