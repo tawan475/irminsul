@@ -101,7 +101,7 @@ tracker at <https://genshin-tracker.475.dev>:
 1. Click **Sign in** in the "Tracker" section. Your browser opens the tracker:
    sign in there if you aren't already, choose where this PC's uploads go, and
    click **Allow**. The page then says you can close it, and Irminsul shows
-   "Signed in as <your name>" and where uploads go.
+   "Signed in as <your name>".
 2. With a capture completed, click the cloud upload icon to send the current
    data. Tick "Auto export to tracker" in the same section to upload every
    completed capture automatically.
@@ -109,7 +109,8 @@ tracker at <https://genshin-tracker.475.dev>:
 Where uploads go is set on the tracker, not in Irminsul: **Auto (by UID)**
 (the default) files each capture under the account with that capture's UID and
 creates one for a new UID; **Always this account** sends everything to one
-account. Click **Configure** next to "Uploads:" to change it in the browser;
+account. The Tracker settings (the cog in the "Tracker" section) show where
+uploads go; click **Configure** there to change it in the browser;
 Irminsul picks the change up when you come back to its window (and every few
 minutes while it is open). This PC also appears in the tracker's **Settings →
 Devices** as "Irminsul on <PC name>", where you can change the target or sign
@@ -183,22 +184,22 @@ wishes of that login's UID are ever sent ("the wish key belongs to another
 account" otherwise). If the UID is not known yet, the sync waits for it.
 Irminsul keeps the key in memory only.
 
-The "Wish History" section says what is the case: "Key valid ~20 h"; "No wish
-key yet"; or "Waiting for the game's login" while Irminsul cannot read the
-game (for example when the game was started before Irminsul) and has no key.
-Hover the line for details, including what Irminsul has seen this login: the
-banner list (the Wish screen), a wish key from the game, the client version,
-the UID and the link in the game's web cache. If something stays missing, the
-same discoveries are in the log ("Open log folder", `latest.log`); it never
-holds the key or the URL.
+The "Wish History" section stays short. Without a key it says "No wish key
+yet", or "Waiting for the game's login" while Irminsul cannot read the game
+(for example when the game was started before Irminsul); with a key it shows
+only the sync line, if there is one. Hover a line for details, including what
+Irminsul has seen this login: the banner list (the Wish screen), a wish key
+from the game, the client version and the UID. How long the key still lasts
+("Key valid ~20 h") is in the Copy icon's tooltip. If something stays missing,
+the same discoveries are in the log ("Open log folder", `latest.log`); it
+never holds the key or the URL.
 
 - **Copy wish URL** (the clipboard icon) copies the game's own wish URL for
   that key. Paste it into [paimon.moe](https://paimon.moe/wish/import)
   ("Manual" import) or [StarDB](https://stardb.gg/en/genshin/wish-import); the
   "Open Paimon.moe" and "Open StarDB" links copy it and open the page in one
-  go. Without a key it copies the link the game left in its web cache
-  instead, as it is. That link may be another account's (the cache belongs to
-  the PC, not the login), so it is never used to sync.
+  go. They need this login's key: without one they are disabled. Irminsul
+  never reads the game's web cache, which may hold another account's link.
 - **Sync to the tracker**: when Irminsul uploads to a Genshin Data Tracker by
   itself -- signed in (or with a verified import key) and "Auto export to
   tracker" ticked -- a new key also sends your wish history there. It asks the

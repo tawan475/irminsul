@@ -40,7 +40,6 @@ use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::game_watch::{GameStatus, MissedLaunch, Severity};
-use crate::good::GiPlayer;
 use crate::monitor::Monitor;
 use crate::player_data::{ExportCounts, ExportSettings};
 use crate::update::{InstallLock, UpdateAnswer, check_for_app_update};
@@ -500,52 +499,6 @@ fn uid_mismatch_message(account: &TrackerAccount, captured: u32) -> String {
     )
 }
 
-/// The data panel's account line, e.g. `AR 60 · WL 8 · Resin 124 at login`.
-///
-/// `None` when none of the three was captured. "At login" because that is
-/// when the game sends them: nothing here follows play, and resin in
-/// particular keeps regenerating after the snapshot.
-fn player_summary(player: &GiPlayer) -> Option<String> {
-    let parts: Vec<String> = [
-        player.ar.map(|ar| format!("AR {ar}")),
-        player.wl.map(|wl| format!("WL {wl}")),
-        player.resin.map(|resin| format!("Resin {resin}")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    (!parts.is_empty()).then(|| format!("{} at login", parts.join(" · ")))
-}
-
-/// The tooltip on [`player_summary`]'s line: the caveat, then the rest of what
-/// `gi_player` holds.
-fn player_details(player: &GiPlayer) -> String {
-    let facts: Vec<String> = [
-        player.uid.map(|uid| format!("UID {uid}")),
-        player.ar_exp.map(|exp| format!("AR EXP {exp}")),
-        player
-            .wl_limit
-            .map(|limit| format!("World Level limit {limit}")),
-        player.story_keys.map(|keys| format!("Story Keys {keys}")),
-        // The game counts stamina in hundredths.
-        player
-            .max_stamina
-            .map(|stamina| format!("Max stamina {}", stamina / 100)),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-
-    let mut details = "A snapshot from login: the game sends these when you enter the world and \
-                       Irminsul does not follow them while you play (resin keeps regenerating)."
-        .to_string();
-    if !facts.is_empty() {
-        details.push_str("\n\n");
-        details.push_str(&facts.join("\n"));
-    }
-    details
-}
-
 pub struct IrminsulApp {
     ui_message_tx: mpsc::UnboundedSender<Message>,
     /// Answers to the update prompt only. Keeping these off `ui_message_tx` is
@@ -576,7 +529,6 @@ pub struct IrminsulApp {
     optimizer_settings_open: bool,
     optimizer_export_rx: Option<oneshot::Receiver<Result<(String, ExportCounts)>>>,
     achievements_export_rx: Option<oneshot::Receiver<Result<Vec<u32>>>>,
-    wish_url_rx_oneshot: Option<oneshot::Receiver<std::result::Result<String, String>>>,
     wish_link_failed_for: Option<String>,
     pending_open_url: Option<String>,
     optimizer_save_dialog: Option<FileDialog>,
@@ -875,7 +827,6 @@ fn start_async_runtime(
         hub: wish_hub,
         view: wish_view,
         sync: wish_sync,
-        cache: wish_cache,
     } = crate::wish_history::channels(
         saved_state_rx.clone(),
         toast_tx.clone(),
@@ -914,10 +865,6 @@ fn start_async_runtime(
             {
                 tracing::error!("error checking for update: {e}");
             }
-
-            // The link in the game's web cache, read when the UI asks (Copy
-            // without a key); never a key for the sync. Ends with the UI.
-            tokio::spawn(wish_cache.run());
 
             // Wish history from the keys; ends with the monitor.
             tokio::spawn(wish_sync.run());
@@ -1173,7 +1120,6 @@ impl IrminsulApp {
             optimizer_settings_open: false,
             optimizer_export_rx: None,
             achievements_export_rx: None,
-            wish_url_rx_oneshot: None,
             wish_link_failed_for: None,
             pending_open_url: None,
             optimizer_save_dialog: None,
@@ -1362,7 +1308,6 @@ impl eframe::App for IrminsulApp {
 
             ui.vertical(|ui| {
                 self.title_bar(ui);
-                ui.add_space(25.);
 
                 // Handle power tools here instead of main UI to allow it to be opened
                 // in other app states.
@@ -1539,7 +1484,6 @@ impl IrminsulApp {
     /// frame. Called once at the top of `update`.
     fn poll_background_results(&mut self, ctx: &Context) {
         self.optimizer_handle_export(ctx).toast_error(self);
-        self.wish_handle_find_url(ctx).toast_error(self);
         self.achievements_handle_export(ctx).toast_error(self);
         self.poll_tracker_sign_in(ctx);
         self.poll_tracker_upload();
@@ -1786,8 +1730,7 @@ impl IrminsulApp {
         self.capture_ui(ui, app_state);
         ui.separator();
         // The wish URL is built from the key the game sends when its wish
-        // history is opened, so the section works wherever capture does; the
-        // web-cache fallback is the part that needs a Windows or Wine client.
+        // history is opened, so the section works wherever capture does.
         self.wish_ui(ui, app_state);
         ui.separator();
         self.achievement_ui(ui, app_state);
@@ -1939,13 +1882,6 @@ impl IrminsulApp {
                 Self::data_state(ui, "Characters", app_state.updated.characters_updated);
                 Self::data_state(ui, "Achievements", app_state.updated.achievements_updated);
             });
-
-        if let Some(player) = &app_state.player
-            && let Some(summary) = player_summary(player)
-        {
-            ui.label(RichText::new(summary).color(Color32::GRAY))
-                .on_hover_text(player_details(player));
-        }
 
         ui.add_space(4.0);
 
@@ -2117,9 +2053,21 @@ impl IrminsulApp {
         self.optimizer_export_rx = Some(rx);
     }
 
+    /// The wish section, kept compact: the header with Copy, one line only
+    /// when there is something to say (no key, or the sync), and the two
+    /// links. Everything else is in tooltips.
+    ///
+    /// Copy and the links need this login's key: without one they are
+    /// disabled.
     fn wish_ui(&mut self, ui: &mut egui::Ui, app_state: &AppState) {
+        const NO_KEY: &str = "No wish key yet: open the wish history in game";
         let now = Instant::now();
         let wish_url = self.wishes.wish_url(now);
+        let uid_known = app_state
+            .player
+            .as_ref()
+            .is_some_and(|player| player.uid.is_some());
+        let status = self.wishes.status(now, app_state.game_status, uid_known);
         ui.vertical(|ui| {
             egui::Sides::new().show(
                 ui,
@@ -2128,118 +2076,54 @@ impl IrminsulApp {
                     ui.label(egui_material_icons::icons::ICON_HELP)
                         .on_hover_text(
                             "Irminsul takes your wish key from the game when its wish history \
-                         page opens; each login starts fresh. Click the Copy icon to copy \
-                         the wish URL, then paste it into paimon.moe (Manual import) or \
-                         StarDB. Without a key it copies the link in the game's web cache, \
-                         which may be another account's. With the Tracker set up and \
-                         uploads on, new wishes are sent to it as well.",
+                             page opens; each login starts fresh. Click the Copy icon to copy \
+                             the wish URL, then paste it into paimon.moe (Manual import) or \
+                             StarDB. With the Tracker set up and uploads on, new wishes are \
+                             sent to it as well.",
                         );
                 },
                 |ui| {
-                    ui.add_enabled_ui(self.wish_url_rx_oneshot.is_none(), |ui| {
-                        if ui
+                    ui.add_enabled_ui(wish_url.is_some(), |ui| {
+                        let copy = ui
                             .button(egui_material_icons::icons::ICON_CONTENT_PASTE_GO)
-                            .on_hover_text("Copy wish URL")
-                            .clicked()
+                            .on_hover_text(format!("Copy wish URL\n{}", status.text))
+                            .on_disabled_hover_text(NO_KEY);
+                        if copy.clicked()
+                            && let Some(url) = &wish_url
                         {
-                            if let Some(url) = &wish_url {
-                                ui.ctx().copy_text(url.clone());
-                                self.toasts.info("Wish URL copied to clipboard");
-                                self.wish_link_failed_for = None;
-                            } else {
-                                self.wish_url_rx_oneshot = Some(self.wishes.look_in_cache());
-                                self.pending_open_url = None;
-                                self.wish_link_failed_for = None;
-                            }
+                            ui.ctx().copy_text(url.clone());
+                            self.toasts.info("Wish URL copied to clipboard");
                         }
                     });
                 },
             );
-            let uid_known = app_state
-                .player
-                .as_ref()
-                .is_some_and(|player| player.uid.is_some());
-            let status = self.wishes.status(now, app_state.game_status, uid_known);
-            ui.label(RichText::new(status.text).weak())
-                .on_hover_text(status.tooltip);
+            if wish_url.is_none() {
+                ui.label(RichText::new(&status.text).weak())
+                    .on_hover_text(&status.tooltip);
+            }
             if let Some(line) = self.wishes.sync_line(now) {
-                ui.label(RichText::new(line).weak());
+                ui.label(RichText::new(line).weak())
+                    .on_hover_text(&status.tooltip);
             }
             ui.horizontal(|ui| {
-                if ui.link("Open Paimon.moe").clicked() {
-                    self.handle_wish_open_button(
-                        ui,
-                        wish_url.clone(),
-                        "https://paimon.moe/wish/import",
-                    );
-                }
-                if ui.link("Open StarDB").clicked() {
-                    self.handle_wish_open_button(
-                        ui,
-                        wish_url.clone(),
-                        "https://stardb.gg/en/genshin/wish-import",
-                    );
+                for (label, target) in [
+                    ("Open Paimon.moe", "https://paimon.moe/wish/import"),
+                    ("Open StarDB", "https://stardb.gg/en/genshin/wish-import"),
+                ] {
+                    let link = ui
+                        .add_enabled(wish_url.is_some(), egui::Link::new(label))
+                        .on_hover_text("Copies the wish URL and opens the page")
+                        .on_disabled_hover_text(NO_KEY);
+                    if link.clicked()
+                        && let Some(url) = &wish_url
+                    {
+                        ui.ctx().copy_text(url.clone());
+                        self.toasts.info("Wish URL copied to clipboard");
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(target));
+                    }
                 }
             });
         });
-    }
-
-    /// Collect the answer of a look in the game's web cache
-    /// (`WishView::look_in_cache`).
-    ///
-    /// Polled, never awaited in the widget tree: the look reads the game's
-    /// log and cache files.
-    fn wish_handle_find_url(&mut self, ctx: &Context) -> Result<()> {
-        let url = match poll_oneshot(&mut self.wish_url_rx_oneshot) {
-            Polled::Pending => return Ok(()),
-            Polled::Ready(Ok(url)) => Ok(url),
-            Polled::Ready(Err(why)) => Err(why),
-            Polled::Dropped => Err("the game's web cache could not be read".to_owned()),
-        };
-
-        match url {
-            Ok(url) => {
-                ctx.copy_text(url);
-                self.toasts
-                    .info("Wish URL copied from the game's cache (may be another account's)");
-                self.wish_link_failed_for = None;
-                if let Some(target_url) = self.pending_open_url.take() {
-                    ctx.open_url(egui::OpenUrl::new_tab(target_url));
-                }
-            }
-            Err(why) => {
-                if let Some(target_url) = self.pending_open_url.take() {
-                    self.wish_link_failed_for = Some(target_url);
-                    self.toasts
-                        .error("Link not found, click again to open anyways");
-                } else {
-                    self.wish_link_failed_for = None;
-                    self.toasts.error(format!("No wish key yet: {why}."));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn handle_wish_open_button(
-        &mut self,
-        ui: &mut egui::Ui,
-        wish_url: Option<String>,
-        target_url: &str,
-    ) {
-        if self.wish_link_failed_for.as_deref() == Some(target_url) {
-            ui.ctx().open_url(egui::OpenUrl::new_tab(target_url));
-            self.wish_link_failed_for = None;
-        } else if let Some(url) = wish_url {
-            ui.ctx().copy_text(url);
-            self.toasts.info("Wish URL copied to clipboard");
-            ui.ctx().open_url(egui::OpenUrl::new_tab(target_url));
-            self.wish_link_failed_for = None;
-        } else {
-            self.wish_url_rx_oneshot = Some(self.wishes.look_in_cache());
-            self.pending_open_url = Some(target_url.to_string());
-            self.wish_link_failed_for = None;
-        }
     }
 
     fn automation_ui(&mut self, ui: &mut egui::Ui) {
@@ -2463,7 +2347,9 @@ impl IrminsulApp {
     /// The sign-in's state while it is not plain "signed out": waiting on
     /// the browser, or who is signed in and where uploads go. Shared by the
     /// panel and the settings window.
-    fn sign_in_status_ui(&mut self, ui: &mut egui::Ui, status: &AuthStatus) {
+    /// The sign-in's state; with `show_target`, also where uploads go and
+    /// Configure (the Tracker settings dialog only: the section stays short).
+    fn sign_in_status_ui(&mut self, ui: &mut egui::Ui, status: &AuthStatus, show_target: bool) {
         match status {
             AuthStatus::Loading => {
                 ui.label(RichText::new("…").color(Color32::GRAY));
@@ -2516,6 +2402,9 @@ impl IrminsulApp {
                         self.send_tracker(TrackerRequest::SignOut);
                     }
                 });
+                if !show_target {
+                    return;
+                }
                 ui.horizontal(|ui| {
                     let target = whoami
                         .as_ref()
@@ -2689,7 +2578,7 @@ impl IrminsulApp {
                 ui.set_width(360.0);
                 ui.heading("Tracker");
                 ui.separator();
-                self.sign_in_status_ui(ui, &status);
+                self.sign_in_status_ui(ui, &status, true);
                 ui.add_space(6.0);
                 egui::CollapsingHeader::new("Advanced")
                     .id_salt("tracker_advanced")
@@ -2833,7 +2722,7 @@ impl IrminsulApp {
                     self.import_key_status_ui(ui, captured_uid);
                 }
                 other => {
-                    self.sign_in_status_ui(ui, other);
+                    self.sign_in_status_ui(ui, other, false);
                     if let Some(account) = signed_in.then(|| self.upload_account()).flatten()
                         && let Some(captured) = uid_mismatch(&account, captured_uid)
                     {
@@ -3869,57 +3758,6 @@ mod tests {
             None
         );
         assert_eq!(tracker_error_status("HTTP - no status"), None);
-    }
-
-    fn login_player() -> GiPlayer {
-        GiPlayer {
-            uid: Some(811_111_111),
-            ar: Some(60),
-            ar_exp: Some(0),
-            wl: Some(8),
-            wl_limit: Some(9),
-            resin: Some(124),
-            story_keys: Some(3),
-            max_stamina: Some(24_000),
-            game_data: Some("792978e5".to_string()),
-        }
-    }
-
-    #[test]
-    fn the_account_line_says_its_values_are_from_login() {
-        assert_eq!(
-            player_summary(&login_player()).as_deref(),
-            Some("AR 60 · WL 8 · Resin 124 at login")
-        );
-
-        // Only what was captured.
-        let partial = GiPlayer {
-            ar: Some(45),
-            ..Default::default()
-        };
-        assert_eq!(player_summary(&partial).as_deref(), Some("AR 45 at login"));
-
-        // A UID alone is no line.
-        let uid_only = GiPlayer {
-            uid: Some(811_111_111),
-            ..Default::default()
-        };
-        assert_eq!(player_summary(&uid_only), None);
-    }
-
-    #[test]
-    fn the_account_tooltip_carries_the_caveat_and_the_rest() {
-        let details = player_details(&login_player());
-        assert!(details.starts_with("A snapshot from login"), "{details}");
-        for fact in [
-            "UID 811111111",
-            "AR EXP 0",
-            "World Level limit 9",
-            "Story Keys 3",
-            "Max stamina 240",
-        ] {
-            assert!(details.contains(fact), "{fact} missing from {details}");
-        }
     }
 
     fn linked_account(uid: &str) -> TrackerAccount {
