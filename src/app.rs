@@ -612,6 +612,10 @@ pub struct IrminsulApp {
     /// Said once at startup when the previous run did not exit cleanly (see
     /// `crash.rs`), until dismissed.
     previous_run_notice: Option<String>,
+
+    /// Started with `--minimized` ("Start minimized" on the startup task):
+    /// minimize on the first frame, then clear.
+    start_minimized: bool,
 }
 
 trait ToastError<T> {
@@ -912,6 +916,7 @@ impl IrminsulApp {
         capture_source: capture::CaptureSource,
         restart_requested: Arc<AtomicBool>,
         previous_run_notice: Option<String>,
+        start_minimized: bool,
     ) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         egui_material_icons::initialize(&cc.egui_ctx);
@@ -1148,6 +1153,7 @@ impl IrminsulApp {
             startup,
             background: load_background(&cc.egui_ctx),
             previous_run_notice,
+            start_minimized,
             monitor_cancel_token: cancel_token,
             monitor_handle: Some(monitor_handle),
             install_lock,
@@ -1216,6 +1222,16 @@ impl eframe::App for IrminsulApp {
         self.poll_background_results(ctx);
         #[cfg(windows)]
         self.release_settled_memory();
+
+        // eframe shows the window after painting the first frame and applies
+        // this frame's commands after that, so it is on screen for one frame.
+        // To the tray only when that was the user's choice for the minimize
+        // button; otherwise the taskbar, where it can be found.
+        if std::mem::take(&mut self.start_minimized) {
+            let to_tray = self.saved_state.minimize_to_tray == Some(true);
+            tracing::info!(to_tray, "starting minimized");
+            self.minimize(ctx, to_tray);
+        }
 
         let minimize_modal_open = self.minimize_modal_open;
         if minimize_modal_open {

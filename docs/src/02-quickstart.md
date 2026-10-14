@@ -226,6 +226,10 @@ ordinary startup list, which Windows never runs for a program that needs
 administrator rights; a newer version moves that entry to the task when it
 starts.)
 
+The cog next to the checkbox holds "Start minimized": the task then starts
+Irminsul with `--minimized`, to the tray if that is what you chose for the
+minimize button, otherwise to the taskbar.
+
 If the task starts a different copy of Irminsul, or a file that is no longer
 there, an amber warning icon appears next to the checkbox. Click it to see both
 paths, and "Start this copy instead" to point the task at the copy you are
