@@ -16,6 +16,10 @@
 //! file that is gone, an amber icon next to the checkbox says so and offers to
 //! point it at the running copy.
 //!
+//! The cog beside the checkbox holds "Start minimized", which is the task's
+//! [`MINIMIZED_ARG`] argument: like the checkbox, Task Scheduler holds it, so
+//! no saved setting can disagree with what sign-in will do.
+//!
 //! Everything that builds or reads text is a plain function, tested on every
 //! platform; only `windows_impl` touches the system. Elsewhere the checkbox
 //! fails the way it always has.
@@ -44,6 +48,10 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const FOCUS_REFRESH_MIN: Duration = Duration::from_secs(2);
 
 const CHECKBOX_LABEL: &str = "Start Irminsul on startup";
+
+/// The argument the task passes when "Start minimized" is ticked; `main.rs`
+/// parses it.
+pub const MINIMIZED_ARG: &str = "--minimized";
 
 /// Escape text for an XML element's content.
 ///
@@ -174,9 +182,15 @@ fn xml_bool(text: &str) -> Option<bool> {
 ///   would start the capture below normal priority, behind the game.
 /// - The command is quoted; the working directory is the exe's folder, where
 ///   a debug build keeps its `irminsul-data` (release builds use `%APPDATA%`).
-pub fn task_xml(exe: &str, working_dir: &str, user_id: &str) -> String {
+/// - `minimized` adds [`MINIMIZED_ARG`].
+pub fn task_xml(exe: &str, working_dir: &str, user_id: &str, minimized: bool) -> String {
     let command = xml_escape(&format!("\"{exe}\""));
     let user_id = xml_escape(user_id);
+    let arguments = if minimized {
+        format!("\n      <Arguments>{MINIMIZED_ARG}</Arguments>")
+    } else {
+        String::new()
+    };
     let working_dir = if working_dir.is_empty() {
         String::new()
     } else {
@@ -220,7 +234,7 @@ pub fn task_xml(exe: &str, working_dir: &str, user_id: &str) -> String {
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>{command}</Command>{working_dir}
+      <Command>{command}</Command>{arguments}{working_dir}
     </Exec>
   </Actions>
 </Task>
@@ -267,6 +281,8 @@ pub struct RegisteredTask {
     /// Whether it will run at sign-in: the task is enabled, and so is one of
     /// its logon triggers.
     pub enabled: bool,
+    /// Whether it passes [`MINIMIZED_ARG`].
+    pub minimized: bool,
 }
 
 /// Read a task definition (see [`decode_task_xml`] for the bytes).
@@ -284,15 +300,23 @@ pub fn parse_task_xml(xml: &str) -> RegisteredTask {
                 .unwrap_or(true)
         })
     });
-    let command = element(xml, "Actions")
-        .and_then(|actions| element(actions, "Exec"))
+    let exec = element(xml, "Actions").and_then(|actions| element(actions, "Exec"));
+    let command = exec
         .and_then(|exec| element(exec, "Command"))
         .map(|command| xml_unescape(command.trim()))
         .filter(|command| !command.is_empty());
+    let minimized = exec
+        .and_then(|exec| element(exec, "Arguments"))
+        .is_some_and(|arguments| {
+            xml_unescape(arguments)
+                .split_whitespace()
+                .any(|argument| argument == MINIMIZED_ARG)
+        });
 
     RegisteredTask {
         command,
         enabled: task_enabled && logon_enabled,
+        minimized,
     }
 }
 
@@ -362,6 +386,8 @@ pub fn startup_warning(
 struct Snapshot {
     /// The task exists and runs at sign-in.
     enabled: bool,
+    /// It starts Irminsul minimized.
+    minimized: bool,
     warning: Option<StartupWarning>,
     /// The exe the task starts, unquoted, when there is a task.
     registered: Option<String>,
@@ -377,12 +403,13 @@ enum Job {
     Migrate,
     /// Read the state.
     Refresh,
-    /// Register the task for the running exe.
-    Enable,
+    /// Register the task for the running exe, minimized or not.
+    Enable { minimized: bool },
     /// Remove the task.
     Disable,
-    /// Register the task for the running exe instead of another copy.
-    Repoint,
+    /// Register the task for the running exe instead of another copy,
+    /// keeping whether it starts minimized.
+    Repoint { minimized: bool },
 }
 
 impl Job {
@@ -408,7 +435,7 @@ fn run(job: Job) -> JobResult {
 fn run(job: Job) -> JobResult {
     let outcome = match job {
         Job::Migrate | Job::Refresh => Ok(None),
-        Job::Enable | Job::Disable | Job::Repoint => {
+        Job::Enable { .. } | Job::Disable | Job::Repoint { .. } => {
             Err("Start on startup is only supported on Windows".to_string())
         }
     };
@@ -427,6 +454,7 @@ pub struct Startup {
     checked_at: Option<Instant>,
     was_focused: bool,
     modal_open: bool,
+    settings_open: bool,
 }
 
 impl Startup {
@@ -439,6 +467,7 @@ impl Startup {
             checked_at: None,
             was_focused: false,
             modal_open: false,
+            settings_open: false,
         };
         if cfg!(windows) {
             startup.start(Job::Migrate);
@@ -511,22 +540,22 @@ impl Startup {
                 tracing::error!("could not move Start on startup to Task Scheduler: {e}");
                 toasts.error("Could not move Start on startup to Task Scheduler");
             }
-            (Job::Enable | Job::Disable, Err(e)) => {
+            (Job::Enable { .. } | Job::Disable, Err(e)) => {
                 tracing::error!("Unable to update startup behavior: {e}");
                 toasts.error("Unable to update startup behavior");
             }
-            (Job::Repoint, Ok(_)) => {
+            (Job::Repoint { .. }, Ok(_)) => {
                 toasts.success("Startup now opens this copy");
             }
-            (Job::Repoint, Err(e)) => {
+            (Job::Repoint { .. }, Err(e)) => {
                 tracing::error!("could not point startup at this copy: {e}");
                 toasts.error("Could not point startup at this copy");
             }
             (Job::Refresh, Err(e)) => tracing::warn!("could not read the startup task: {e}"),
-            (Job::Migrate | Job::Refresh | Job::Enable | Job::Disable, Ok(_)) => {}
+            (Job::Migrate | Job::Refresh | Job::Enable { .. } | Job::Disable, Ok(_)) => {}
         }
 
-        if job == Job::Enable && !snapshot.enabled {
+        if matches!(job, Job::Enable { .. }) && !snapshot.enabled {
             tracing::warn!("the {TASK_NAME} task was registered but does not read back as enabled");
         }
         // Once per change, not per refresh.
@@ -550,6 +579,9 @@ impl Startup {
         if snapshot.warning.is_none() {
             self.modal_open = false;
         }
+        if !snapshot.enabled {
+            self.settings_open = false;
+        }
         self.snapshot = Some(snapshot);
         self.checked_at = Some(Instant::now());
     }
@@ -567,14 +599,37 @@ impl Startup {
         }
     }
 
-    /// The "Start Irminsul on startup" row: the checkbox, and the warning
-    /// icon when the task starts another file.
+    /// Whether the task starts Irminsul minimized, as last read.
+    fn minimized(&self) -> bool {
+        self.snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.minimized)
+    }
+
+    /// The "Start Irminsul on startup" row: the checkbox, the cog for its
+    /// options, and the warning icon when the task starts another file.
     pub fn checkbox_ui(&mut self, ui: &mut Ui, saved_on: &mut bool) {
         ui.horizontal(|ui| {
             let checkbox = egui::Checkbox::new(saved_on, CHECKBOX_LABEL);
             if ui.add_enabled(!self.changing(), checkbox).changed() {
                 // Shown at once; the job's read-back corrects it if needed.
-                self.start(if *saved_on { Job::Enable } else { Job::Disable });
+                self.start(if *saved_on {
+                    Job::Enable {
+                        minimized: self.minimized(),
+                    }
+                } else {
+                    Job::Disable
+                });
+            }
+
+            if ui
+                .add_enabled(
+                    *saved_on,
+                    Button::new(egui_material_icons::icons::ICON_SETTINGS),
+                )
+                .clicked()
+            {
+                self.settings_open = true;
             }
 
             if let Some(warning) = self.warning(*saved_on) {
@@ -591,8 +646,47 @@ impl Startup {
         });
     }
 
-    /// The modal behind the warning icon, when it is open.
+    /// The modals behind the cog and the warning icon, when they are open.
     pub fn modal_ui(&mut self, ctx: &Context, saved_on: bool) {
+        self.settings_ui(ctx, saved_on);
+        self.warning_ui(ctx, saved_on);
+    }
+
+    /// The startup options behind the cog.
+    fn settings_ui(&mut self, ctx: &Context, saved_on: bool) {
+        if !self.settings_open {
+            return;
+        }
+        if !saved_on {
+            self.settings_open = false;
+            return;
+        }
+
+        let changing = self.changing();
+        let mut minimized = self.minimized();
+        let modal = Modal::new(Id::new("Startup Settings")).show(ctx, |ui| {
+            ui.heading("Startup");
+            ui.separator();
+            let checkbox = egui::Checkbox::new(&mut minimized, "Start minimized");
+            if ui
+                .add_enabled(!changing, checkbox)
+                .on_hover_text("To the tray or the taskbar, like the minimize button")
+                .changed()
+            {
+                self.start(Job::Enable { minimized });
+            }
+            ui.separator();
+            if ui.button("Close").clicked() {
+                self.settings_open = false;
+            }
+        });
+        if modal.should_close() {
+            self.settings_open = false;
+        }
+    }
+
+    /// The modal behind the warning icon.
+    fn warning_ui(&mut self, ctx: &Context, saved_on: bool) {
         if !self.modal_open {
             return;
         }
@@ -654,7 +748,9 @@ impl Startup {
 
         match choice {
             Some(Choice::Repoint) => {
-                self.start(Job::Repoint);
+                self.start(Job::Repoint {
+                    minimized: snapshot.minimized,
+                });
                 self.modal_open = false;
             }
             Some(Choice::Reveal(path)) => reveal_in_explorer(&path),
@@ -738,7 +834,9 @@ mod windows_impl {
         let outcome = match job {
             Job::Refresh => Ok(None),
             Job::Migrate => migrate(),
-            Job::Enable | Job::Repoint => create_task().map(|()| None),
+            Job::Enable { minimized } | Job::Repoint { minimized } => {
+                create_task(minimized).map(|()| None)
+            }
             Job::Disable => delete_task().map(|()| None),
         }
         .map_err(|e| format!("{e:#}"));
@@ -756,6 +854,7 @@ mod windows_impl {
             None
         });
         let enabled = task.as_ref().is_some_and(|task| task.enabled);
+        let minimized = task.as_ref().is_some_and(|task| task.minimized);
         let registered = task
             .and_then(|task| task.command)
             .map(|command| clean_exe_path(&command));
@@ -787,6 +886,7 @@ mod windows_impl {
 
         Snapshot {
             enabled,
+            minimized,
             warning,
             registered,
             registered_modified,
@@ -862,14 +962,14 @@ mod windows_impl {
     }
 
     /// Register the task for the running exe, replacing any other.
-    fn create_task() -> Result<()> {
+    fn create_task(minimized: bool) -> Result<()> {
         let exe = std::env::current_exe().context("could not find the running executable")?;
         let exe = clean_exe_path(&exe.display().to_string());
         let working_dir = Path::new(&exe)
             .parent()
             .map(|dir| dir.display().to_string())
             .unwrap_or_default();
-        let xml = task_xml(&exe, &working_dir, &current_user()?);
+        let xml = task_xml(&exe, &working_dir, &current_user()?, minimized);
 
         // A directory rather than a `NamedTempFile`, so schtasks can open the
         // file however it likes; both go when `dir` is dropped.
@@ -983,7 +1083,7 @@ mod windows_impl {
             "found Start on startup as a Run entry ({old}), which Windows does not run for an \
              exe that needs elevation; replacing it with a scheduled task"
         );
-        create_task().context("the Run entry is kept so the next launch tries again")?;
+        create_task(false).context("the Run entry is kept so the next launch tries again")?;
         delete_run_values();
         Ok(Some(old))
     }
@@ -1048,7 +1148,7 @@ mod tests {
 
     #[test]
     fn the_task_starts_this_exe_elevated_at_sign_in_and_never_times_out() {
-        let xml = task_xml(EXE, DIR, USER);
+        let xml = task_xml(EXE, DIR, USER, false);
 
         for expected in [
             "<RunLevel>HighestAvailable</RunLevel>",
@@ -1076,7 +1176,7 @@ mod tests {
     #[test]
     fn paths_and_names_are_escaped_in_the_task() {
         let exe = r"C:\Tom & Jerry\<odd>\irminsul.exe";
-        let xml = task_xml(exe, r"C:\Tom & Jerry\<odd>", r"R&D\a<b");
+        let xml = task_xml(exe, r"C:\Tom & Jerry\<odd>", r"R&D\a<b", false);
 
         assert!(
             xml.contains(r#"<Command>"C:\Tom &amp; Jerry\&lt;odd&gt;\irminsul.exe"</Command>"#),
@@ -1099,8 +1199,9 @@ mod tests {
 
     #[test]
     fn the_task_reads_back_as_enabled_for_this_exe() {
-        let task = parse_task_xml(&task_xml(EXE, DIR, USER));
+        let task = parse_task_xml(&task_xml(EXE, DIR, USER, false));
         assert!(task.enabled);
+        assert!(!task.minimized);
         assert_eq!(
             task.command.as_deref(),
             Some(r#""D:\Apps\Irminsul\irminsul.exe""#)
@@ -1108,9 +1209,27 @@ mod tests {
     }
 
     #[test]
+    fn start_minimized_is_the_tasks_argument_and_reads_back() {
+        let xml = task_xml(EXE, DIR, USER, true);
+        assert!(xml.contains("<Arguments>--minimized</Arguments>"), "{xml}");
+        let task = parse_task_xml(&xml);
+        assert!(task.enabled && task.minimized);
+        assert_eq!(
+            task.command.as_deref(),
+            Some(r#""D:\Apps\Irminsul\irminsul.exe""#)
+        );
+
+        assert!(!task_xml(EXE, DIR, USER, false).contains("<Arguments>"));
+        // Someone else's arguments are not ours.
+        assert!(!parse_task_xml(FOREIGN_TASK).minimized);
+        let edited = xml.replace("--minimized", " -b pcap  --minimized ");
+        assert!(parse_task_xml(&edited).minimized);
+    }
+
+    #[test]
     fn the_task_file_is_utf16_with_a_bom_and_non_ascii_paths_survive() {
         let exe = r"C:\Users\ธวัช\下载\irminsul.exe";
-        let xml = task_xml(exe, r"C:\Users\ธวัช\下载", USER);
+        let xml = task_xml(exe, r"C:\Users\ธวัช\下载", USER, false);
         let bytes = utf16le_with_bom(&xml);
 
         assert_eq!(&bytes[..4], &[0xFF, 0xFE, b'<', 0]);
@@ -1155,7 +1274,7 @@ mod tests {
 
     #[test]
     fn a_disabled_task_or_logon_trigger_does_not_run_at_sign_in() {
-        let xml = task_xml(EXE, DIR, USER);
+        let xml = task_xml(EXE, DIR, USER, false);
 
         // Task Scheduler's "Disable" sets the task-level flag, not the
         // trigger's, and the two must not be confused.

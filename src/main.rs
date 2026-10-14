@@ -172,6 +172,16 @@ struct Args {
     read_from_file: bool,
 
     #[arg(
+        long,
+        default_value_t = false,
+        help = "Start with the window minimized (to the tray or the taskbar, like its minimize button)",
+        long_help = "Start with the window minimized: to the tray or the taskbar, as the window's \
+                     minimize button would. The \"Start Irminsul on startup\" task passes it when \
+                     \"Start minimized\" is ticked."
+    )]
+    minimized: bool,
+
+    #[arg(
         long = "replay-export",
         value_name = "OUT_JSON",
         requires = "savefile_path",
@@ -345,6 +355,7 @@ fn main() -> eframe::Result {
                 capture_source,
                 app_restart_requested,
                 previous_run_notice,
+                args.minimized,
             )))
         }),
     );
@@ -372,8 +383,12 @@ fn main() -> eframe::Result {
         // across -- without it a user who started
         // `irminsul-windows-pcap.exe -b pcap` came back on the pktmon default
         // after an update, and `--no-admin` and `-r <file>` replay mode were
-        // dropped the same way.
-        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        // dropped the same way. Except `--minimized`: the window the user just
+        // updated from comes back where they can see it.
+        let args: Vec<std::ffi::OsString> = std::env::args_os()
+            .skip(1)
+            .filter(|arg| arg.as_os_str() != autostart::MINIMIZED_ARG)
+            .collect();
         match std::env::current_exe() {
             Ok(exe) => match std::process::Command::new(&exe).args(&args).spawn() {
                 Ok(_) => tracing::info!("relaunched {exe:?} with {args:?} after update"),
@@ -642,6 +657,12 @@ mod tests {
         assert_eq!(args.replay_request(), expected);
         let args = parse(&["latest.pcapng", "--replay-export=out.json"]).unwrap();
         assert_eq!(args.replay_request(), expected);
+    }
+
+    #[test]
+    fn the_startup_tasks_minimized_argument_parses() {
+        assert!(parse(&[autostart::MINIMIZED_ARG]).unwrap().minimized);
+        assert!(!parse(&[]).unwrap().minimized);
     }
 
     #[test]
