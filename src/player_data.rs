@@ -449,6 +449,12 @@ pub struct ExportSettings {
     pub min_weapon_refinement: u32,
     pub min_weapon_ascension: u32,
     pub min_weapon_rarity: u32,
+
+    /// Give every artifact and weapon its game guid (`gi_guid`): live sync
+    /// names items by it. Tracker uploads only; a Genshin Optimizer file has
+    /// no use for it.
+    #[serde(default)]
+    pub item_guids: bool,
 }
 
 /// What a fresh install exports: every category, with the default minimums.
@@ -469,6 +475,7 @@ impl Default for ExportSettings {
             min_weapon_refinement: 0,
             min_weapon_ascension: 0,
             min_weapon_rarity: 3,
+            item_guids: false,
         }
     }
 }
@@ -514,6 +521,7 @@ impl ExportSettings {
             min_weapon_refinement: 0,
             min_weapon_ascension: 0,
             min_weapon_rarity: 0,
+            item_guids: true,
         }
     }
 }
@@ -1034,6 +1042,38 @@ impl PlayerData {
         self.checked_gi_player().0
     }
 
+    /// Items held, of every kind (what a full send is measured against).
+    pub fn item_count(&self) -> usize {
+        self.items.len()
+    }
+
+    /// The tracker export at `now_ms`, what it left out, and its keyed form,
+    /// for live sync (`live.rs`): every item with its guid.
+    pub fn live_export(&self, now_ms: u64) -> (good::Good, ExportReport, crate::delta::Keyed) {
+        let (good, report) = self.export_at(&ExportSettings::for_tracker(), now_ms);
+        let keyed = self.keyed(&good);
+        (good, report, keyed)
+    }
+
+    /// `good` keyed for live sync, each weapon's rarity (a delete's hint,
+    /// which GOOD's weapon has no field for) read from the items held.
+    pub fn keyed(&self, good: &good::Good) -> crate::delta::Keyed {
+        let rarities: HashMap<u64, u32> = self
+            .items
+            .values()
+            .filter(|item| item.has_equip() && item.equip().has_weapon())
+            .filter_map(|item| {
+                let weapon = self.game_data.get_weapon(item.item_id).ok()?;
+                Some((item.guid, weapon.rarity))
+            })
+            .collect();
+        crate::delta::Keyed::of(good, |guid| {
+            guid.parse::<u64>()
+                .ok()
+                .and_then(|guid| rarities.get(&guid).copied())
+        })
+    }
+
     /// Build the GOOD export and report what had to be left out of it.
     ///
     /// Callers with a UI should surface [`ExportReport::summary`]: a snapshot
@@ -1153,6 +1193,8 @@ impl PlayerData {
             gi_characters: None,
             // Omitted when the book was not captured, like the keys above.
             gi_anecdotes: self.export_anecdotes(now_ms / 1000),
+            // Set by the tracker upload (`live.rs`), never here.
+            gi_capture: None,
         };
 
         if settings.include_characters {
@@ -1574,6 +1616,7 @@ impl PlayerData {
                     astral_mark,
                     elixer_crafted,
                     unactivated_substats,
+                    gi_guid: (settings.item_guids && item.guid != 0).then(|| item.guid.to_string()),
                 })
             })
             .collect()
@@ -1646,6 +1689,7 @@ impl PlayerData {
                     refinement,
                     location,
                     lock: equip.is_locked,
+                    gi_guid: (settings.item_guids && item.guid != 0).then(|| item.guid.to_string()),
                 })
             })
             .collect()
@@ -2630,7 +2674,12 @@ mod tests {
 
     fn golden_json(data: &PlayerData) -> String {
         let mut report = ExportReport::default();
-        let good = data.build_good(&settings(), &mut report, GOLDEN_TIMESTAMP_MS);
+        // Without the guids live sync adds (see the test after these).
+        let settings = ExportSettings {
+            item_guids: false,
+            ..settings()
+        };
+        let good = data.build_good(&settings, &mut report, GOLDEN_TIMESTAMP_MS);
         assert!(report.is_empty(), "{}", report.summary());
         serde_json::to_string(&good).unwrap()
     }
@@ -2671,6 +2720,30 @@ mod tests {
         let with = golden_json(&golden_player_data(true));
         let good_part = GOLDEN_GOOD.strip_suffix('}').unwrap();
         assert_eq!(with, format!("{good_part}{GOLDEN_EXTRAS}"));
+    }
+
+    #[test]
+    fn a_tracker_export_names_each_item_by_its_guid_and_is_otherwise_the_same() {
+        let data = golden_player_data(false);
+        let mut report = ExportReport::default();
+        let mut good = data.build_good(&settings(), &mut report, GOLDEN_TIMESTAMP_MS);
+        for guid in good
+            .artifacts
+            .iter()
+            .map(|a| &a.gi_guid)
+            .chain(good.weapons.iter().map(|w| &w.gi_guid))
+        {
+            let guid = guid.as_deref().expect("every item has its guid");
+            assert!(guid.parse::<u64>().is_ok_and(|guid| guid != 0), "{guid}");
+        }
+        // A Genshin Optimizer export carries none.
+        let optimizer = data.build_good(&ExportSettings::default(), &mut report, 0);
+        assert!(optimizer.weapons.iter().all(|w| w.gi_guid.is_none()));
+        assert!(optimizer.artifacts.iter().all(|a| a.gi_guid.is_none()));
+        // Without them, byte for byte the golden export.
+        good.artifacts.iter_mut().for_each(|a| a.gi_guid = None);
+        good.weapons.iter_mut().for_each(|w| w.gi_guid = None);
+        assert_eq!(serde_json::to_string(&good).unwrap(), GOLDEN_GOOD);
     }
 
     #[test]

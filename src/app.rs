@@ -138,6 +138,12 @@ pub struct SavedAppState {
     pub tracker_api_url: String,
     #[serde(default)]
     pub auto_export_to_tracker: bool,
+    /// Live sync (`live.rs`): between the game's full sends, send the
+    /// tracker what changed instead of the whole account. On by default; the
+    /// tracker still decides per account whether it takes batches. Off is
+    /// the behaviour from before: every change uploads the whole account.
+    #[serde(default = "default_live_sync")]
+    pub live_sync: bool,
     /// Whether the stored key was accepted by the tracker *in this session*.
     ///
     /// `serde(skip)`, because it records a round trip that actually happened
@@ -156,6 +162,10 @@ pub struct SavedAppState {
     pub tracker_sign_in: TrackerSignIn,
     #[serde(default)]
     pub minimize_to_tray: Option<bool>,
+}
+
+fn default_live_sync() -> bool {
+    true
 }
 
 /// Where the tracker lives when the build bakes in no `TRACKER_API_URL`: the
@@ -238,6 +248,7 @@ impl Default for SavedAppState {
             tracker_import_key: String::new(),
             tracker_api_url: default_tracker_url(),
             auto_export_to_tracker: false,
+            live_sync: default_live_sync(),
             tracker_verified: false,
             tracker_sign_in: TrackerSignIn::Unknown,
             minimize_to_tray: None,
@@ -2757,6 +2768,13 @@ impl IrminsulApp {
             ui.checkbox(
                 &mut self.saved_state.auto_export_to_tracker,
                 "Auto export to tracker",
+            );
+            ui.add_enabled(
+                self.saved_state.auto_export_to_tracker,
+                egui::Checkbox::new(&mut self.saved_state.live_sync, "Live sync"),
+            )
+            .on_hover_text(
+                "Between snapshots, send the tracker what changed as you play, so it stays                  current without logging out. Off: every change uploads the whole account.",
             );
             // Checked but inert is otherwise completely silent: the
             // automation upload simply never fires.

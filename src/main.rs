@@ -21,13 +21,16 @@ mod app;
 mod autostart;
 mod capture;
 mod crash;
+mod delta;
 mod game_watch;
 mod good;
+mod live;
 mod monitor;
 mod pcapng;
 mod player_data;
 mod recording;
 mod replay;
+mod replay_live;
 mod signin;
 mod update;
 mod wish_history;
@@ -209,6 +212,39 @@ struct Args {
     replay_export: Option<PathBuf>,
 
     #[arg(
+        long = "replay-journal",
+        value_name = "OUT_NDJSON",
+        requires = "savefile_path",
+        conflicts_with_all = ["read_from_file", "capture_backend", "replay_export"],
+        help = "Replay the recording SAVEFILE_PATH through live sync and write what it would send to OUT_NDJSON",
+        long_help = "Decode the recording SAVEFILE_PATH like --replay-export, and run live sync's \
+                     sender over it with the recording's own clock and a stand-in tracker that \
+                     stores everything. OUT_NDJSON gets one JSON object per line: each snapshot \
+                     as it would be uploaded ({\"type\":\"snapshot\"}), each batch of changes \
+                     ({\"type\":\"batch\"}), and the whole state just before each snapshot and \
+                     at the end ({\"type\":\"state\"}): the tracker's replay check applies the \
+                     batches to the snapshots and compares. Same guarantees as --replay-export: \
+                     nothing is uploaded, no settings or data directory are touched, no lock is \
+                     taken. The log goes to OUT_NDJSON.log."
+    )]
+    replay_journal: Option<PathBuf>,
+
+    #[arg(
+        long = "replay-live",
+        value_name = "OUT_NDJSON",
+        requires = "savefile_path",
+        conflicts_with_all = ["read_from_file", "capture_backend", "replay_export", "replay_journal"],
+        help = "Debug builds: --replay-journal, but sent to a local tracker (IRMINSUL_REPLAY_TRACKER, IRMINSUL_REPLAY_IMPORT_KEY)",
+        long_help = "Debug builds only, for testing a tracker: like --replay-journal, but the \
+                     snapshots and batches really go to the tracker API at \
+                     IRMINSUL_REPLAY_TRACKER (a localhost or 127.0.0.1 address only, e.g. \
+                     http://127.0.0.1:5173/api) with the import key in \
+                     IRMINSUL_REPLAY_IMPORT_KEY, as fast as the tracker answers, stamped with \
+                     the recording's times. Never reads or writes the app's settings or data."
+    )]
+    replay_live: Option<PathBuf>,
+
+    #[arg(
         value_name = "SAVEFILE_PATH",
         help = "Recording to replay (--read-from-file, --replay-export), or a filename template to record to",
         long_help = "Recording to replay with --read-from-file or --replay-export, or a filename \
@@ -282,6 +318,17 @@ impl Args {
         // clap requires SAVEFILE_PATH with --replay-export.
         Some((self.savefile_path.as_deref()?, out))
     }
+    /// `(recording, journal)` when this is a `--replay-live` run.
+    fn live_request(&self) -> Option<(&Path, &Path)> {
+        let out = self.replay_live.as_deref()?;
+        Some((self.savefile_path.as_deref()?, out))
+    }
+
+    /// `(recording, journal)` when this is a `--replay-journal` run.
+    fn journal_request(&self) -> Option<(&Path, &Path)> {
+        let out = self.replay_journal.as_deref()?;
+        Some((self.savefile_path.as_deref()?, out))
+    }
 }
 
 fn main() -> eframe::Result {
@@ -292,6 +339,16 @@ fn main() -> eframe::Result {
     // beside a live Irminsul), the log rotation in the data directory (which
     // in a debug build would move the very recording being replayed), and the
     // elevation check. See `replay.rs` for what else it never does.
+    if let Some((recording, out)) = args.live_request() {
+        let code = replay_live::run(recording, out);
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        std::process::exit(code);
+    }
+    if let Some((recording, out)) = args.journal_request() {
+        let code = replay::run_journal(recording, out);
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        std::process::exit(code);
+    }
     if let Some((recording, out)) = args.replay_request() {
         let code = replay::run(recording, out);
         let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -663,6 +720,27 @@ mod tests {
     fn the_startup_tasks_minimized_argument_parses() {
         assert!(parse(&[autostart::MINIMIZED_ARG]).unwrap().minimized);
         assert!(!parse(&[]).unwrap().minimized);
+    }
+
+    #[test]
+    fn replay_journal_takes_its_output_and_the_recording() {
+        let args = parse(&["--replay-journal", "out.ndjson", "latest.pcapng"]).unwrap();
+        assert_eq!(
+            args.journal_request(),
+            Some((Path::new("latest.pcapng"), Path::new("out.ndjson")))
+        );
+        assert_eq!(args.replay_request(), None);
+        assert!(parse(&["--replay-journal", "out.ndjson"]).is_err());
+        assert!(
+            parse(&[
+                "--replay-journal",
+                "o.ndjson",
+                "--replay-export",
+                "o.json",
+                "r.pcapng"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

@@ -27,6 +27,13 @@ pub struct Artifact {
     pub astral_mark: bool,
     pub elixer_crafted: bool,
     pub unactivated_substats: Vec<Substat>,
+
+    /// The game's id of this piece, as a decimal string (a u64 does not fit a
+    /// JavaScript number): what live sync names it by (`delta.rs`). Tracker
+    /// uploads only (`ExportSettings::item_guids`); omitted elsewhere. Not
+    /// camelCase: irminsul's own keys keep their `gi_` names.
+    #[serde(rename = "gi_guid", skip_serializing_if = "Option::is_none", default)]
+    pub gi_guid: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -37,6 +44,9 @@ pub struct Weapon {
     pub refinement: u32,
     pub location: String,
     pub lock: bool,
+    /// The game's id of this weapon; see [`Artifact::gi_guid`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub gi_guid: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -94,6 +104,36 @@ pub struct Good {
     /// it unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gi_anecdotes: Option<GiAnecdotes>,
+    /// Why this snapshot was taken and which play session it belongs to
+    /// (live sync, plan section 5.1). Tracker uploads only.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub gi_capture: Option<GiCapture>,
+}
+
+/// `gi_capture`: why a tracker snapshot was taken, and which game login it
+/// belongs to. A wire contract with the tracker (`live/capture.ts`); append
+/// fields and reasons only.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GiCapture {
+    /// Always 1.
+    pub v: u32,
+    /// `login`, `world`, `manual`, `collapse`, `logout`, `resync` or `change`.
+    pub reason: String,
+    /// irminsul's id of this game login: 16+ characters of `[A-Za-z0-9_-]`.
+    pub session: String,
+    /// 1 = the first world of the login, 2+ = each later full send of the
+    /// account in the same connection, by order (irminsul cannot tell the
+    /// player's own world from a co-op host's).
+    pub world: u32,
+    /// The journal this snapshot ends.
+    pub journal: GiCaptureJournal,
+}
+
+/// `gi_capture.journal`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GiCaptureJournal {
+    /// The last batch sent on the journal this snapshot ends (0 at login).
+    pub seq: u64,
 }
 
 /// How `gi_player.uid` was read off the item guids (see
@@ -325,6 +365,7 @@ mod tests {
             astral_mark: false,
             elixer_crafted: false,
             unactivated_substats: unactivated,
+            gi_guid: Some("3488998120056947072".to_string()),
         }
     }
 
@@ -391,6 +432,7 @@ mod tests {
                 refinement: 1,
                 location: "HuTao".to_string(),
                 lock: true,
+                gi_guid: Some("3488998120056947188".to_string()),
             }],
             materials: HashMap::from([("ChilledMeat".to_string(), 12)]),
             gi_achievements: Some(vec![80001]),
@@ -442,6 +484,13 @@ mod tests {
                     last_wish_time: 1_791_000_000,
                 }),
             }),
+            gi_capture: Some(GiCapture {
+                v: 1,
+                reason: "login".to_string(),
+                session: "01J9ZK5Q8W3E7R2T".to_string(),
+                world: 1,
+                journal: GiCaptureJournal { seq: 0 },
+            }),
         };
 
         let json = serde_json::to_value(&good).expect("Good must serialize");
@@ -469,6 +518,7 @@ mod tests {
                 "gi_achievement_times",
                 "gi_achievements",
                 "gi_anecdotes",
+                "gi_capture",
                 "gi_characters",
                 "gi_player",
                 "materials",
@@ -494,6 +544,7 @@ mod tests {
             keys(&json["weapons"][0]),
             [
                 "ascension",
+                "gi_guid",
                 "key",
                 "level",
                 "location",
@@ -511,6 +562,7 @@ mod tests {
             [
                 "astralMark",
                 "elixerCrafted",
+                "gi_guid",
                 "level",
                 "location",
                 "lock",
@@ -594,6 +646,22 @@ mod tests {
             json["gi_anecdotes"]["wish"],
             serde_json::json!({ "npcId": 9801, "lastWishTime": 1_791_000_000 })
         );
+
+        // Live sync (the tracker's `live/capture.ts` and `live/delta.ts`):
+        // item guids are decimal strings, a u64 does not fit a JS number.
+        assert_eq!(
+            keys(&json["gi_capture"]),
+            ["journal", "reason", "session", "v", "world"]
+        );
+        assert_eq!(keys(&json["gi_capture"]["journal"]), ["seq"]);
+        assert_eq!(
+            json["artifacts"][0]["gi_guid"],
+            serde_json::json!("3488998120056947072")
+        );
+        assert_eq!(
+            json["weapons"][0]["gi_guid"],
+            serde_json::json!("3488998120056947188")
+        );
     }
 
     #[test]
@@ -617,6 +685,7 @@ mod tests {
             gi_achievement_times: None,
             gi_characters: None,
             gi_anecdotes: None,
+            gi_capture: None,
         };
 
         let json = serde_json::to_value(&good).expect("Good must serialize");
@@ -627,6 +696,7 @@ mod tests {
         assert!(!object.contains_key("gi_achievement_times"));
         assert!(!object.contains_key("gi_characters"));
         assert!(!object.contains_key("gi_anecdotes"));
+        assert!(!object.contains_key("gi_capture"));
     }
 
     #[test]

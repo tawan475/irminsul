@@ -1,0 +1,276 @@
+{
+  "comment": "Contract fixture for live sync (docs/plans/live-sync.md, section 5.2), the same file in irminsul (tests/fixtures/good-x-delta.json) and the tracker (packages/shared/test/fixtures/good-x-delta.json): applying delta.changes to base gives result, and diffing base against result gives the same changes (in any order). Synthetic data, placeholder UID.",
+  "base": {
+    "format": "GOOD",
+    "version": 2,
+    "source": "Irminsul",
+    "characters": [
+      {
+        "key": "Furina",
+        "level": 90,
+        "constellation": 0,
+        "ascension": 6,
+        "talent": { "auto": 1, "skill": 9, "burst": 8 }
+      },
+      {
+        "key": "Escoffier",
+        "level": 80,
+        "constellation": 0,
+        "ascension": 5,
+        "talent": { "auto": 1, "skill": 6, "burst": 6 }
+      }
+    ],
+    "artifacts": [
+      {
+        "setKey": "GoldenTroupe",
+        "slotKey": "plume",
+        "level": 16,
+        "rarity": 5,
+        "mainStatKey": "atk",
+        "location": "",
+        "lock": false,
+        "substats": [
+          { "key": "critRate_", "value": 3.9, "initialValue": 3.9 },
+          { "key": "critDMG_", "value": 14.0, "initialValue": 7.0 },
+          { "key": "hp_", "value": 5.8, "initialValue": 5.8 },
+          { "key": "enerRech_", "value": 6.5, "initialValue": 6.5 }
+        ],
+        "totalRolls": 8,
+        "astralMark": false,
+        "elixerCrafted": false,
+        "unactivatedSubstats": [],
+        "gi_guid": "3488998120056947072"
+      },
+      {
+        "setKey": "NoblesseOblige",
+        "slotKey": "flower",
+        "level": 0,
+        "rarity": 4,
+        "mainStatKey": "hp",
+        "location": "",
+        "lock": false,
+        "substats": [{ "key": "def", "value": 16.0, "initialValue": 16.0 }],
+        "totalRolls": 3,
+        "astralMark": false,
+        "elixerCrafted": false,
+        "unactivatedSubstats": [],
+        "gi_guid": "3488998120056947078"
+      }
+    ],
+    "weapons": [
+      {
+        "key": "SplendorOfTranquilWaters",
+        "level": 90,
+        "ascension": 6,
+        "refinement": 1,
+        "location": "Furina",
+        "lock": true,
+        "gi_guid": "3488998120056947188"
+      },
+      {
+        "key": "DullBlade",
+        "level": 1,
+        "ascension": 0,
+        "refinement": 1,
+        "location": "",
+        "lock": false,
+        "gi_guid": "3488998120056947189"
+      }
+    ],
+    "materials": { "Mora": 48201930, "HerosWit": 300, "Primogem": 1600, "MysticEnhancementOre": 4 },
+    "gi_achievements": [81000, 81001],
+    "timestamp": 1792000000000,
+    "gi_player": { "uid": 812345678, "ar": 60, "wl": 9, "resin": 120 },
+    "gi_achievement_times": { "81000": 1790000000, "81001": 1790000100 },
+    "gi_characters": { "Furina": { "friendship": 9, "obtainedAt": 1700000000 } },
+    "gi_anecdotes": {
+      "anecdotes": {
+        "100001": { "state": 3, "finishCount": 1 },
+        "100002": { "state": 2, "finishCount": 0 }
+      },
+      "unlockedAreas": [1, 2],
+      "reward": { "index": 0, "progress": 4, "target": 10 }
+    }
+  },
+  "delta": {
+    "format": "GOOD-X-delta",
+    "v": 1,
+    "uid": 812345678,
+    "session": "01J9ZK5Q8W3E7R2T",
+    "seq": 1,
+    "base": "1a2b3c4d5e",
+    "at": 1792000060000,
+    "changes": [
+      ["set", ["materials", "Mora"], 48211930],
+      ["set", ["materials", "HerosWit"], 312],
+      ["del", ["materials", "MysticEnhancementOre"]],
+      ["set", ["materials", "WanderersAdvice"], 7],
+      ["set", ["characters", "Furina", "talent", "burst"], 9],
+      ["set", ["characters", "Escoffier", "level"], 90],
+      ["set", ["characters", "Escoffier", "ascension"], 6],
+      [
+        "add",
+        ["characters", "Nahida"],
+        {
+          "key": "Nahida",
+          "level": 1,
+          "constellation": 0,
+          "ascension": 0,
+          "talent": { "auto": 1, "skill": 1, "burst": 1 }
+        }
+      ],
+      ["set", ["artifacts", "3488998120056947072", "level"], 20],
+      [
+        "set",
+        ["artifacts", "3488998120056947072", "substats"],
+        [
+          { "key": "critRate_", "value": 3.9, "initialValue": 3.9 },
+          { "key": "critDMG_", "value": 21.0, "initialValue": 7.0 },
+          { "key": "hp_", "value": 5.8, "initialValue": 5.8 },
+          { "key": "enerRech_", "value": 6.5, "initialValue": 6.5 }
+        ]
+      ],
+      ["set", ["artifacts", "3488998120056947072", "totalRolls"], 9],
+      ["set", ["artifacts", "3488998120056947072", "location"], "Furina"],
+      ["set", ["artifacts", "3488998120056947072", "lock"], true],
+      ["del", ["artifacts", "3488998120056947078"], { "rarity": 4 }],
+      [
+        "add",
+        ["artifacts", "3488998120056947079"],
+        {
+          "setKey": "GoldenTroupe",
+          "slotKey": "flower",
+          "level": 0,
+          "rarity": 5,
+          "mainStatKey": "hp",
+          "location": "",
+          "lock": false,
+          "substats": [
+            { "key": "critRate_", "value": 3.1, "initialValue": 3.1 },
+            { "key": "atk_", "value": 5.8, "initialValue": 5.8 },
+            { "key": "def", "value": 19.0, "initialValue": 19.0 }
+          ],
+          "totalRolls": 3,
+          "astralMark": false,
+          "elixerCrafted": false,
+          "unactivatedSubstats": [{ "key": "critDMG_", "value": 7.8, "initialValue": 7.8 }]
+        }
+      ],
+      ["del", ["weapons", "3488998120056947189"], { "rarity": 1 }],
+      ["set", ["weapons", "3488998120056947188", "refinement"], 2],
+      ["set", ["gi_player", "resin"], 160],
+      ["set", ["gi_characters", "Furina", "friendship"], 10],
+      ["set", ["gi_characters", "Nahida", "obtainedAt"], 1792000050],
+      ["set", ["achievements", "81219"], 1792000000],
+      ["set", ["anecdotes", "100002"], { "state": 3, "finishCount": 1 }],
+      ["set", ["gi_anecdotes", "reward"], { "index": 0, "progress": 5, "target": 10 }]
+    ],
+    "sum": {
+      "characters": 3,
+      "weapons": 1,
+      "artifacts": 2,
+      "materials": 4,
+      "mora": 48211930,
+      "primogem": 1600,
+      "artifact3": 0,
+      "artifact4": 0
+    }
+  },
+  "result": {
+    "format": "GOOD",
+    "version": 2,
+    "source": "Irminsul",
+    "characters": [
+      {
+        "key": "Furina",
+        "level": 90,
+        "constellation": 0,
+        "ascension": 6,
+        "talent": { "auto": 1, "skill": 9, "burst": 9 }
+      },
+      {
+        "key": "Escoffier",
+        "level": 90,
+        "constellation": 0,
+        "ascension": 6,
+        "talent": { "auto": 1, "skill": 6, "burst": 6 }
+      },
+      {
+        "key": "Nahida",
+        "level": 1,
+        "constellation": 0,
+        "ascension": 0,
+        "talent": { "auto": 1, "skill": 1, "burst": 1 }
+      }
+    ],
+    "artifacts": [
+      {
+        "setKey": "GoldenTroupe",
+        "slotKey": "plume",
+        "level": 20,
+        "rarity": 5,
+        "mainStatKey": "atk",
+        "location": "Furina",
+        "lock": true,
+        "substats": [
+          { "key": "critRate_", "value": 3.9, "initialValue": 3.9 },
+          { "key": "critDMG_", "value": 21.0, "initialValue": 7.0 },
+          { "key": "hp_", "value": 5.8, "initialValue": 5.8 },
+          { "key": "enerRech_", "value": 6.5, "initialValue": 6.5 }
+        ],
+        "totalRolls": 9,
+        "astralMark": false,
+        "elixerCrafted": false,
+        "unactivatedSubstats": [],
+        "gi_guid": "3488998120056947072"
+      },
+      {
+        "setKey": "GoldenTroupe",
+        "slotKey": "flower",
+        "level": 0,
+        "rarity": 5,
+        "mainStatKey": "hp",
+        "location": "",
+        "lock": false,
+        "substats": [
+          { "key": "critRate_", "value": 3.1, "initialValue": 3.1 },
+          { "key": "atk_", "value": 5.8, "initialValue": 5.8 },
+          { "key": "def", "value": 19.0, "initialValue": 19.0 }
+        ],
+        "totalRolls": 3,
+        "astralMark": false,
+        "elixerCrafted": false,
+        "unactivatedSubstats": [{ "key": "critDMG_", "value": 7.8, "initialValue": 7.8 }],
+        "gi_guid": "3488998120056947079"
+      }
+    ],
+    "weapons": [
+      {
+        "key": "SplendorOfTranquilWaters",
+        "level": 90,
+        "ascension": 6,
+        "refinement": 2,
+        "location": "Furina",
+        "lock": true,
+        "gi_guid": "3488998120056947188"
+      }
+    ],
+    "materials": { "Mora": 48211930, "HerosWit": 312, "Primogem": 1600, "WanderersAdvice": 7 },
+    "gi_achievements": [81000, 81001, 81219],
+    "timestamp": 1792000060000,
+    "gi_player": { "uid": 812345678, "ar": 60, "wl": 9, "resin": 160 },
+    "gi_achievement_times": { "81000": 1790000000, "81001": 1790000100, "81219": 1792000000 },
+    "gi_characters": {
+      "Furina": { "friendship": 10, "obtainedAt": 1700000000 },
+      "Nahida": { "obtainedAt": 1792000050 }
+    },
+    "gi_anecdotes": {
+      "anecdotes": {
+        "100001": { "state": 3, "finishCount": 1 },
+        "100002": { "state": 3, "finishCount": 1 }
+      },
+      "unlockedAreas": [1, 2],
+      "reward": { "index": 0, "progress": 5, "target": 10 }
+    }
+  }
+}

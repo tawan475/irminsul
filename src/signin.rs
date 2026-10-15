@@ -1545,6 +1545,7 @@ impl TrackerAuth {
 
     /// Upload a GOOD snapshot with this session (contract section 6). The
     /// error has the key path's `HTTP {status} - {body}` shape.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn upload(
         &self,
         client: &reqwest::Client,
@@ -1553,6 +1554,21 @@ impl TrackerAuth {
         captured_at_ms: Option<i64>,
         timeout: Duration,
     ) -> Result<(), String> {
+        self.upload_answer(client, expected_base, json, captured_at_ms, timeout)
+            .await
+            .map(|_| ())
+    }
+
+    /// [`Self::upload`], answering with the tracker's answer (live sync
+    /// reads `live` from it).
+    pub async fn upload_answer(
+        &self,
+        client: &reqwest::Client,
+        expected_base: &str,
+        json: String,
+        captured_at_ms: Option<i64>,
+        timeout: Duration,
+    ) -> Result<String, String> {
         let expected_base = normalize_base(expected_base);
         let result = self
             .authorized(client, |grant| {
@@ -1575,7 +1591,7 @@ impl TrackerAuth {
         let body = response.text().await.unwrap_or_default();
         if status.is_success() {
             tracing::info!("Successfully uploaded data to tracker (signed in)");
-            Ok(())
+            Ok(body)
         } else {
             tracing::error!("Tracker upload failed ({}): {}", status, body);
             Err(http_failure(status, &body))
