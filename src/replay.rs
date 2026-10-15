@@ -917,6 +917,7 @@ fn describe(applied: AppliedData) -> String {
         (applied.achievements, "achievements"),
         (applied.properties, "player properties"),
         (applied.anecdotes, "anecdotes"),
+        (applied.routine, "planner routine"),
     ]
     .into_iter()
     .filter_map(|(present, name)| present.then_some(name))

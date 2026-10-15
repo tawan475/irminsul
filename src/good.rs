@@ -108,6 +108,11 @@ pub struct Good {
     /// (live sync, plan section 5.1). Tracker uploads only.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub gi_capture: Option<GiCapture>,
+    /// The planner's routine (commissions, the Abyss, expeditions...), as the
+    /// game last sent each part. Omitted when none was captured, and each
+    /// part omitted when it was not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gi_tasks: Option<GiTasks>,
 }
 
 /// `gi_capture`: why a tracker snapshot was taken, and which game login it
@@ -240,6 +245,85 @@ pub struct GiAnecdoteWish {
     pub npc_id: Option<u32>,
     /// When the last wish was made, in unix seconds.
     pub last_wish_time: u32,
+}
+
+/// `gi_tasks`: what the planner's tasks can be ticked from. The contract with
+/// the tracker is `GI_TASKS.md` (v1, 2026-10-15); append fields only. Times
+/// are unix seconds. Each part is the game's state when it last sent it (at
+/// login, mostly), not a live value.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GiTasks {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commissions: Option<GiCommissions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abyss: Option<GiAbyss>,
+    /// The characters out on an expedition (an empty list: nobody is out).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expeditions: Option<Vec<GiExpedition>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub realm: Option<GiRealm>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub welkin: Option<GiWelkin>,
+}
+
+impl GiTasks {
+    pub fn is_empty(&self) -> bool {
+        self.commissions.is_none()
+            && self.abyss.is_none()
+            && self.expeditions.is_none()
+            && self.realm.is_none()
+            && self.welkin.is_none()
+    }
+}
+
+/// `gi_tasks.commissions`: today's Daily Commissions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GiCommissions {
+    pub finished: u32,
+    pub total: u32,
+}
+
+/// `gi_tasks.abyss`: the Spiral Abyss period running.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GiAbyss {
+    pub start: u32,
+    /// When the next period begins.
+    pub end: u32,
+    pub stars: u32,
+    pub max_stars: u32,
+}
+
+/// One entry of `gi_tasks.expeditions`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GiExpedition {
+    /// The character's GOOD key. Omitted when the roster was not captured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub character: Option<String>,
+    /// The game's expedition id.
+    pub id: u32,
+    pub start: u32,
+    pub hours: u32,
+    /// When it is done: `start + hours`, less what a talent takes off.
+    pub done_at: u32,
+}
+
+/// `gi_tasks.realm`: the Serenitea Pot's realm currency.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GiRealm {
+    pub value: u32,
+    pub limit: u32,
+}
+
+/// `gi_tasks.welkin`: the Blessing of the Welkin Moon.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GiWelkin {
+    pub days: u32,
 }
 
 /// Account values GOOD has no place for: `gi_player`.
@@ -491,6 +575,30 @@ mod tests {
                 world: 1,
                 journal: GiCaptureJournal { seq: 0 },
             }),
+            gi_tasks: Some(GiTasks {
+                commissions: Some(GiCommissions {
+                    finished: 4,
+                    total: 4,
+                }),
+                abyss: Some(GiAbyss {
+                    start: 1_789_502_400,
+                    end: 1_792_094_399,
+                    stars: 30,
+                    max_stars: 36,
+                }),
+                expeditions: Some(vec![GiExpedition {
+                    character: Some("Xiangling".to_string()),
+                    id: 202,
+                    start: 1_791_000_000,
+                    hours: 20,
+                    done_at: 1_791_072_000,
+                }]),
+                realm: Some(GiRealm {
+                    value: 1_800,
+                    limit: 2_400,
+                }),
+                welkin: Some(GiWelkin { days: 30 }),
+            }),
         };
 
         let json = serde_json::to_value(&good).expect("Good must serialize");
@@ -521,6 +629,7 @@ mod tests {
                 "gi_capture",
                 "gi_characters",
                 "gi_player",
+                "gi_tasks",
                 "materials",
                 "source",
                 "timestamp",
@@ -662,6 +771,29 @@ mod tests {
             json["weapons"][0]["gi_guid"],
             serde_json::json!("3488998120056947188")
         );
+
+        // `GI_TASKS.md`: unix seconds; each part omitted when not captured.
+        assert_eq!(
+            json["gi_tasks"],
+            serde_json::json!({
+                "commissions": { "finished": 4, "total": 4 },
+                "abyss": {
+                    "start": 1_789_502_400,
+                    "end": 1_792_094_399,
+                    "stars": 30,
+                    "maxStars": 36,
+                },
+                "expeditions": [{
+                    "character": "Xiangling",
+                    "id": 202,
+                    "start": 1_791_000_000,
+                    "hours": 20,
+                    "doneAt": 1_791_072_000,
+                }],
+                "realm": { "value": 1_800, "limit": 2_400 },
+                "welkin": { "days": 30 },
+            })
+        );
     }
 
     #[test]
@@ -686,6 +818,7 @@ mod tests {
             gi_characters: None,
             gi_anecdotes: None,
             gi_capture: None,
+            gi_tasks: None,
         };
 
         let json = serde_json::to_value(&good).expect("Good must serialize");
@@ -697,6 +830,7 @@ mod tests {
         assert!(!object.contains_key("gi_characters"));
         assert!(!object.contains_key("gi_anecdotes"));
         assert!(!object.contains_key("gi_capture"));
+        assert!(!object.contains_key("gi_tasks"));
     }
 
     #[test]

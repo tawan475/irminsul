@@ -7,8 +7,8 @@ use anyhow::Result;
 pub use auto_artifactarium::Achievement;
 pub use auto_artifactarium::r#gen::protos::{AvatarInfo, Item, PropValue};
 use auto_artifactarium::{
-    ANECDOTE_AREA_IDS, ANECDOTE_IDS, AnecdoteData, MAX_ANECDOTE_FINISH_COUNT, MAX_ANECDOTE_STATE,
-    MAX_ANECDOTES,
+    ANECDOTE_AREA_IDS, ANECDOTE_IDS, AbyssPeriod, AnecdoteData, DailyCommissions, Expedition,
+    HomeResources, MAX_ANECDOTE_FINISH_COUNT, MAX_ANECDOTE_STATE, MAX_ANECDOTES,
 };
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -580,6 +580,31 @@ fn group_thousands(n: usize) -> String {
     grouped
 }
 
+/// The most expeditions `gi_tasks` lists (the contract's cap; the game has
+/// five slots).
+const MAX_EXPORTED_EXPEDITIONS: usize = 20;
+
+/// One part of the planner's routine, as one message carried it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RoutinePart {
+    Commissions(DailyCommissions),
+    Abyss(AbyssPeriod),
+    Expeditions(Vec<Expedition>),
+    Home(HomeResources),
+    Welkin(u32),
+}
+
+/// The planner's routine as captured: each part `None` until its message
+/// arrives.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Routine {
+    commissions: Option<DailyCommissions>,
+    abyss: Option<AbyssPeriod>,
+    expeditions: Option<Vec<Expedition>>,
+    home: Option<HomeResources>,
+    welkin: Option<u32>,
+}
+
 pub struct PlayerData {
     game_data: AnimeGameData,
     achievements: HashMap<u32, Achievement>,
@@ -603,6 +628,9 @@ pub struct PlayerData {
     /// re-sends the whole book each time it is asked for it, so the newest
     /// copy replaces the old one rather than merging into it.
     anecdotes: Option<AnecdoteData>,
+    /// What the planner's tasks are ticked from, each part as the game last
+    /// sent it (each message is the whole state of its part).
+    routine: Routine,
 
     character_equip_guid_map: HashMap<u64, u32>,
 
@@ -619,6 +647,7 @@ impl PlayerData {
             items: HashMap::new(),
             properties: HashMap::new(),
             anecdotes: None,
+            routine: Routine::default(),
             character_equip_guid_map: HashMap::new(),
             game_data_sha: None,
         }
@@ -646,6 +675,7 @@ impl PlayerData {
         self.items.clear();
         self.properties.clear();
         self.anecdotes = None;
+        self.routine = Routine::default();
         self.character_equip_guid_map.clear();
     }
 
@@ -657,6 +687,7 @@ impl PlayerData {
             && self.items.is_empty()
             && self.properties.is_empty()
             && self.anecdotes.is_none()
+            && self.routine == Routine::default()
     }
 
     pub fn process_achievements(&mut self, achievements: &[Achievement]) {
@@ -670,6 +701,18 @@ impl PlayerData {
     /// any earlier copy: each one is the whole book.
     pub fn process_anecdotes(&mut self, data: &AnecdoteData) {
         self.anecdotes = Some(data.clone());
+    }
+
+    /// Keep one part of the planner's routine, replacing what the game sent
+    /// for it before.
+    pub fn process_routine(&mut self, part: RoutinePart) {
+        match part {
+            RoutinePart::Commissions(found) => self.routine.commissions = Some(found),
+            RoutinePart::Abyss(found) => self.routine.abyss = Some(found),
+            RoutinePart::Expeditions(found) => self.routine.expeditions = Some(found),
+            RoutinePart::Home(found) => self.routine.home = Some(found),
+            RoutinePart::Welkin(days) => self.routine.welkin = Some(days),
+        }
     }
 
     pub fn process_properties(&mut self, new_props: &HashMap<u32, u64>) {
@@ -889,6 +932,87 @@ impl PlayerData {
             }),
             wish,
         })
+    }
+
+    /// `gi_tasks`, per the tracker contract (`GI_TASKS.md`), or `None` when
+    /// none of it was captured. A part whose values fall outside the
+    /// contract's ranges is left out (the tracker would drop it).
+    fn export_tasks(&self, now_secs: u64) -> Option<good::GiTasks> {
+        let routine = &self.routine;
+        let time_ok = |secs: u32| plausible_time(u64::from(secs), now_secs);
+        let commissions = routine.commissions.and_then(|found| {
+            let finished = found.finished?;
+            (found.total >= 1 && finished <= found.total).then_some(good::GiCommissions {
+                finished,
+                total: found.total,
+            })
+        });
+        let abyss = routine.abyss.and_then(|found| {
+            let ok = time_ok(found.start)
+                && found.end > found.start
+                && found.stars <= found.max_stars
+                && found.max_stars >= 1;
+            if !ok {
+                tracing::warn!(
+                    ?found,
+                    "abyss period outside the contract's ranges; left out"
+                );
+            }
+            ok.then_some(good::GiAbyss {
+                start: found.start,
+                end: found.end,
+                stars: found.stars,
+                max_stars: found.max_stars,
+            })
+        });
+        let expeditions = routine.expeditions.as_ref().and_then(|all| {
+            let mut out: Vec<good::GiExpedition> = all
+                .iter()
+                .filter(|e| e.is_out() && time_ok(e.start_time))
+                .map(|e| good::GiExpedition {
+                    character: self.character_key_by_guid(e.avatar_guid),
+                    id: e.expedition_id,
+                    start: e.start_time,
+                    hours: e.hours,
+                    done_at: e.done_at(),
+                })
+                .collect();
+            out.sort_by(|a, b| (a.done_at, &a.character).cmp(&(b.done_at, &b.character)));
+            if out.len() > MAX_EXPORTED_EXPEDITIONS {
+                tracing::warn!(
+                    out = out.len(),
+                    "more expeditions out than slots exist; left out"
+                );
+                return None;
+            }
+            Some(out)
+        });
+        let realm = routine.home.and_then(|found| {
+            (found.realm_currency <= found.realm_currency_limit).then_some(good::GiRealm {
+                value: found.realm_currency,
+                limit: found.realm_currency_limit,
+            })
+        });
+        let welkin = routine.welkin.map(|days| good::GiWelkin { days });
+        let tasks = good::GiTasks {
+            commissions,
+            abyss,
+            expeditions,
+            realm,
+            welkin,
+        };
+        (!tasks.is_empty()).then_some(tasks)
+    }
+
+    /// The GOOD key of the character with this avatar guid, if the roster was
+    /// captured and the game data knows them.
+    fn character_key_by_guid(&self, guid: u64) -> Option<String> {
+        let avatar = self
+            .characters
+            .values()
+            .find(|avatar| avatar.guid == guid && avatar.avatar_type == AVATAR_TYPE_FORMAL)?;
+        let name = self.game_data.get_character(avatar.avatar_id).ok()?;
+        Some(good::to_good_key(name)).filter(|key| !key.is_empty())
     }
 
     /// A captured player property, if it lies in the range a real one can.
@@ -1195,6 +1319,8 @@ impl PlayerData {
             gi_anecdotes: self.export_anecdotes(now_ms / 1000),
             // Set by the tracker upload (`live.rs`), never here.
             gi_capture: None,
+            // Omitted when nothing of it was captured, like the keys above.
+            gi_tasks: self.export_tasks(now_ms / 1000),
         };
 
         if settings.include_characters {
@@ -2668,6 +2794,29 @@ mod tests {
                 }),
                 wish: None,
             });
+            data.process_routine(RoutinePart::Commissions(DailyCommissions {
+                total: 4,
+                finished: Some(4),
+            }));
+            data.process_routine(RoutinePart::Abyss(AbyssPeriod {
+                start: 1_754_000_000,
+                end: 1_756_592_000,
+                stars: 30,
+                max_stars: 36,
+            }));
+            data.process_routine(RoutinePart::Expeditions(vec![Expedition {
+                avatar_guid: guid(4),
+                state: 1,
+                expedition_id: 202,
+                hours: 20,
+                start_time: 1_755_990_000,
+                shorten_ratio: 0.0,
+            }]));
+            data.process_routine(RoutinePart::Home(HomeResources {
+                realm_currency: 1_800,
+                realm_currency_limit: 2_400,
+            }));
+            data.process_routine(RoutinePart::Welkin(30));
         }
         data
     }
@@ -2709,7 +2858,11 @@ mod tests {
         r#""gi_characters":{"HuTao":{"friendship":10,"obtainedAt":1646092800}},"#,
         r#""gi_anecdotes":{"anecdotes":{"100001":{"state":3,"finishCount":1},"#,
         r#""101604":{"state":0,"finishCount":3}},"unlockedAreas":[1,2],"#,
-        r#""reward":{"index":0,"progress":1,"target":10}}}"#,
+        r#""reward":{"index":0,"progress":1,"target":10}},"#,
+        r#""gi_tasks":{"commissions":{"finished":4,"total":4},"#,
+        r#""abyss":{"start":1754000000,"end":1756592000,"stars":30,"maxStars":36},"#,
+        r#""expeditions":[{"character":"HuTao","id":202,"start":1755990000,"hours":20,"#,
+        r#""doneAt":1756062000}],"realm":{"value":1800,"limit":2400},"welkin":{"days":30}}}"#,
     );
 
     #[test]
@@ -2760,17 +2913,102 @@ mod tests {
         assert!(good.gi_achievement_times.is_some());
         assert!(good.gi_characters.is_some());
         assert!(good.gi_anecdotes.is_some());
+        assert!(good.gi_tasks.is_some());
         let with = serde_json::to_string(&good).unwrap();
 
         good.gi_player = None;
         good.gi_achievement_times = None;
         good.gi_characters = None;
         good.gi_anecdotes = None;
+        good.gi_tasks = None;
         let without = serde_json::to_string(&good).unwrap();
 
         let good_part = without.strip_suffix('}').unwrap();
         assert!(with.starts_with(good_part), "{with}\n{without}");
         assert!(with[good_part.len()..].starts_with(r#","gi_player":"#));
+    }
+
+    // -- gi_tasks ----------------------------------------------------------------
+
+    fn expedition(guid: u64, state: u32, start_time: u32) -> Expedition {
+        Expedition {
+            avatar_guid: guid,
+            state,
+            expedition_id: 301,
+            hours: 20,
+            start_time,
+            shorten_ratio: 0.25,
+        }
+    }
+
+    #[test]
+    fn nothing_of_the_routine_captured_means_no_gi_tasks_key() {
+        let mut data = player_data();
+        data.process_properties(&login_properties());
+        let json = serde_json::to_value(data.export_at(&settings(), NOW_SECS * 1000).0).unwrap();
+        assert!(json.as_object().unwrap().get("gi_tasks").is_none());
+    }
+
+    #[test]
+    fn only_who_is_out_is_exported_and_a_count_not_told_apart_is_left_out() {
+        let mut data = player_data();
+        let start = (NOW_SECS - 3_600) as u32;
+        data.process_routine(RoutinePart::Expeditions(vec![
+            expedition(1 << 40, 1, start),
+            expedition(2 << 40, 0, start - 86_400),
+            expedition(3 << 40, 2, start - 86_400),
+        ]));
+        data.process_routine(RoutinePart::Commissions(DailyCommissions {
+            total: 4,
+            finished: None,
+        }));
+
+        let tasks = data.export_tasks(NOW_SECS).unwrap();
+        assert_eq!(tasks.commissions, None);
+        let out = tasks.expeditions.unwrap();
+        assert_eq!(out.len(), 2);
+        // Sorted by when they are done; no roster, so no character.
+        assert_eq!(out[0].start, start - 86_400);
+        assert_eq!(out[1].done_at, start + 15 * 3_600);
+        assert!(out.iter().all(|e| e.character.is_none()));
+    }
+
+    #[test]
+    fn an_empty_expedition_list_says_nobody_is_out() {
+        let mut data = player_data();
+        data.process_routine(RoutinePart::Expeditions(vec![expedition(
+            1 << 40,
+            0,
+            1_700_000_000,
+        )]));
+        let json = serde_json::to_value(data.export_tasks(NOW_SECS)).unwrap();
+        assert_eq!(json, serde_json::json!({ "expeditions": [] }));
+    }
+
+    #[test]
+    fn an_abyss_period_from_the_future_is_left_out() {
+        let mut data = player_data();
+        let start = (NOW_SECS + CLOCK_SLACK_SECS + 1) as u32;
+        data.process_routine(RoutinePart::Abyss(AbyssPeriod {
+            start,
+            end: start + 86_400 * 30,
+            stars: 9,
+            max_stars: 36,
+        }));
+        data.process_routine(RoutinePart::Welkin(12));
+        let tasks = data.export_tasks(NOW_SECS).unwrap();
+        assert_eq!(tasks.abyss, None);
+        assert_eq!(tasks.welkin, Some(good::GiWelkin { days: 12 }));
+    }
+
+    #[test]
+    fn reset_forgets_the_routine() {
+        let mut data = player_data();
+        data.process_routine(RoutinePart::Welkin(12));
+        assert!(!data.is_empty());
+        data.reset();
+        assert!(data.is_empty());
+        assert_eq!(data.export_tasks(NOW_SECS), None);
     }
 
     // -- gi_anecdotes ----------------------------------------------------------------

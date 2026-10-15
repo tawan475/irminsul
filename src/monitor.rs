@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use crate::capture::{self, BackendType, CaptureSource, create_capture};
 use crate::game_watch::{self, GameStatus, GameWatch, SystemProcessDetector};
 use crate::live::{Action, BatchAnswer, ImportAnswer, LiveSync, Reason};
-use crate::player_data::{ExportReport, ExportSettings, PlayerData};
+use crate::player_data::{ExportReport, ExportSettings, PlayerData, RoutinePart};
 use crate::signin::{TrackerAuth, UploadCredential};
 use crate::{AppState, DataUpdated, Message, State};
 
@@ -394,11 +394,19 @@ pub(crate) struct AppliedData {
     /// The Travel Accounts book. Like properties, no timestamp of its own:
     /// it rides along with whatever export the other classes trigger.
     pub(crate) anecdotes: bool,
+    /// A part of the planner's routine (`gi_tasks`). No timestamp of its own
+    /// either, like the anecdotes.
+    pub(crate) routine: bool,
 }
 
 impl AppliedData {
     pub(crate) fn any(&self) -> bool {
-        self.items || self.characters || self.achievements || self.properties || self.anecdotes
+        self.items
+            || self.characters
+            || self.achievements
+            || self.properties
+            || self.anecdotes
+            || self.routine
     }
 
     /// Everything either side changed.
@@ -409,6 +417,7 @@ impl AppliedData {
             achievements: self.achievements || other.achievements,
             properties: self.properties || other.properties,
             anecdotes: self.anecdotes || other.anecdotes,
+            routine: self.routine || other.routine,
         }
     }
 }
@@ -471,6 +480,36 @@ pub(crate) fn apply_commands(
                 );
                 player_data.process_anecdotes(&anecdotes);
                 applied.anecdotes = true;
+            }
+            CommandMatch::Commissions(found) => {
+                tracing::info!(total = found.total, finished = ?found.finished, "Found commissions");
+                player_data.process_routine(RoutinePart::Commissions(found));
+                applied.routine = true;
+            }
+            CommandMatch::Abyss(found) => {
+                tracing::info!(
+                    stars = found.stars,
+                    max_stars = found.max_stars,
+                    "Found abyss period"
+                );
+                player_data.process_routine(RoutinePart::Abyss(found));
+                applied.routine = true;
+            }
+            CommandMatch::Expeditions(found) => {
+                let out = found.iter().filter(|e| e.is_out()).count();
+                tracing::info!(out, "Found expeditions");
+                player_data.process_routine(RoutinePart::Expeditions(found));
+                applied.routine = true;
+            }
+            CommandMatch::HomeResources(found) => {
+                tracing::info!("Found realm currency");
+                player_data.process_routine(RoutinePart::Home(found));
+                applied.routine = true;
+            }
+            CommandMatch::Welkin(days) => {
+                tracing::info!("Found Welkin Moon days");
+                player_data.process_routine(RoutinePart::Welkin(days));
+                applied.routine = true;
             }
             CommandMatch::DeletedItems(guids) => {
                 // The matcher reports candidates -- its shape is shared with
@@ -3082,6 +3121,33 @@ pub(crate) mod tests {
         );
         // And the next connection is news again.
         assert!(replacement.connection_reset());
+    }
+
+    #[test]
+    fn routine_parts_are_applied_without_stamping_a_data_class() {
+        let mut data = PlayerData::new(AnimeGameData::new());
+        let applied = apply_commands(
+            &mut data,
+            vec![
+                (
+                    1,
+                    CommandMatch::Commissions(auto_artifactarium::DailyCommissions {
+                        total: 4,
+                        finished: Some(2),
+                    }),
+                ),
+                (2, CommandMatch::Welkin(30)),
+            ],
+        );
+        assert_eq!(
+            applied,
+            AppliedData {
+                routine: true,
+                ..AppliedData::default()
+            }
+        );
+        assert!(applied.any());
+        assert!(!data.is_empty());
     }
 
     #[test]

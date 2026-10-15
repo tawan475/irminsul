@@ -81,6 +81,13 @@ pub use crate::gacha::{
 use crate::r#gen::protos::{AvatarInfo, Item, PacketHead, PropValue, Unk, prop_value};
 use crate::kcp::{KcpSniffer, SegmentHead, segment_head};
 use crate::oodle::TcpDecoder;
+pub use crate::routine::{
+    ABYSS_FLOOR_IDS, ABYSS_STARS_PER_FLOOR, AbyssPeriod, DAILY_TASK_IDS, DailyCommissions,
+    EXPEDITION_HOURS, EXPEDITION_IDS, Expedition, HomeResources, MAX_ABYSS_FLOORS, MAX_DAILY_TASKS,
+    MAX_EXPEDITION_STATE, MAX_REALM_CURRENCY, MAX_WELKIN_DAYS, matches_avatar_expedition_notify,
+    matches_daily_task_notify, matches_home_resource_notify, matches_recharge_data_notify,
+    matches_tower_all_data_rsp,
+};
 pub use crate::unk_util::{
     Achievement, AchievementMatchError, matches_achievement_all_data_notify,
     matches_avatars_all_data_notify, matches_get_player_token_rsp, matches_items_all_data_notify,
@@ -103,6 +110,7 @@ mod cs_rand;
 mod gacha;
 mod kcp;
 pub mod oodle;
+mod routine;
 #[cfg(test)]
 mod test_support;
 mod unk_util;
@@ -267,6 +275,11 @@ static AUTHKEY_RSP_LOGGED: AtomicBool = AtomicBool::new(false);
 static GACHA_RSP_LOGGED: AtomicBool = AtomicBool::new(false);
 static GACHA_INFO_RSP_LOGGED: AtomicBool = AtomicBool::new(false);
 static CLIENT_VERSION_LOGGED: AtomicBool = AtomicBool::new(false);
+static DAILY_TASK_NOTIFY_LOGGED: AtomicBool = AtomicBool::new(false);
+static TOWER_RSP_LOGGED: AtomicBool = AtomicBool::new(false);
+static EXPEDITION_NOTIFY_LOGGED: AtomicBool = AtomicBool::new(false);
+static HOME_RESOURCE_NOTIFY_LOGGED: AtomicBool = AtomicBool::new(false);
+static RECHARGE_NOTIFY_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// `true` the first time it is called for a given flag.
 fn first_time(flag: &AtomicBool) -> bool {
@@ -1466,6 +1479,17 @@ pub enum CommandMatch {
     /// The client's full version string (`GetPlayerTokenReq`): see
     /// [`matches_client_version_packet`]. Not account data.
     ClientVersion(String),
+    /// Today's Daily Commissions: see [`matches_daily_task_packet`].
+    Commissions(DailyCommissions),
+    /// The Spiral Abyss period now running: see [`matches_tower_packet`].
+    Abyss(AbyssPeriod),
+    /// Every character's expedition: see [`matches_expedition_packet`].
+    Expeditions(Vec<Expedition>),
+    /// The Serenitea Pot's realm currency: see [`matches_home_resource_packet`].
+    HomeResources(HomeResources),
+    /// The Blessing of the Welkin Moon's days left: see
+    /// [`matches_recharge_packet`].
+    Welkin(u32),
 }
 
 impl CommandMatch {
@@ -1482,6 +1506,11 @@ impl CommandMatch {
             Self::Wish(_) => "wish",
             Self::GachaInfo(_) => "banner list",
             Self::ClientVersion(_) => "client version",
+            Self::Commissions(_) => "commissions",
+            Self::Abyss(_) => "abyss",
+            Self::Expeditions(_) => "expeditions",
+            Self::HomeResources(_) => "realm currency",
+            Self::Welkin(_) => "welkin",
         }
     }
 
@@ -1518,6 +1547,21 @@ pub fn classify_command(game_command: &GameCommand) -> Option<CommandMatch> {
     }
     if let Some(anecdotes) = matches_anecdote_packet(game_command) {
         claims.push(CommandMatch::Anecdotes(anecdotes));
+    }
+    if let Some(commissions) = matches_daily_task_packet(game_command) {
+        claims.push(CommandMatch::Commissions(commissions));
+    }
+    if let Some(abyss) = matches_tower_packet(game_command) {
+        claims.push(CommandMatch::Abyss(abyss));
+    }
+    if let Some(expeditions) = matches_expedition_packet(game_command) {
+        claims.push(CommandMatch::Expeditions(expeditions));
+    }
+    if let Some(home) = matches_home_resource_packet(game_command) {
+        claims.push(CommandMatch::HomeResources(home));
+    }
+    if let Some(days) = matches_recharge_packet(game_command) {
+        claims.push(CommandMatch::Welkin(days));
     }
     if let Some(key) = matches_authkey_packet(game_command) {
         claims.push(CommandMatch::AuthKey(key));
@@ -1595,6 +1639,99 @@ pub fn matches_anecdote_packet(game_command: &GameCommand) -> Option<AnecdoteDat
         );
     }
     Some(data)
+}
+
+/// Recover today's Daily Commissions from a `WorldOwnerDailyTaskNotify`, or
+/// `None` if this is not one. Recognised by shape (see
+/// [`matches_daily_task_notify`]); the first match logs the command id.
+pub fn matches_daily_task_packet(game_command: &GameCommand) -> Option<DailyCommissions> {
+    let found = matches_daily_task_notify(&game_command.proto_data)?;
+    if first_time(&DAILY_TASK_NOTIFY_LOGGED) {
+        info!(
+            command_id = game_command.command_id,
+            total = found.total,
+            finished = ?found.finished,
+            "discovered WorldOwnerDailyTaskNotify"
+        );
+    } else {
+        debug!(command_id = game_command.command_id, "commission packet");
+    }
+    Some(found)
+}
+
+/// Recover the Spiral Abyss period from a `TowerAllDataRsp`, or `None` if
+/// this is not one. Recognised by shape (see [`matches_tower_all_data_rsp`]);
+/// the first match logs the command id.
+pub fn matches_tower_packet(game_command: &GameCommand) -> Option<AbyssPeriod> {
+    let found = matches_tower_all_data_rsp(&game_command.proto_data)?;
+    if first_time(&TOWER_RSP_LOGGED) {
+        info!(
+            command_id = game_command.command_id,
+            stars = found.stars,
+            max_stars = found.max_stars,
+            "discovered TowerAllDataRsp"
+        );
+    } else {
+        debug!(command_id = game_command.command_id, "abyss packet");
+    }
+    Some(found)
+}
+
+/// Recover every character's expedition from an `AvatarExpeditionDataNotify`,
+/// or `None` if this is not one. Recognised by shape (see
+/// [`matches_avatar_expedition_notify`]); the first match logs the command id.
+pub fn matches_expedition_packet(game_command: &GameCommand) -> Option<Vec<Expedition>> {
+    let found = matches_avatar_expedition_notify(&game_command.proto_data)?;
+    let out = found.iter().filter(|e| e.is_out()).count();
+    if first_time(&EXPEDITION_NOTIFY_LOGGED) {
+        info!(
+            command_id = game_command.command_id,
+            entries = found.len(),
+            out,
+            "discovered AvatarExpeditionDataNotify"
+        );
+    } else {
+        debug!(
+            command_id = game_command.command_id,
+            out, "expedition packet"
+        );
+    }
+    Some(found)
+}
+
+/// Recover the Serenitea Pot's realm currency from a `HomeResourceNotify`, or
+/// `None` if this is not one. Recognised by shape (see
+/// [`matches_home_resource_notify`]); the first match logs the command id.
+pub fn matches_home_resource_packet(game_command: &GameCommand) -> Option<HomeResources> {
+    let found = matches_home_resource_notify(&game_command.proto_data)?;
+    if first_time(&HOME_RESOURCE_NOTIFY_LOGGED) {
+        info!(
+            command_id = game_command.command_id,
+            "discovered HomeResourceNotify"
+        );
+    } else {
+        debug!(
+            command_id = game_command.command_id,
+            "realm currency packet"
+        );
+    }
+    Some(found)
+}
+
+/// Recover the Welkin Moon's days left from a `PlayerRechargeDataNotify`, or
+/// `None` if this is not one. Recognised by shape (see
+/// [`matches_recharge_data_notify`]); the first match logs the command id.
+pub fn matches_recharge_packet(game_command: &GameCommand) -> Option<u32> {
+    let found = matches_recharge_data_notify(&game_command.proto_data)?;
+    if first_time(&RECHARGE_NOTIFY_LOGGED) {
+        info!(
+            command_id = game_command.command_id,
+            "discovered PlayerRechargeDataNotify"
+        );
+    } else {
+        debug!(command_id = game_command.command_id, "recharge packet");
+    }
+    Some(found)
 }
 
 /// Recover a web view key from a `GetAuthkeyRsp`, or `None` if this is not one.
