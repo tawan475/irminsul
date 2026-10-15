@@ -374,7 +374,11 @@ impl DataReplacement {
         // A delete notify only removes from what is held, and the wish
         // history messages are not account data at all.
         let replaces = classified.iter().any(|(_, found)| {
-            found.is_account_data() && !matches!(found, CommandMatch::DeletedItems(_))
+            found.is_account_data()
+                && !matches!(
+                    found,
+                    CommandMatch::DeletedItems(_) | CommandMatch::ChangedItems(_)
+                )
         });
         self.verdict(key, replaces)
     }
@@ -511,6 +515,22 @@ pub(crate) fn apply_commands(
                 player_data.process_routine(RoutinePart::Welkin(days));
                 applied.routine = true;
             }
+            CommandMatch::ChangedItems(items) => {
+                // Candidates as well: only the captured account's are taken.
+                let changed = player_data.change_items(&items);
+                if changed > 0 {
+                    tracing::info!(
+                        "Item change packet updated {changed} of {} items",
+                        items.len()
+                    );
+                    applied.items = true;
+                } else {
+                    tracing::debug!(
+                        "Item change packet held none of the account's items ({} items)",
+                        items.len()
+                    );
+                }
+            }
             CommandMatch::DeletedItems(guids) => {
                 // The matcher reports candidates -- its shape is shared with
                 // a couple of dozen other messages -- so the inventory
@@ -559,6 +579,7 @@ pub(crate) fn changes_in(classified: &[(u16, CommandMatch)]) -> usize {
             CommandMatch::Properties(properties) => properties.len(),
             CommandMatch::Achievements(achievements) => achievements.len(),
             CommandMatch::DeletedItems(guids) => guids.len(),
+            CommandMatch::ChangedItems(items) => items.len(),
             CommandMatch::Anecdotes(_) => 1,
             _ => 0,
         })

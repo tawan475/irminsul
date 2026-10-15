@@ -1467,6 +1467,10 @@ pub enum CommandMatch {
     /// [`matches_item_del_packet`] for why the caller must intersect them with
     /// an inventory it actually holds.
     DeletedItems(Vec<u64>),
+    /// A few items the game says changed (`StoreItemChangeNotify`): see
+    /// [`matches_item_change_packet`]. Candidates too: the caller keeps only
+    /// the captured account's (guid top half = its UID).
+    ChangedItems(Vec<Item>),
     /// A web view key (`GetAuthkeyRsp`): see [`matches_authkey_packet`]. Not
     /// account data; its `Debug` never prints the key.
     AuthKey(GachaAuthKey),
@@ -1502,6 +1506,7 @@ impl CommandMatch {
             Self::Achievements(_) => "achievements",
             Self::Anecdotes(_) => "anecdotes",
             Self::DeletedItems(_) => "deleted items",
+            Self::ChangedItems(_) => "changed items",
             Self::AuthKey(_) => "auth key",
             Self::Wish(_) => "wish",
             Self::GachaInfo(_) => "banner list",
@@ -1562,6 +1567,9 @@ pub fn classify_command(game_command: &GameCommand) -> Option<CommandMatch> {
     }
     if let Some(days) = matches_recharge_packet(game_command) {
         claims.push(CommandMatch::Welkin(days));
+    }
+    if let Some(items) = matches_item_change_packet(game_command) {
+        claims.push(CommandMatch::ChangedItems(items));
     }
     if let Some(key) = matches_authkey_packet(game_command) {
         claims.push(CommandMatch::AuthKey(key));
@@ -1867,6 +1875,23 @@ pub fn matches_item_packet(game_command: &GameCommand) -> Option<Vec<Item>> {
             "item packet"
         );
     }
+    Some(items)
+}
+
+/// Recover the items of a `StoreItemChangeNotify` (fewer than ten; a longer
+/// list is [`matches_item_packet`]'s), or `None` if this is not one.
+///
+/// Found by shape (see `unk_util::discover_changed_items`): one list of
+/// entries that are all real inventory items of one account, beside a few
+/// scalars. Observed command id: 26018 in 7.1 (documentation only).
+pub fn matches_item_change_packet(game_command: &GameCommand) -> Option<Vec<Item>> {
+    let (field, items) = unk_util::discover_changed_items(&game_command.proto_data)?;
+    debug!(
+        command_id = game_command.command_id,
+        field,
+        count = items.len(),
+        "item change packet"
+    );
     Some(items)
 }
 
@@ -4406,6 +4431,103 @@ mod tests {
     #[test]
     fn a_command_that_matches_nothing_is_classified_as_nothing() {
         assert!(classify_command(&command(field_varint(1, 1))).is_none());
+    }
+
+    // -- item change matcher ---------------------------------------------------
+
+    /// Where 7.1 put `StoreItemChangeNotify`'s fields (list, store type, reason).
+    const CHANGE_LIST_TAG: u32 = 12;
+    const CHANGE_STORE_TYPE_TAG: u32 = 1;
+    const CHANGE_REASON_TAG: u32 = 4;
+
+    /// A weapon `Item`: an equip arm holding a weapon.
+    fn weapon_entry(item_id: u32, guid: u64) -> Vec<u8> {
+        let mut out = field_varint(1, u64::from(item_id));
+        out.extend(field_varint(2, guid));
+        let weapon = field_varint(1, 90);
+        out.extend(field_bytes(6, &field_bytes(2, &weapon)));
+        out
+    }
+
+    fn change_packet(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut out: Vec<u8> = entries
+            .iter()
+            .flat_map(|entry| field_bytes(CHANGE_LIST_TAG, entry))
+            .collect();
+        out.extend(field_varint(CHANGE_STORE_TYPE_TAG, 1));
+        out.extend(field_varint(CHANGE_REASON_TAG, 0));
+        out
+    }
+
+    #[test]
+    fn a_store_item_change_notify_yields_its_items() {
+        let command = command(change_packet(&[
+            item_entry(104_013, guid(TEST_UID, 77)),
+            weapon_entry(11_509, guid(TEST_UID, 78)),
+        ]));
+        let items = matches_item_change_packet(&command).expect("match");
+        assert_eq!(
+            items.iter().map(|item| item.item_id).collect::<Vec<_>>(),
+            [104_013, 11_509]
+        );
+        assert!(matches!(
+            classify_command(&command),
+            Some(CommandMatch::ChangedItems(_))
+        ));
+    }
+
+    #[test]
+    fn ten_changed_items_are_the_inventory_matchers() {
+        // Ten or more is the full-send matcher's list (it upserts the same way),
+        // so the two never both claim one command.
+        let entries: Vec<Vec<u8>> = (0..10)
+            .map(|i| item_entry(104_000 + i, guid(TEST_UID, u64::from(i) + 1)))
+            .collect();
+        let command = command(change_packet(&entries));
+        assert!(matches_item_change_packet(&command).is_none());
+        assert!(matches!(
+            classify_command(&command),
+            Some(CommandMatch::Items(_))
+        ));
+    }
+
+    #[test]
+    fn a_change_list_is_held_to_every_entry_being_an_item() {
+        // One entry without an account guid (a scene object's id pair).
+        let mut stray = field_varint(1, 3);
+        stray.extend(field_varint(2, 12));
+        stray.extend(field_bytes(6, &field_bytes(2, &field_varint(1, 1))));
+        assert!(
+            matches_item_change_packet(&command(change_packet(&[
+                item_entry(104_013, guid(TEST_UID, 1)),
+                stray,
+            ])))
+            .is_none()
+        );
+        // Two accounts' guids.
+        assert!(
+            matches_item_change_packet(&command(change_packet(&[
+                item_entry(104_013, guid(TEST_UID, 1)),
+                item_entry(104_002, guid(TEST_UID + 1, 2)),
+            ])))
+            .is_none()
+        );
+        // A second list beside it.
+        let mut two_lists = change_packet(&[item_entry(104_013, guid(TEST_UID, 1))]);
+        two_lists.extend(field_bytes(9, &item_entry(104_002, guid(TEST_UID, 2))));
+        assert!(matches_item_change_packet(&command(two_lists)).is_none());
+        // A fixed-width field.
+        let mut fixed = change_packet(&[item_entry(104_013, guid(TEST_UID, 1))]);
+        fixed.extend(field_fixed32(7, 1));
+        assert!(matches_item_change_packet(&command(fixed)).is_none());
+        // An equip arm that is neither weapon nor artifact.
+        let mut empty_equip = field_varint(1, 11_509);
+        empty_equip.extend(field_varint(2, guid(TEST_UID, 3)));
+        empty_equip.extend(field_bytes(6, &field_varint(3, 1)));
+        assert!(matches_item_change_packet(&command(change_packet(&[empty_equip]))).is_none());
+        // A delete notify is not a change.
+        let delete = command(delete_packet(&[guid(TEST_UID, 1), guid(TEST_UID, 2)]));
+        assert!(matches_item_change_packet(&delete).is_none());
     }
 
     // -- item delete matcher ---------------------------------------------------

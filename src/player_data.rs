@@ -786,6 +786,38 @@ impl PlayerData {
         }
     }
 
+    /// Apply a few changed items (`StoreItemChangeNotify`), returning how
+    /// many were the captured account's.
+    ///
+    /// The matcher reports *candidates* found by shape, so only items whose
+    /// guid's top half is the account's UID (read off the held inventory, see
+    /// [`Self::account_uid`]) are taken; with no inventory held there is no
+    /// UID and nothing is taken (the login's full send comes first anyway). A
+    /// material whose count is now 0 is dropped. Zero means "some other
+    /// packet", as for [`Self::remove_items`].
+    pub fn change_items(&mut self, items: &[Item]) -> usize {
+        let Some(uid) = self.account_uid() else {
+            return 0;
+        };
+        let mine: Vec<Item> = items
+            .iter()
+            .filter(|item| item.guid >> 32 == u64::from(uid))
+            .cloned()
+            .collect();
+        let mut gone = Vec::new();
+        let mut kept = Vec::new();
+        for item in mine.iter() {
+            if item.has_material() && item.material().count == 0 {
+                gone.push(item.guid);
+            } else {
+                kept.push(item.clone());
+            }
+        }
+        self.process_items(&kept);
+        self.remove_items(&gone);
+        mine.len()
+    }
+
     /// Drop items the game says are gone, returning how many were actually held.
     ///
     /// The guids come from `auto_artifactarium`'s delete matcher, which reports
@@ -2663,6 +2695,48 @@ mod tests {
         // One stray item among 21 doesn't spoil it (95% agree).
         data.process_items(&[material_item(105_000, minted_guid(800_000_002, 1), 1)]);
         assert_eq!(data.account_uid(), Some(800_000_001));
+    }
+
+    #[test]
+    fn changed_items_are_taken_only_for_the_account() {
+        let mut data = player_data();
+        // No inventory yet: no UID to check against, nothing taken.
+        assert_eq!(
+            data.change_items(&[material_item(104_013, minted_guid(800_000_001, 1), 5)]),
+            0
+        );
+        let items: Vec<_> = (1..=20)
+            .map(|n| material_item(104_000 + n, minted_guid(800_000_001, u64::from(n)), 3))
+            .collect();
+        data.process_items(&items);
+
+        // A new count for a held stack, and a new stack.
+        let taken = data.change_items(&[
+            material_item(104_001, minted_guid(800_000_001, 1), 9),
+            material_item(104_100, minted_guid(800_000_001, 99), 2),
+        ]);
+        assert_eq!(taken, 2);
+        let count = |data: &PlayerData, id: u32, guid: u64| {
+            data.items
+                .get(&(id, guid))
+                .map(|item| item.material().count)
+        };
+        assert_eq!(count(&data, 104_001, minted_guid(800_000_001, 1)), Some(9));
+        assert_eq!(count(&data, 104_100, minted_guid(800_000_001, 99)), Some(2));
+
+        // Another account's guid is some other packet: nothing changes.
+        assert_eq!(
+            data.change_items(&[material_item(104_001, minted_guid(800_000_002, 1), 1)]),
+            0
+        );
+        assert_eq!(count(&data, 104_001, minted_guid(800_000_001, 1)), Some(9));
+
+        // A stack down to 0 is gone.
+        assert_eq!(
+            data.change_items(&[material_item(104_002, minted_guid(800_000_001, 2), 0)]),
+            1
+        );
+        assert_eq!(count(&data, 104_002, minted_guid(800_000_001, 2)), None);
     }
 
     #[test]
