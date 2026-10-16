@@ -9,7 +9,7 @@ use anime_game_data::AnimeGameData;
 use anyhow::{Context, Result, anyhow};
 use auto_artifactarium::{
     CommandMatch, ConnectionPacket, GameCommand, GamePacket, GameSniffer, KeyState,
-    PacketDirection, classify_command,
+    PacketDirection, classify_command, classify_union,
 };
 use base64::prelude::*;
 use chrono::prelude::*;
@@ -371,13 +371,15 @@ impl DataReplacement {
         key: KeyState,
         classified: &[(u16, CommandMatch)],
     ) -> DataVerdict {
-        // A delete notify only removes from what is held, and the wish
-        // history messages are not account data at all.
+        // A delete notify, a changed item or property only alter what is
+        // held, and the wish history messages are not account data at all.
         let replaces = classified.iter().any(|(_, found)| {
             found.is_account_data()
                 && !matches!(
                     found,
-                    CommandMatch::DeletedItems(_) | CommandMatch::ChangedItems(_)
+                    CommandMatch::DeletedItems(_)
+                        | CommandMatch::ChangedItems(_)
+                        | CommandMatch::PropertyUpdate(_)
                 )
         });
         self.verdict(key, replaces)
@@ -431,12 +433,19 @@ impl AppliedData {
 /// One classification pass instead of an `else if` chain of matchers: the
 /// chain could not notice that two of them claimed the same command, which is
 /// exactly how a shape collision turns into silently missing data.
+///
+/// A command no matcher claims may be the game's bundle of small notifies,
+/// whose player property updates (Mora, Primogems after a reward) are taken
+/// out with their own command ids.
 pub(crate) fn classify_commands(commands: &[GameCommand]) -> Vec<(u16, CommandMatch)> {
     commands
         .iter()
-        .filter_map(|command| {
+        .flat_map(|command| {
             let _span = tracing::info_span!("command", id = command.command_id).entered();
-            classify_command(command).map(|found| (command.command_id, found))
+            match classify_command(command) {
+                Some(found) => vec![(command.command_id, found)],
+                None => classify_union(command),
+            }
         })
         .collect()
 }
@@ -461,6 +470,11 @@ pub(crate) fn apply_commands(
             }
             CommandMatch::Properties(properties) => {
                 tracing::info!("Found properties packet: {:?}", properties);
+                player_data.process_properties(&properties);
+                applied.properties = true;
+            }
+            CommandMatch::PropertyUpdate(properties) => {
+                tracing::info!("Found property update: {:?}", properties);
                 player_data.process_properties(&properties);
                 applied.properties = true;
             }
@@ -576,7 +590,9 @@ pub(crate) fn changes_in(classified: &[(u16, CommandMatch)]) -> usize {
         .map(|(_, found)| match found {
             CommandMatch::Items(items) => items.len(),
             CommandMatch::Avatars(avatars) => avatars.len(),
-            CommandMatch::Properties(properties) => properties.len(),
+            CommandMatch::Properties(properties) | CommandMatch::PropertyUpdate(properties) => {
+                properties.len()
+            }
             CommandMatch::Achievements(achievements) => achievements.len(),
             CommandMatch::DeletedItems(guids) => guids.len(),
             CommandMatch::ChangedItems(items) => items.len(),
@@ -3121,6 +3137,47 @@ pub(crate) mod tests {
             replacement.verdict(KeyState::Session, true),
             DataVerdict::ReplaceThenApply
         );
+    }
+
+    #[test]
+    fn a_property_update_does_not_replace_the_snapshot() {
+        // A Mora update can come before the new connection's login data; it
+        // must not throw the old snapshot away for one currency.
+        let mut replacement = DataReplacement::default();
+        replacement.connection_reset();
+        let update = vec![(
+            21436,
+            CommandMatch::PropertyUpdate(HashMap::from([(10016, 5)])),
+        )];
+        assert_eq!(
+            replacement.verdict_for_batch(KeyState::Session, &update),
+            DataVerdict::Hold
+        );
+        let page = vec![(
+            1,
+            CommandMatch::Properties((10_010..=10_016).map(|k| (k, 3)).collect()),
+        )];
+        assert_eq!(
+            replacement.verdict_for_batch(KeyState::Session, &page),
+            DataVerdict::ReplaceThenApply
+        );
+        assert_eq!(
+            replacement.verdict_for_batch(KeyState::Session, &update),
+            DataVerdict::Apply
+        );
+    }
+
+    #[test]
+    fn a_property_update_changes_mora() {
+        let mut data = PlayerData::new(AnimeGameData::new());
+        let update = || {
+            vec![(
+                21436,
+                CommandMatch::PropertyUpdate(HashMap::from([(10016, 141_000)])),
+            )]
+        };
+        assert_eq!(changes_in(&update()), 1);
+        assert!(apply_commands(&mut data, update()).properties);
     }
 
     #[test]
