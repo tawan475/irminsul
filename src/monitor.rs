@@ -9,7 +9,7 @@ use anime_game_data::AnimeGameData;
 use anyhow::{Context, Result, anyhow};
 use auto_artifactarium::{
     CommandMatch, ConnectionPacket, GameCommand, GamePacket, GameSniffer, KeyState,
-    PacketDirection, classify_command, classify_union,
+    PacketDirection, classify_command, classify_union, flat_message, union_commands,
 };
 use base64::prelude::*;
 use chrono::prelude::*;
@@ -380,6 +380,7 @@ impl DataReplacement {
                     CommandMatch::DeletedItems(_)
                         | CommandMatch::ChangedItems(_)
                         | CommandMatch::PropertyUpdate(_)
+                        | CommandMatch::Flat(_)
                 )
         });
         self.verdict(key, replaces)
@@ -403,6 +404,10 @@ pub(crate) struct AppliedData {
     /// A part of the planner's routine (`gi_tasks`). No timestamp of its own
     /// either, like the anecdotes.
     pub(crate) routine: bool,
+    /// Characters' live updates applied (talents, levels, constellations,
+    /// gear moved, new characters), for live sync's change count: what they
+    /// are is only known once they are applied.
+    pub(crate) avatar_changes: usize,
 }
 
 impl AppliedData {
@@ -424,6 +429,7 @@ impl AppliedData {
             properties: self.properties || other.properties,
             anecdotes: self.anecdotes || other.anecdotes,
             routine: self.routine || other.routine,
+            avatar_changes: self.avatar_changes + other.avatar_changes,
         }
     }
 }
@@ -436,7 +442,9 @@ impl AppliedData {
 ///
 /// A command no matcher claims may be the game's bundle of small notifies,
 /// whose player property updates (Mora, Primogems after a reward) are taken
-/// out with their own command ids.
+/// out with their own command ids, or a character's live update, which only
+/// the held data can recognise ([`CommandMatch::Flat`], decided in
+/// [`apply_commands`]).
 pub(crate) fn classify_commands(commands: &[GameCommand]) -> Vec<(u16, CommandMatch)> {
     commands
         .iter()
@@ -444,7 +452,10 @@ pub(crate) fn classify_commands(commands: &[GameCommand]) -> Vec<(u16, CommandMa
             let _span = tracing::info_span!("command", id = command.command_id).entered();
             match classify_command(command) {
                 Some(found) => vec![(command.command_id, found)],
-                None => classify_union(command),
+                None if union_commands(command).is_some() => classify_union(command),
+                None => flat_message(command)
+                    .map(|flat| vec![(command.command_id, CommandMatch::Flat(flat))])
+                    .unwrap_or_default(),
             }
         })
         .collect()
@@ -477,6 +488,18 @@ pub(crate) fn apply_commands(
                 tracing::info!("Found property update: {:?}", properties);
                 player_data.process_properties(&properties);
                 applied.properties = true;
+            }
+            CommandMatch::Flat(flat) => {
+                // Most are other traffic: only the held characters can say.
+                if let Some(change) = player_data.apply_avatar_change(&flat) {
+                    tracing::info!(?change, "Found character update");
+                    if change.is_equip() {
+                        applied.items = true;
+                    } else {
+                        applied.characters = true;
+                    }
+                    applied.avatar_changes += 1;
+                }
             }
             CommandMatch::Avatars(avatars) => {
                 tracing::info!("Found avatar packet with {} avatars", avatars.len());
@@ -1711,7 +1734,7 @@ impl Monitor {
         if full_send {
             self.live.note_full_send();
         }
-        self.live.note_change(noted);
+        self.live.note_change(noted + applied.avatar_changes);
 
         let mut updated = self.app_state.app_state.updated.clone();
         let now = instant_after(self.automation_cycle_started_at);

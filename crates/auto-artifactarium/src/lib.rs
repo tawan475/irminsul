@@ -73,6 +73,7 @@ pub use crate::anecdotes::{
 };
 use crate::connection::parse_frame;
 use crate::crypto::{bruteforce, decrypt_command, guess, lookup_initial_key};
+pub use crate::flat::{FlatMessage, flat_message, parse_avatar_info};
 pub use crate::gacha::{
     GACHA_TYPES, GachaAuthKey, GachaRecordLink, GachaWish, WISH_CURRENCY_IDS,
     matches_client_version, matches_do_gacha_rsp, matches_get_authkey_rsp,
@@ -107,6 +108,7 @@ mod anecdotes;
 mod connection;
 mod crypto;
 mod cs_rand;
+mod flat;
 mod gacha;
 mod kcp;
 pub mod oodle;
@@ -1467,6 +1469,10 @@ pub enum CommandMatch {
     /// a reward or a purchase), top-level or inside a `UnionCmdNotify`. They
     /// update what is held but can never stand in for a whole snapshot.
     PropertyUpdate(HashMap<u32, u64>),
+    /// A message no matcher recognised, taken apart for a caller that tells
+    /// a character's live updates apart by the account data in them (see
+    /// [`flat_message`]). Never replaces a snapshot; most are other traffic.
+    Flat(FlatMessage),
     Avatars(Vec<AvatarInfo>),
     Achievements(Vec<Achievement>),
     /// The Travel Accounts book, in full: see [`matches_anecdote_packet`].
@@ -1511,6 +1517,7 @@ impl CommandMatch {
             Self::Items(_) => "items",
             Self::Properties(_) => "properties",
             Self::PropertyUpdate(_) => "property update",
+            Self::Flat(_) => "flat",
             Self::Avatars(_) => "avatars",
             Self::Achievements(_) => "achievements",
             Self::Anecdotes(_) => "anecdotes",
@@ -1609,9 +1616,11 @@ pub fn union_commands(game_command: &GameCommand) -> Option<Vec<GameCommand>> {
 /// What a `UnionCmdNotify` carries that the account data needs, with each
 /// inner command's id.
 ///
-/// Only the player property updates are taken from inside it: they are what
-/// the game was seen bundling, and running every matcher over the combat and
-/// movement traffic that fills most unions would only buy shape collisions.
+/// Only the player property updates are recognised inside it (they are what
+/// the game was seen bundling; running every matcher over the combat and
+/// movement traffic that fills most unions would only buy shape collisions);
+/// the rest that could be a character's update is passed on as
+/// [`CommandMatch::Flat`] (a new character arrived inside one).
 pub fn classify_union(game_command: &GameCommand) -> Vec<(u16, CommandMatch)> {
     let Some(commands) = union_commands(game_command) else {
         return Vec::new();
@@ -1619,8 +1628,11 @@ pub fn classify_union(game_command: &GameCommand) -> Vec<(u16, CommandMatch)> {
     commands
         .iter()
         .filter_map(|inner| {
-            matches_player_property_packet(inner)
-                .map(|properties| (inner.command_id, CommandMatch::for_properties(properties)))
+            let found = match matches_player_property_packet(inner) {
+                Some(properties) => CommandMatch::for_properties(properties),
+                None => CommandMatch::Flat(flat_message(inner)?),
+            };
+            Some((inner.command_id, found))
         })
         .collect()
 }
