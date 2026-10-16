@@ -218,11 +218,14 @@ const PENDING_RESET_DISARM_MESSAGES: u32 = 64;
 /// the compressed stream.
 const COMPRESSED_LEN_FIELD: u32 = 8;
 
-/// Entries a property notify needs before it is believed.
+/// Entries a property map needs to be believed on the loose rules (most keys
+/// in the player block, inner ids counted rather than required).
 ///
-/// Deliberately unchanged. Lowering it to catch single-property delta notifies
-/// does not work -- the delta arrives under a different command id with a
-/// different shape -- and would trade a known limitation for false positives.
+/// A smaller map is the game's live update: in 7.1 `PlayerPropNotify` (21436
+/// that day, 61 in one recorded session) arrives after every Mora or Primogem
+/// change carrying only the changed properties, in the same
+/// `map<uint32, PropValue>` shape as the login's full page. Those are believed
+/// only on the strict rules of [`is_strict_property_map`].
 const MIN_PROPERTIES: usize = 5;
 
 /// The block of player property ids (the client's `PROP_*` enum).
@@ -1458,7 +1461,12 @@ fn compressed_len(command: &GameCommand) -> Option<usize> {
 #[non_exhaustive]
 pub enum CommandMatch {
     Items(Vec<Item>),
+    /// A page of player properties (a login or a world change sends them all).
     Properties(HashMap<u32, u64>),
+    /// The few player properties that just changed (`PlayerPropNotify` after
+    /// a reward or a purchase), top-level or inside a `UnionCmdNotify`. They
+    /// update what is held but can never stand in for a whole snapshot.
+    PropertyUpdate(HashMap<u32, u64>),
     Avatars(Vec<AvatarInfo>),
     Achievements(Vec<Achievement>),
     /// The Travel Accounts book, in full: see [`matches_anecdote_packet`].
@@ -1502,6 +1510,7 @@ impl CommandMatch {
         match self {
             Self::Items(_) => "items",
             Self::Properties(_) => "properties",
+            Self::PropertyUpdate(_) => "property update",
             Self::Avatars(_) => "avatars",
             Self::Achievements(_) => "achievements",
             Self::Anecdotes(_) => "anecdotes",
@@ -1519,6 +1528,16 @@ impl CommandMatch {
         }
     }
 
+    /// A property map as [`Self::Properties`] or, when it is smaller than a
+    /// page, [`Self::PropertyUpdate`].
+    fn for_properties(properties: HashMap<u32, u64>) -> Self {
+        if properties.len() < MIN_PROPERTIES {
+            Self::PropertyUpdate(properties)
+        } else {
+            Self::Properties(properties)
+        }
+    }
+
     /// Whether this is the account's data (what an export or upload holds),
     /// as opposed to what only the wish history uses.
     pub fn is_account_data(&self) -> bool {
@@ -1527,6 +1546,83 @@ impl CommandMatch {
             Self::AuthKey(_) | Self::Wish(_) | Self::GachaInfo(_) | Self::ClientVersion(_)
         )
     }
+}
+
+/// The commands bundled in a `UnionCmdNotify`, or `None` if this is not one.
+///
+/// The game batches small notifies into one message: a list of entries that
+/// each hold an inner command id (a varint) and, unless the command is empty,
+/// its body (bytes); 7.1 sent it as command 2246 with the list on field 8, the
+/// body on 6 and the id on 13. About 40% of a session's `PlayerPropNotify`
+/// updates came inside one, so they are found by that shape: every top-level
+/// field one entry on one field number, every entry exactly an id and at most
+/// one body, on the same two field numbers throughout.
+pub fn union_commands(game_command: &GameCommand) -> Option<Vec<GameCommand>> {
+    let msg = Unk::parse_from_bytes(&game_command.proto_data).ok()?;
+
+    let mut list_field = None;
+    let mut id_field = None;
+    let mut body_field = None;
+    let mut commands = Vec::new();
+    for (field_number, field_data) in msg.unknown_fields().iter() {
+        if *list_field.get_or_insert(field_number) != field_number {
+            return None;
+        }
+        let LengthDelimited(entry_bytes) = field_data else {
+            return None;
+        };
+        let entry = Unk::parse_from_bytes(entry_bytes).ok()?;
+        let mut command_id = None;
+        let mut body = None;
+        for (inner_number, inner_data) in entry.unknown_fields().iter() {
+            match inner_data {
+                Varint(id) if command_id.is_none() => {
+                    if *id_field.get_or_insert(inner_number) != inner_number {
+                        return None;
+                    }
+                    command_id = Some(u16::try_from(id).ok().filter(|id| *id != 0)?);
+                }
+                LengthDelimited(bytes) if body.is_none() => {
+                    if *body_field.get_or_insert(inner_number) != inner_number {
+                        return None;
+                    }
+                    body = Some(bytes.to_vec());
+                }
+                _ => return None,
+            }
+        }
+        let proto_data = body.unwrap_or_default();
+        commands.push(GameCommand {
+            command_id: command_id?,
+            header_len: 0,
+            data_len: u32::try_from(proto_data.len()).ok()?,
+            proto_header: Vec::new(),
+            proto_data,
+        });
+    }
+    if commands.is_empty() || id_field == body_field {
+        return None;
+    }
+    Some(commands)
+}
+
+/// What a `UnionCmdNotify` carries that the account data needs, with each
+/// inner command's id.
+///
+/// Only the player property updates are taken from inside it: they are what
+/// the game was seen bundling, and running every matcher over the combat and
+/// movement traffic that fills most unions would only buy shape collisions.
+pub fn classify_union(game_command: &GameCommand) -> Vec<(u16, CommandMatch)> {
+    let Some(commands) = union_commands(game_command) else {
+        return Vec::new();
+    };
+    commands
+        .iter()
+        .filter_map(|inner| {
+            matches_player_property_packet(inner)
+                .map(|properties| (inner.command_id, CommandMatch::for_properties(properties)))
+        })
+        .collect()
 }
 
 /// Run every matcher over one command and report what it is.
@@ -1542,7 +1638,7 @@ pub fn classify_command(game_command: &GameCommand) -> Option<CommandMatch> {
         claims.push(CommandMatch::Items(items));
     }
     if let Some(properties) = matches_player_property_packet(game_command) {
-        claims.push(CommandMatch::Properties(properties));
+        claims.push(CommandMatch::for_properties(properties));
     }
     if let Some(avatars) = matches_avatar_packet(game_command) {
         claims.push(CommandMatch::Avatars(avatars));
@@ -2198,6 +2294,36 @@ fn drifted_prop_value(prop: &PropValue) -> Option<u64> {
     best
 }
 
+/// How a small property map was laid out, for [`is_strict_property_map`].
+#[derive(Debug)]
+struct StrictShape {
+    /// Top-level fields in the message.
+    fields: usize,
+    /// Whether they all sit on one field number.
+    one_field: bool,
+    /// Map entries read.
+    entries: usize,
+    /// Entries keyed in the player block whose inner `type` names their key
+    /// and whose value sits in the declared fields.
+    exact: usize,
+}
+
+/// Whether a map below [`MIN_PROPERTIES`] is a live property update.
+///
+/// Nothing in it may be unexplained: the message is the map and only the map,
+/// every entry is a player property whose `PropValue.type` repeats its key and
+/// whose value is in the declared fields, and no value equals its own key (a
+/// one-entry id list would otherwise pass).
+fn is_strict_property_map(shape: &StrictShape, properties: &HashMap<u32, u64>) -> bool {
+    shape.entries > 0
+        && shape.one_field
+        && shape.fields == shape.entries
+        && shape.exact == shape.entries
+        && properties
+            .iter()
+            .all(|(key, value)| u64::from(*key) != *value)
+}
+
 /// Recover the player properties from a `PlayerPropertyNotify`, or `None` if this
 /// is not one.
 ///
@@ -2226,8 +2352,18 @@ pub fn matches_player_property_packet(game_command: &GameCommand) -> Option<Hash
     // consistently disagree with its keys is not a property map at all.
     let mut agreeing = 0usize;
     let mut disagreeing = 0usize;
+    // What the strict rules for a small map look at: every top-level field one
+    // map entry on one field number, each read from the declared fields.
+    let mut fields = 0usize;
+    let mut map_field = None;
+    let mut one_field = true;
+    let mut exact = 0usize;
 
-    for (_, field_data) in msg.unknown_fields().iter() {
+    for (field_number, field_data) in msg.unknown_fields().iter() {
+        fields += 1;
+        if map_field.get_or_insert(field_number) != &field_number {
+            one_field = false;
+        }
         let LengthDelimited(entry_bytes) = field_data else {
             continue;
         };
@@ -2244,10 +2380,14 @@ pub fn matches_player_property_packet(game_command: &GameCommand) -> Option<Hash
             disagreeing += 1;
         }
 
-        let Some(value) = prop_value(&prop).or_else(|| drifted_prop_value(&prop)) else {
+        let declared = prop_value(&prop);
+        let Some(value) = declared.or_else(|| drifted_prop_value(&prop)) else {
             trace!(key, "property value could not be read");
             continue;
         };
+        if declared.is_some() && prop.type_ == key && PLAYER_PROPERTY_IDS.contains(&key) {
+            exact += 1;
+        }
         properties.insert(key, value);
     }
 
@@ -2259,12 +2399,29 @@ pub fn matches_player_property_packet(game_command: &GameCommand) -> Option<Hash
         return None;
     }
 
-    // A property notify carries a whole page of properties. Anything smaller is
-    // more likely a coincidence than a delta -- real deltas arrive under a
-    // different command id with a different shape, so lowering this floor buys
-    // false positives and no live tracking.
+    // A small map is the live update after a currency changes; on its own the
+    // shape is too common to trust, so it must be exactly a property map.
     if properties.len() < MIN_PROPERTIES {
-        return None;
+        let shape = StrictShape {
+            fields,
+            one_field,
+            entries: properties.len(),
+            exact,
+        };
+        if !is_strict_property_map(&shape, &properties) {
+            trace!(
+                command_id = game_command.command_id,
+                ?shape,
+                "small map is not a property update"
+            );
+            return None;
+        }
+        debug!(
+            command_id = game_command.command_id,
+            ?properties,
+            "property update"
+        );
+        return Some(properties);
     }
 
     // A list of ids wearing the map's shape: no counter in it is anything but
@@ -4273,6 +4430,131 @@ mod tests {
             "prop map entries carry no guid and no detail arm"
         );
         assert!(matches_avatar_packet(&command).is_none());
+    }
+
+    // -- live property updates ------------------------------------------------
+
+    /// One `UnionCmdNotify` entry as 7.1 sends it: the body on 6, the inner
+    /// command id on 13 (no body for an empty command).
+    fn union_entry(command_id: u16, body: Option<&[u8]>) -> Vec<u8> {
+        let mut out = body.map(|body| field_bytes(6, body)).unwrap_or_default();
+        out.extend(field_varint(13, u64::from(command_id)));
+        out
+    }
+
+    fn union_packet(entries: &[Vec<u8>]) -> Vec<u8> {
+        entries
+            .iter()
+            .flat_map(|entry| field_bytes(8, entry))
+            .collect()
+    }
+
+    fn property_command(entries: &[(u32, Vec<u8>)]) -> GameCommand {
+        command(property_packet(entries))
+    }
+
+    #[test]
+    fn a_single_property_update_is_recognised() {
+        // What the game sends after a domain reward: Mora alone.
+        let mora = property_command(&[(10016, prop_val(10016, 1_234_567))]);
+
+        let properties = matches_player_property_packet(&mora).expect("an update");
+        assert_eq!(properties, HashMap::from([(10016, 1_234_567)]));
+        assert!(matches!(
+            classify_command(&mora),
+            Some(CommandMatch::PropertyUpdate(_))
+        ));
+
+        let two = property_command(&[(10015, prop_val(10015, 160)), (10016, prop_val(10016, 5))]);
+        assert_eq!(
+            matches_player_property_packet(&two).map(|p| p.len()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn a_full_page_is_still_a_page() {
+        let entries: Vec<(u32, Vec<u8>)> = (10_010..=10_016u32)
+            .map(|key| (key, prop_val(key, 3)))
+            .collect();
+        assert!(matches!(
+            classify_command(&property_command(&entries)),
+            Some(CommandMatch::Properties(_))
+        ));
+    }
+
+    #[test]
+    fn a_small_map_must_be_exactly_a_property_update() {
+        let rejected = |command: GameCommand| matches_player_property_packet(&command).is_none();
+        // Inner `type` missing or naming another property.
+        assert!(rejected(property_command(&[(10016, field_varint(4, 5))])));
+        assert!(rejected(property_command(&[(10016, prop_val(10015, 5))])));
+        // Outside the player block (an avatar or a 20xxx id).
+        assert!(rejected(property_command(&[(4001, prop_val(4001, 90))])));
+        assert!(rejected(property_command(&[(20046, prop_val(20046, 3))])));
+        // A one-entry id list.
+        assert!(rejected(property_command(&[(
+            10016,
+            prop_val(10016, 10016)
+        )])));
+        // The map beside another field.
+        let mut beside = property_packet(&[(10016, prop_val(10016, 5))]);
+        beside.extend(field_varint(1, 3));
+        assert!(rejected(command(beside)));
+        // Entries on two field numbers.
+        let mut split = property_packet(&[(10016, prop_val(10016, 5))]);
+        split.extend(field_bytes(
+            PROP_MAP_TAG + 1,
+            &prop_entry(10015, &prop_val(10015, 5)),
+        ));
+        assert!(rejected(command(split)));
+        // A value only the drifted fallback can read.
+        let mut drifted = field_varint(1, 10016);
+        drifted.extend(field_fixed32(9, 120.0f32.to_bits()));
+        assert!(rejected(property_command(&[(10016, drifted)])));
+    }
+
+    #[test]
+    fn a_property_update_inside_a_union_is_taken_with_its_own_id() {
+        let update = property_packet(&[(10016, prop_val(10016, 141_000))]);
+        let other = field_varint(2, 77);
+        let union = command(union_packet(&[
+            union_entry(9736, Some(&other)),
+            union_entry(21436, Some(&update)),
+            union_entry(500, None),
+        ]));
+
+        let inner = union_commands(&union).expect("a union");
+        assert_eq!(
+            inner.iter().map(|c| c.command_id).collect::<Vec<_>>(),
+            vec![9736, 21436, 500]
+        );
+        let found = classify_union(&union);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, 21436);
+        assert!(matches!(
+            &found[0].1,
+            CommandMatch::PropertyUpdate(p) if p == &HashMap::from([(10016, 141_000)])
+        ));
+    }
+
+    #[test]
+    fn what_is_not_a_union_is_left_alone() {
+        assert!(union_commands(&command(item_packet(3))).is_none());
+        // The list beside another field.
+        let mut beside = union_packet(&[union_entry(21436, Some(&[]))]);
+        beside.extend(field_varint(1, 3));
+        assert!(union_commands(&command(beside)).is_none());
+        // Ids that are not command ids.
+        let big = field_bytes(8, &field_varint(13, 70_000));
+        assert!(union_commands(&command(big)).is_none());
+        // Ids and bodies swapping field numbers between entries.
+        let mixed = union_packet(&[
+            union_entry(21436, Some(&[1])),
+            [field_varint(6, 21436), field_bytes(13, &[1])].concat(),
+        ]);
+        assert!(union_commands(&command(mixed)).is_none());
+        assert!(classify_union(&command(Vec::new())).is_empty());
     }
 
     /// Field numbers the item and avatar lists have sat on (5 and 6 in 7.0, 6
