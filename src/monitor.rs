@@ -20,7 +20,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::capture::{self, BackendType, CaptureSource, create_capture};
 use crate::game_watch::{self, GameStatus, GameWatch, SystemProcessDetector};
-use crate::player_data::{ExportReport, ExportSettings, PlayerData};
+use crate::live::{Action, BatchAnswer, ImportAnswer, LiveSync, Reason};
+use crate::player_data::{ExportReport, ExportSettings, PlayerData, RoutinePart};
 use crate::signin::{TrackerAuth, UploadCredential};
 use crate::{AppState, DataUpdated, Message, State};
 
@@ -176,6 +177,43 @@ enum UploadReport {
         retry_tx: mpsc::UnboundedSender<AutomationSignature>,
         signature: AutomationSignature,
     },
+    /// A snapshot live sync asked for (a collapse, a logout, a resync):
+    /// toasted only when it fails; live sync retries it itself.
+    Quiet,
+}
+
+/// What a tracker request reports back to the monitor's live sync.
+#[derive(Debug)]
+enum LiveEvent {
+    /// The snapshot upload with this ticket finished (`None`: it failed).
+    Snapshot {
+        ticket: u64,
+        answer: Option<ImportAnswer>,
+    },
+    /// The batch in flight was answered.
+    Batch(BatchAnswer),
+}
+
+/// Whole-request timeout for one batch of live changes.
+const LIVE_BATCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The time live sync runs on: Unix milliseconds.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+/// Whether live sync may send batches: the switch, and automated tracker
+/// uploads on with a way to upload.
+fn live_enabled(state: &crate::app::SavedAppState) -> bool {
+    state.live_sync && crate::app::want_tracker_upload(state)
+}
+
+/// The tracker's batch route for an API base.
+pub(crate) fn changes_url(base_url: &str) -> String {
+    format!("{}/irminsul/changes", base_url.trim_end_matches('/'))
 }
 
 /// The three timestamps that identify one snapshot of captured data.
@@ -336,7 +374,11 @@ impl DataReplacement {
         // A delete notify only removes from what is held, and the wish
         // history messages are not account data at all.
         let replaces = classified.iter().any(|(_, found)| {
-            found.is_account_data() && !matches!(found, CommandMatch::DeletedItems(_))
+            found.is_account_data()
+                && !matches!(
+                    found,
+                    CommandMatch::DeletedItems(_) | CommandMatch::ChangedItems(_)
+                )
         });
         self.verdict(key, replaces)
     }
@@ -356,11 +398,19 @@ pub(crate) struct AppliedData {
     /// The Travel Accounts book. Like properties, no timestamp of its own:
     /// it rides along with whatever export the other classes trigger.
     pub(crate) anecdotes: bool,
+    /// A part of the planner's routine (`gi_tasks`). No timestamp of its own
+    /// either, like the anecdotes.
+    pub(crate) routine: bool,
 }
 
 impl AppliedData {
     pub(crate) fn any(&self) -> bool {
-        self.items || self.characters || self.achievements || self.properties || self.anecdotes
+        self.items
+            || self.characters
+            || self.achievements
+            || self.properties
+            || self.anecdotes
+            || self.routine
     }
 
     /// Everything either side changed.
@@ -371,6 +421,7 @@ impl AppliedData {
             achievements: self.achievements || other.achievements,
             properties: self.properties || other.properties,
             anecdotes: self.anecdotes || other.anecdotes,
+            routine: self.routine || other.routine,
         }
     }
 }
@@ -434,6 +485,52 @@ pub(crate) fn apply_commands(
                 player_data.process_anecdotes(&anecdotes);
                 applied.anecdotes = true;
             }
+            CommandMatch::Commissions(found) => {
+                tracing::info!(total = found.total, finished = ?found.finished, "Found commissions");
+                player_data.process_routine(RoutinePart::Commissions(found));
+                applied.routine = true;
+            }
+            CommandMatch::Abyss(found) => {
+                tracing::info!(
+                    stars = found.stars,
+                    max_stars = found.max_stars,
+                    "Found abyss period"
+                );
+                player_data.process_routine(RoutinePart::Abyss(found));
+                applied.routine = true;
+            }
+            CommandMatch::Expeditions(found) => {
+                let out = found.iter().filter(|e| e.is_out()).count();
+                tracing::info!(out, "Found expeditions");
+                player_data.process_routine(RoutinePart::Expeditions(found));
+                applied.routine = true;
+            }
+            CommandMatch::HomeResources(found) => {
+                tracing::info!("Found realm currency");
+                player_data.process_routine(RoutinePart::Home(found));
+                applied.routine = true;
+            }
+            CommandMatch::Welkin(days) => {
+                tracing::info!("Found Welkin Moon days");
+                player_data.process_routine(RoutinePart::Welkin(days));
+                applied.routine = true;
+            }
+            CommandMatch::ChangedItems(items) => {
+                // Candidates as well: only the captured account's are taken.
+                let changed = player_data.change_items(&items);
+                if changed > 0 {
+                    tracing::info!(
+                        "Item change packet updated {changed} of {} items",
+                        items.len()
+                    );
+                    applied.items = true;
+                } else {
+                    tracing::debug!(
+                        "Item change packet held none of the account's items ({} items)",
+                        items.len()
+                    );
+                }
+            }
             CommandMatch::DeletedItems(guids) => {
                 // The matcher reports candidates -- its shape is shared with
                 // a couple of dozen other messages -- so the inventory
@@ -460,6 +557,33 @@ pub(crate) fn apply_commands(
         }
     }
     applied
+}
+
+/// Whether a classified batch holds the game sending the whole inventory (a
+/// login, or a world change), given the items held before it (live sync's
+/// snapshots; see [`crate::live::is_full_send`]).
+pub(crate) fn full_send_in(classified: &[(u16, CommandMatch)], items_held: usize) -> bool {
+    classified.iter().any(|(_, found)| {
+        matches!(found, CommandMatch::Items(items) if crate::live::is_full_send(items.len(), items_held))
+    })
+}
+
+/// How many account entries a classified batch touches: live sync's cheap
+/// estimate of what changed (the diff decides what is sent).
+pub(crate) fn changes_in(classified: &[(u16, CommandMatch)]) -> usize {
+    classified
+        .iter()
+        .map(|(_, found)| match found {
+            CommandMatch::Items(items) => items.len(),
+            CommandMatch::Avatars(avatars) => avatars.len(),
+            CommandMatch::Properties(properties) => properties.len(),
+            CommandMatch::Achievements(achievements) => achievements.len(),
+            CommandMatch::DeletedItems(guids) => guids.len(),
+            CommandMatch::ChangedItems(items) => items.len(),
+            CommandMatch::Anecdotes(_) => 1,
+            _ => 0,
+        })
+        .sum()
 }
 
 /// How often the sniffer thread logs what it has been doing.
@@ -904,6 +1028,11 @@ pub struct Monitor {
     /// Where captured wish history keys and wishes go; see
     /// [`crate::wish_history`].
     wish_hub: Option<crate::wish_history::WishHub>,
+
+    /// Live sync's sender (`live.rs`), and where its requests answer.
+    live: LiveSync,
+    live_tx: mpsc::UnboundedSender<LiveEvent>,
+    live_rx: mpsc::UnboundedReceiver<LiveEvent>,
 }
 
 impl Monitor {
@@ -928,6 +1057,7 @@ impl Monitor {
         let (packet_tx, packet_rx) = mpsc::unbounded_channel();
         let (decoded_tx, decoded_rx) = mpsc::unbounded_channel();
         let (automation_retry_tx, automation_retry_rx) = mpsc::unbounded_channel();
+        let (live_tx, live_rx) = mpsc::unbounded_channel();
         let sniffer = spawn_sniffer_thread(sniffer, decoded_tx)?;
 
         // One client for the whole process: clones share its connection pool,
@@ -997,6 +1127,9 @@ impl Monitor {
             pcapng,
             ctx,
             wish_hub: None,
+            live: LiveSync::new(),
+            live_tx,
+            live_rx,
         })
     }
 
@@ -1050,6 +1183,16 @@ impl Monitor {
                 }
             };
 
+            let live_at = self.live_next_tick();
+            let live_fut = async move {
+                match live_at {
+                    Some(at) => {
+                        tokio::time::sleep(Duration::from_millis(at.saturating_sub(now_ms()))).await
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+
             #[rustfmt::skip]
             tokio::select! {
                 _ = self.cancel_token.cancelled() => {
@@ -1057,6 +1200,12 @@ impl Monitor {
                 }
                 _ = sleep_fut => {
                     self.execute_automation_export().await;
+                }
+                _ = live_fut => {
+                    self.live_tick();
+                }
+                Some(event) = self.live_rx.recv() => {
+                    self.handle_live_event(event);
                 }
                 Some(event) = self.packet_rx.recv() => {
                     self.handle_capture_event(event);
@@ -1152,7 +1301,8 @@ impl Monitor {
                 });
             }
             Message::UploadToTracker(json, credential, reply_tx) => {
-                self.spawn_tracker_upload(credential, json, UploadReport::Reply(reply_tx));
+                let (json, ticket) = self.manual_snapshot(json);
+                self.spawn_tracker_upload(credential, json, UploadReport::Reply(reply_tx), ticket);
             }
             Message::Tracker(request) => {
                 self.tracker_auth.handle(self.http.clone(), request);
@@ -1378,7 +1528,13 @@ impl Monitor {
             );
         }
 
+        let was = self.app_state.app_state.game_status;
         self.app_state.update_game_status(status);
+        // The game closed: the login is over (live sync's logout snapshot).
+        if status == GameStatus::NotRunning && was != GameStatus::NotRunning {
+            self.live.note_connection_ended();
+            self.live_tick();
+        }
     }
 
     /// Hand a captured frame to the sniffer thread.
@@ -1444,6 +1600,10 @@ impl Monitor {
             tracing::info!(
                 "new game connection; keeping the captured data until it delivers its own"
             );
+            // The login is over: a journal with anything in it ends on a
+            // snapshot of the data as it is, before a new login replaces it.
+            self.live.note_connection_ended();
+            self.live_tick();
         }
         if self.game_watch.note_session_reset() {
             let status = self.game_watch.status();
@@ -1526,10 +1686,16 @@ impl Monitor {
             }
         }
 
+        let full_send = full_send_in(&classified, self.player_data.item_count());
+        let noted = changes_in(&classified);
         let applied = apply_commands(&mut self.player_data, classified);
         if !applied.any() {
             return;
         }
+        if full_send {
+            self.live.note_full_send();
+        }
+        self.live.note_change(noted);
 
         let mut updated = self.app_state.app_state.updated.clone();
         let now = instant_after(self.automation_cycle_started_at);
@@ -1603,6 +1769,7 @@ impl Monitor {
             hub.new_login();
         }
         self.player_data.reset();
+        self.live.note_data_replaced();
         self.app_state.update_captured(DataUpdated::new(), None);
         self.capture_timestamp_ms = None;
         // Without these the signature check can suppress the first export after
@@ -1716,16 +1883,25 @@ impl Monitor {
             };
             file_export = Some(export);
         }
+        // Live sync: in live mode the tracker gets a snapshot only for the
+        // game's full sends (batches carry the rest); otherwise every change,
+        // as before, labelled with why.
+        let live_reason = self
+            .live
+            .automation_reason(live_enabled(&saved_state), now_ms());
         let mut tracker_export = None;
-        if let Some(settings) = &plan.tracker {
-            let Some(export) = self.automation_export(settings, "tracker upload") else {
-                return;
-            };
-            tracker_export = Some(export);
+        if plan.tracker.is_some()
+            && let Some(reason) = live_reason
+        {
+            tracker_export = Some(self.live_snapshot_export(reason));
         }
         // One toast, not one per export: the tracker's export leaves nothing
         // out by choice, so every gap in the file's is in the tracker's too.
-        if let Some((_, report)) = tracker_export.as_ref().or(file_export.as_ref()) {
+        if let Some(report) = tracker_export
+            .as_ref()
+            .map(|(_, report, _)| report)
+            .or(file_export.as_ref().map(|(_, report)| report))
+        {
             self.report_export_gaps(report);
         }
         // Recorded now so a second trigger for the same data cannot start a
@@ -1749,7 +1925,7 @@ impl Monitor {
             }
         }
 
-        if let Some((json, report)) = tracker_export
+        if let Some((json, report, ticket)) = tracker_export
             && let Some(credential) = crate::app::upload_credential(&saved_state)
         {
             let _ = self
@@ -1762,6 +1938,7 @@ impl Monitor {
                     retry_tx: self.automation_retry_tx.clone(),
                     signature,
                 },
+                Some(ticket),
             );
         }
 
@@ -1834,7 +2011,9 @@ impl Monitor {
         credential: UploadCredential,
         json: String,
         report: UploadReport,
+        live_ticket: Option<u64>,
     ) {
+        let live_tx = self.live_tx.clone();
         let client = self.http.clone();
         let auth = self.tracker_auth.clone();
         let ctx = self.ctx.clone();
@@ -1852,11 +2031,22 @@ impl Monitor {
                         upload_to_tracker(&client, &url, &key, json, captured_at).await
                     }
                     UploadCredential::SignedIn { base } => {
-                        auth.upload(&client, &base, json, captured_at, TRACKER_UPLOAD_TIMEOUT)
-                            .await
+                        auth.upload_answer(
+                            &client,
+                            &base,
+                            json,
+                            captured_at,
+                            TRACKER_UPLOAD_TIMEOUT,
+                        )
+                        .await
                     }
                 }
             };
+            if let Some(ticket) = live_ticket {
+                let answer = result.as_ref().ok().map(|body| ImportAnswer::parse(body));
+                let _ = live_tx.send(LiveEvent::Snapshot { ticket, answer });
+            }
+            let result = result.map(|_| ());
             match report {
                 UploadReport::Reply(reply_tx) => {
                     let _ = reply_tx.send(result);
@@ -1874,9 +2064,211 @@ impl Monitor {
                         }
                     };
                 }
+                UploadReport::Quiet => {
+                    if let Err(e) = result {
+                        let _ = toast_tx.send((format!("Tracker upload failed: {e}"), true));
+                    }
+                }
             }
             ctx.request_repaint();
         });
+    }
+}
+
+impl Monitor {
+    /// When live sync next has something to decide, in Unix ms.
+    fn live_next_tick(&self) -> Option<u64> {
+        let state = self.saved_state_rx.borrow();
+        if !uploads_allowed(&self.capture_source) || !crate::app::want_tracker_upload(&state) {
+            return None;
+        }
+        self.live.next_tick_ms(live_enabled(&state), now_ms())
+    }
+
+    /// Let live sync send what is due: a batch, or a snapshot it asked for.
+    fn live_tick(&mut self) {
+        if !uploads_allowed(&self.capture_source) {
+            return;
+        }
+        let state = self.saved_state_rx.borrow().clone();
+        let Some(credential) = crate::app::upload_credential(&state) else {
+            return;
+        };
+        if !state.auto_export_to_tracker {
+            return;
+        }
+        let now = now_ms();
+        let player_data = &self.player_data;
+        let action = self.live.tick(live_enabled(&state), now, || {
+            let (good, _, keyed) = player_data.live_export(now);
+            Some((good, keyed))
+        });
+        match action {
+            Action::Nothing => {}
+            Action::Snapshot(reason) => {
+                let (json, report, ticket) = self.live_snapshot_export(reason);
+                tracing::info!(
+                    reason = reason.as_str(),
+                    "live sync: snapshot: {}",
+                    report.counts()
+                );
+                self.spawn_tracker_upload(credential, json, UploadReport::Quiet, Some(ticket));
+            }
+            Action::Batch(delta) => self.spawn_live_batch(&state, credential, *delta),
+        }
+    }
+
+    /// The tracker export for a snapshot taken for `reason`, labelled with
+    /// its `gi_capture`, and the live sync ticket that follows its answer.
+    fn live_snapshot_export(&mut self, reason: Reason) -> (String, ExportReport, u64) {
+        let (mut good, report, keyed) = self.player_data.live_export(now_ms());
+        tracing::info!(
+            "tracker snapshot ({}): {}",
+            reason.as_str(),
+            report.counts()
+        );
+        good.gi_capture = self.live.capture(reason);
+        let json = serde_json::to_string(&good).unwrap_or_default();
+        let ticket = self.live.snapshot_started(reason, keyed);
+        (json, report, ticket)
+    }
+
+    /// The UI's upload button: its export, labelled `manual`, and the live
+    /// sync ticket that follows its answer (`None` when it is not a GOOD
+    /// export this can read).
+    fn manual_snapshot(&mut self, json: String) -> (String, Option<u64>) {
+        let Ok(mut good) = serde_json::from_str::<crate::good::Good>(&json) else {
+            return (json, None);
+        };
+        let Some(capture) = self.live.capture(Reason::Manual) else {
+            return (json, None);
+        };
+        good.gi_capture = Some(capture);
+        let Ok(labelled) = serde_json::to_string(&good) else {
+            return (json, None);
+        };
+        let keyed = self.player_data.keyed(&good);
+        let ticket = self.live.snapshot_started(Reason::Manual, keyed);
+        (labelled, Some(ticket))
+    }
+
+    /// POST one batch; its answer comes back as a [`LiveEvent::Batch`].
+    fn spawn_live_batch(
+        &self,
+        state: &crate::app::SavedAppState,
+        credential: UploadCredential,
+        delta: crate::delta::GoodDelta,
+    ) {
+        tracing::info!(
+            seq = delta.seq,
+            changes = delta.changes.len(),
+            "live sync: sending a batch"
+        );
+        let client = self.http.clone();
+        let auth = self.tracker_auth.clone();
+        let live_tx = self.live_tx.clone();
+        let ctx = self.ctx.clone();
+        let api = state.tracker_api_url.clone();
+        tokio::spawn(async move {
+            let answer = send_live_batch(&client, &auth, &api, credential, &delta).await;
+            match &answer {
+                BatchAnswer::Stored { .. } | BatchAnswer::Duplicate => {
+                    tracing::info!(seq = delta.seq, ?answer, "live sync: batch stored");
+                }
+                other => {
+                    tracing::warn!(seq = delta.seq, answer = ?other, "live sync: batch not stored")
+                }
+            }
+            let _ = live_tx.send(LiveEvent::Batch(answer));
+            ctx.request_repaint();
+        });
+    }
+
+    fn handle_live_event(&mut self, event: LiveEvent) {
+        let now = now_ms();
+        match event {
+            LiveEvent::Snapshot { ticket, answer } => {
+                if let Some(answer) = &answer {
+                    tracing::info!(
+                        live = answer.base.is_some(),
+                        watching = answer.watching,
+                        "live sync: snapshot stored"
+                    );
+                }
+                self.live.snapshot_answered(ticket, answer, now);
+            }
+            LiveEvent::Batch(answer) => self.live.batch_answered(answer, now),
+        }
+    }
+}
+
+/// Send one batch with an import key, and read the answer.
+pub(crate) async fn send_live_batch_with_key(
+    client: &reqwest::Client,
+    api: &str,
+    key: &str,
+    delta: &crate::delta::GoodDelta,
+) -> BatchAnswer {
+    let response = client
+        .post(changes_url(api))
+        .timeout(LIVE_BATCH_TIMEOUT)
+        .header("x-import-key", key)
+        .json(delta)
+        .send()
+        .await;
+    match response {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            BatchAnswer::of(status, &body)
+        }
+        Err(e) => {
+            tracing::warn!("live sync: batch request failed: {}", e.without_url());
+            BatchAnswer::Retry
+        }
+    }
+}
+
+/// Send one batch with the upload credential, and read the answer.
+async fn send_live_batch(
+    client: &reqwest::Client,
+    auth: &TrackerAuth,
+    api: &str,
+    credential: UploadCredential,
+    delta: &crate::delta::GoodDelta,
+) -> BatchAnswer {
+    let response = match credential {
+        UploadCredential::ImportKey { key, .. } => {
+            return send_live_batch_with_key(client, api, &key, delta).await;
+        }
+        UploadCredential::SignedIn { base } => auth
+            .send_signed_in(client, &base, |token| {
+                client
+                    .post(changes_url(&base))
+                    .timeout(LIVE_BATCH_TIMEOUT)
+                    .bearer_auth(token)
+                    .json(delta)
+            })
+            .await
+            .map_err(|error| match error {
+                crate::signin::AuthError::Http { status, body } => {
+                    BatchAnswer::of(status.as_u16(), &body)
+                }
+                crate::signin::AuthError::SignedOut => BatchAnswer::Refused,
+                crate::signin::AuthError::Network(_) => BatchAnswer::Retry,
+                other => {
+                    tracing::warn!("live sync: batch not sent: {other}");
+                    BatchAnswer::Retry
+                }
+            }),
+    };
+    match response {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            BatchAnswer::of(status, &body)
+        }
+        Err(answer) => answer,
     }
 }
 
@@ -1942,13 +2334,13 @@ pub(crate) fn import_url(base_url: &str) -> String {
 /// The failure string is `HTTP {status} - {body}`, and that shape is load
 /// bearing: `app.rs::tracker_error_status` parses the status back out of it to
 /// notice a 401/403 and re-verify the key.
-async fn upload_to_tracker(
+pub(crate) async fn upload_to_tracker(
     client: &reqwest::Client,
     url: &str,
     key: &str,
     json: String,
     captured_at_ms: Option<i64>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<String, String> {
     let form = snapshot_form(json, captured_at_ms)?;
 
     let response = client
@@ -1969,7 +2361,7 @@ async fn upload_to_tracker(
     let body = response.text().await.unwrap_or_default();
     if status.is_success() {
         tracing::info!("Successfully uploaded data to tracker");
-        Ok(())
+        Ok(body)
     } else {
         tracing::error!("Tracker upload failed ({}): {}", status, body);
         Err(format!("HTTP {} - {}", status, body))
@@ -2753,6 +3145,33 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn routine_parts_are_applied_without_stamping_a_data_class() {
+        let mut data = PlayerData::new(AnimeGameData::new());
+        let applied = apply_commands(
+            &mut data,
+            vec![
+                (
+                    1,
+                    CommandMatch::Commissions(auto_artifactarium::DailyCommissions {
+                        total: 4,
+                        finished: Some(2),
+                    }),
+                ),
+                (2, CommandMatch::Welkin(30)),
+            ],
+        );
+        assert_eq!(
+            applied,
+            AppliedData {
+                routine: true,
+                ..AppliedData::default()
+            }
+        );
+        assert!(applied.any());
+        assert!(!data.is_empty());
+    }
+
+    #[test]
     fn a_failed_reconnect_leaves_the_snapshot_exportable() {
         // End to end over the monitor's own pieces: a captured inventory, a
         // reconnect, and only dispatch-key traffic after it.
@@ -2838,6 +3257,99 @@ pub(crate) mod tests {
 
         assert!(!release_signature(&mut last, stale));
         assert_eq!(last, Some(newer));
+    }
+
+    #[test]
+    fn a_live_batch_goes_to_the_changes_route_and_its_answer_is_read() {
+        use crate::wish_history::test_server::{Reply, TestServer};
+
+        let replies = std::sync::Arc::new(std::sync::Mutex::new(vec![
+            Reply::json(500, ""),
+            Reply::json(
+                409,
+                r#"{"error":{"code":"resync","message":"Send a snapshot first"}}"#,
+            ),
+            Reply::json(
+                200,
+                r#"{"ok":true,"seq":1,"collapse":false,"watching":true}"#,
+            ),
+        ]));
+        let server = {
+            let replies = replies.clone();
+            TestServer::start(move |_| replies.lock().unwrap().pop().unwrap())
+        };
+        let auth = TrackerAuth::new(
+            &server.base,
+            std::sync::Arc::new(crate::signin::MemoryStore::default()),
+            "TEST-PC".to_owned(),
+            std::sync::Arc::new(|_| {}),
+            std::sync::Arc::new(|| {}),
+        );
+        let client = crate::http_client_builder().build().unwrap();
+        let mut delta = crate::delta::GoodDelta::new(812_345_678, "01J9ZK5Q8W3E7R2T", 1, "k1", 1);
+        delta.changes.push(crate::delta::Change::Set(
+            vec!["materials".into(), "Mora".into()],
+            serde_json::json!(5),
+        ));
+        let key = || UploadCredential::ImportKey {
+            url: import_url(&server.base),
+            key: "gdt_uk_test".to_owned(),
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let answers: Vec<BatchAnswer> = (0..3)
+            .map(|_| runtime.block_on(send_live_batch(&client, &auth, &server.base, key(), &delta)))
+            .collect();
+        assert_eq!(
+            answers,
+            [
+                BatchAnswer::Stored {
+                    collapse: false,
+                    watching: true
+                },
+                BatchAnswer::Resync,
+                BatchAnswer::Retry,
+            ]
+        );
+        let requests = server.requests();
+        assert_eq!(requests[0].method, "POST");
+        assert!(
+            requests[0].path.ends_with("/irminsul/changes"),
+            "{}",
+            requests[0].path
+        );
+        assert_eq!(requests[0].header("x-import-key"), Some("gdt_uk_test"));
+        let sent: crate::delta::GoodDelta = serde_json::from_str(&requests[0].body).unwrap();
+        assert_eq!(sent, delta);
+        // Nothing listens here: a batch that cannot be sent is kept.
+        let nowhere = UploadCredential::ImportKey {
+            url: String::new(),
+            key: "gdt_uk_test".to_owned(),
+        };
+        assert_eq!(
+            runtime.block_on(send_live_batch(
+                &client,
+                &auth,
+                "http://127.0.0.1:9",
+                nowhere,
+                &delta
+            )),
+            BatchAnswer::Retry
+        );
+    }
+
+    #[test]
+    fn live_sync_needs_its_switch_and_automated_uploads() {
+        let mut state = automation_state();
+        assert!(live_enabled(&state));
+        state.live_sync = false;
+        assert!(!live_enabled(&state));
+        state.live_sync = true;
+        state.auto_export_to_tracker = false;
+        assert!(!live_enabled(&state));
+        assert_eq!(
+            changes_url("https://tracker.invalid/api/"),
+            "https://tracker.invalid/api/irminsul/changes"
+        );
     }
 
     #[test]

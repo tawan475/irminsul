@@ -37,7 +37,7 @@ mod run;
 mod run_tests;
 mod sync;
 #[cfg(test)]
-mod test_server;
+pub(crate) mod test_server;
 mod tracker;
 
 use std::sync::Arc;

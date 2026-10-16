@@ -28,6 +28,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -38,6 +39,7 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::good::Good;
+use crate::live::{Action, BatchAnswer, ImportAnswer, LiveSync, Reason};
 use crate::monitor::{
     self, AppliedData, DataReplacement, DataVerdict, KeyReport, SnifferEvent, SnifferStats,
 };
@@ -60,6 +62,40 @@ pub fn run(recording: &Path, out: &Path) -> i32 {
         }
     };
     tracing::info!(log = %log_path.display(), "replay finished");
+    code
+}
+
+/// `--replay-journal`: replay `recording` through live sync's sender, with
+/// the recording's own clock and a stand-in tracker that stores everything,
+/// and write what would have been sent to `out` (NDJSON): each snapshot as
+/// uploaded, each batch, and the whole state just before each snapshot and
+/// at the end. The tracker's `live-replay.test.ts` checks that every
+/// snapshot with the batches after it gives each state (plan section 6.4).
+/// Exit code as for [`run`].
+pub fn run_journal(recording: &Path, out: &Path) -> i32 {
+    run_journal_with(recording, out, |_| Ok(Box::new(StoreEverything::default())))
+}
+
+/// [`run_journal`] against the tracker `tracker` makes (once tracing is up).
+pub(crate) fn run_journal_with(
+    recording: &Path,
+    out: &Path,
+    tracker: impl FnOnce(&Path) -> Result<Box<dyn StandInTracker>>,
+) -> i32 {
+    let log_path = log_path_for(out);
+    init_tracing(&log_path);
+    crate::crash::install_panic_hook();
+
+    let code = match tracker(recording)
+        .and_then(|tracker| replay_journal_to_file(recording, out, tracker))
+    {
+        Ok(()) => 0,
+        Err(e) => {
+            tracing::error!("journal replay failed: {e:#}");
+            1
+        }
+    };
+    tracing::info!(log = %log_path.display(), "journal replay finished");
     code
 }
 
@@ -150,6 +186,227 @@ fn replay_to_file(recording_path: &Path, out: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Replay `recording_path` through live sync and write the journal to `out`.
+fn replay_journal_to_file(
+    recording_path: &Path,
+    out: &Path,
+    tracker: Box<dyn StandInTracker>,
+) -> Result<()> {
+    tracing::info!(
+        recording = %recording_path.display(),
+        out = %out.display(),
+        "replaying a recording through live sync: nothing is uploaded, and no app \
+         settings or data are read or written"
+    );
+    if is_same_file(recording_path, out) || is_same_file(recording_path, &log_path_for(out)) {
+        bail!("the output would overwrite the recording itself");
+    }
+    if let Some(dir) = out.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("cannot create the directory {}", dir.display()))?;
+    }
+    let file = File::create(out).with_context(|| format!("cannot write {}", out.display()))?;
+
+    let mut recording = Recording::open(recording_path)?;
+    let player_data = PlayerData::new(monitor::load_game_data()?)
+        .with_game_data_sha(monitor::embedded_game_data_sha());
+    let sniffer = GameSniffer::new().set_initial_keys(monitor::load_keys()?);
+    let mut replay = Replay::new(sniffer, player_data);
+    replay.journal = Some(JournalSim::new(BufWriter::new(file), tracker));
+
+    loop {
+        match recording.next_frame() {
+            Ok(Some(frame)) => {
+                let at = frame.timestamp_ns;
+                replay.feed(frame);
+                if let Some(ns) = at {
+                    replay.advance_journal(ns / 1_000_000)?;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                tracing::error!(
+                    frames = replay.frames,
+                    "stopped reading the recording: {e:#}; keeping what came before"
+                );
+                break;
+            }
+        }
+    }
+    replay.finish_journal()
+}
+
+/// What a journal replay sends its snapshots and batches to.
+pub(crate) trait StandInTracker {
+    /// A snapshot upload of `good`: `None` when it failed.
+    fn snapshot(&mut self, good: &Good) -> Option<ImportAnswer>;
+    fn batch(&mut self, delta: &crate::delta::GoodDelta) -> BatchAnswer;
+}
+
+/// The stand-in `--replay-journal` uses: every snapshot is stored and gets
+/// a journal, every batch is stored.
+#[derive(Default)]
+struct StoreEverything {
+    bases: u64,
+}
+
+impl StandInTracker for StoreEverything {
+    fn snapshot(&mut self, _: &Good) -> Option<ImportAnswer> {
+        self.bases += 1;
+        Some(ImportAnswer {
+            base: Some(format!("replay{}", self.bases)),
+            watching: false,
+        })
+    }
+
+    fn batch(&mut self, _: &crate::delta::GoodDelta) -> BatchAnswer {
+        BatchAnswer::Stored {
+            collapse: false,
+            watching: false,
+        }
+    }
+}
+
+/// Live sync's sender driven by a replay's clock, against a stand-in tracker.
+struct JournalSim {
+    live: LiveSync,
+    tracker: Box<dyn StandInTracker>,
+    out: BufWriter<File>,
+    /// When the debounced automation export would run (5 s after data).
+    automation_at: Option<u64>,
+    /// The recording's clock, from the newest frame.
+    now_ms: u64,
+    snapshots: u64,
+    batches: u64,
+    changes: u64,
+    states: u64,
+    error: Option<anyhow::Error>,
+}
+
+/// How long the automation waits after the last data (monitor.rs).
+const JOURNAL_DEBOUNCE_MS: u64 = 5_000;
+
+impl JournalSim {
+    fn new(out: BufWriter<File>, tracker: Box<dyn StandInTracker>) -> Self {
+        Self {
+            live: LiveSync::new(),
+            tracker,
+            out,
+            automation_at: None,
+            now_ms: 0,
+            snapshots: 0,
+            batches: 0,
+            changes: 0,
+            states: 0,
+            error: None,
+        }
+    }
+
+    fn line(&mut self, value: &serde_json::Value) {
+        if self.error.is_some() {
+            return;
+        }
+        let written = serde_json::to_writer(&mut self.out, value)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| self.out.write_all(b"\n").map_err(anyhow::Error::from));
+        if let Err(e) = written {
+            self.error = Some(e);
+        }
+    }
+
+    fn batch(&mut self, delta: &crate::delta::GoodDelta) {
+        self.batches += 1;
+        self.changes += delta.changes.len() as u64;
+        tracing::info!(
+            seq = delta.seq,
+            changes = delta.changes.len(),
+            at = %when(Some(delta.at.saturating_mul(1_000_000))),
+            "batch"
+        );
+        self.line(&serde_json::json!({ "type": "batch", "delta": delta }));
+    }
+
+    /// Flush what is unsent and write the whole state, when a journal is
+    /// open (else there is nothing to check it against).
+    fn checkpoint(&mut self, player_data: &PlayerData) {
+        let now = self.now_ms;
+        if !self.live.is_live(now) {
+            return;
+        }
+        let (good, _, keyed) = player_data.live_export(now);
+        if let Some(delta) = self.live.flush(now, &good, keyed) {
+            self.batch(&delta);
+        }
+        self.states += 1;
+        self.line(
+            &serde_json::json!({ "type": "state", "good": crate::delta::as_uploaded(&good) }),
+        );
+    }
+
+    fn snapshot(&mut self, reason: Reason, player_data: &PlayerData) {
+        self.checkpoint(player_data);
+        let now = self.now_ms;
+        let (mut good, _, keyed) = player_data.live_export(now);
+        good.gi_capture = self.live.capture(reason);
+        self.snapshots += 1;
+        tracing::info!(
+            reason = reason.as_str(),
+            world = good.gi_capture.as_ref().map(|capture| capture.world),
+            at = %when(Some(now.saturating_mul(1_000_000))),
+            "snapshot"
+        );
+        let ticket = self.live.snapshot_started(reason, keyed);
+        let answer = self.tracker.snapshot(&good);
+        // The capture beside the account, not in it: `good` is compared
+        // with the states, which carry no capture of their own.
+        let capture = good.gi_capture.take();
+        self.line(&serde_json::json!({
+            "type": "snapshot",
+            "capture": capture,
+            "good": crate::delta::as_uploaded(&good),
+        }));
+        self.live.snapshot_answered(ticket, answer, now);
+    }
+
+    /// Run the sender up to `now_ms`.
+    fn advance(&mut self, now_ms: u64, player_data: &PlayerData) {
+        self.now_ms = self.now_ms.max(now_ms);
+        let now = self.now_ms;
+        if self.automation_at.is_some_and(|at| at <= now) {
+            self.automation_at = None;
+            if let Some(reason) = self.live.automation_reason(true, now) {
+                self.snapshot(reason, player_data);
+            }
+        }
+        // A handful at most per frame: each step sends or settles something.
+        for _ in 0..16 {
+            if !self
+                .live
+                .next_tick_ms(true, now)
+                .is_some_and(|at| at <= now)
+            {
+                break;
+            }
+            match self.live.tick(true, now, || {
+                let (good, _, keyed) = player_data.live_export(now);
+                Some((good, keyed))
+            }) {
+                Action::Nothing => break,
+                Action::Snapshot(reason) => self.snapshot(reason, player_data),
+                Action::Batch(delta) => {
+                    let answer = self.tracker.batch(&delta);
+                    if matches!(answer, BatchAnswer::Stored { .. } | BatchAnswer::Duplicate) {
+                        self.batch(&delta);
+                    } else {
+                        tracing::warn!(seq = delta.seq, ?answer, "batch not stored");
+                    }
+                    self.live.batch_answered(answer, now);
+                }
+            }
+        }
+    }
+}
+
 /// Whether two paths name one existing file.
 fn is_same_file(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
@@ -198,6 +455,8 @@ struct Replay {
     captured: AppliedData,
     /// When the newest data in `player_data` was captured.
     last_data_ns: Option<u64>,
+    /// `--replay-journal`'s sender, when this is one.
+    journal: Option<JournalSim>,
 }
 
 impl Replay {
@@ -218,6 +477,7 @@ impl Replay {
             data_from: None,
             captured: AppliedData::default(),
             last_data_ns: None,
+            journal: None,
         }
     }
 
@@ -254,6 +514,12 @@ impl Replay {
         match event {
             SnifferEvent::SessionReset => {
                 self.close_connection();
+                if let Some(journal) = &mut self.journal {
+                    journal.live.note_connection_ended();
+                    if let Some(ns) = at {
+                        journal.advance(ns / 1_000_000, &self.player_data);
+                    }
+                }
                 let news = self.replacement.connection_reset();
                 let number = self.connections.len() + 1;
                 self.connections.push(Connection {
@@ -407,6 +673,9 @@ impl Replay {
                 self.player_data.reset();
                 self.captured = AppliedData::default();
                 self.data_from = None;
+                if let Some(journal) = &mut self.journal {
+                    journal.live.note_data_replaced();
+                }
             }
             DataVerdict::Hold => {
                 tracing::debug!(
@@ -418,7 +687,21 @@ impl Replay {
             }
         }
 
+        let held = self.player_data.item_count();
+        let full_send = monitor::full_send_in(&classified, held);
+        let noted = monitor::changes_in(&classified);
         let applied = monitor::apply_commands(&mut self.player_data, classified);
+        if applied.any()
+            && let Some(journal) = &mut self.journal
+        {
+            if full_send {
+                journal.live.note_full_send();
+            }
+            journal.live.note_change(noted);
+            if let Some(ns) = at {
+                journal.automation_at = Some(ns / 1_000_000 + JOURNAL_DEBOUNCE_MS);
+            }
+        }
         if applied.any() {
             self.captured = self.captured.union(applied);
             let connection = &mut self.connections[index];
@@ -529,6 +812,48 @@ impl Replay {
         Ok(good)
     }
 
+    /// Run the sender for what a frame brought.
+    fn advance_journal(&mut self, now_ms: u64) -> Result<()> {
+        if let Some(journal) = &mut self.journal {
+            journal.advance(now_ms, &self.player_data);
+            if let Some(e) = journal.error.take() {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// End of a `--replay-journal`: the last debounced snapshot, the final
+    /// state, and the counts.
+    fn finish_journal(&mut self) -> Result<()> {
+        self.close_connection();
+        let Some(mut journal) = self.journal.take() else {
+            bail!("not a journal replay");
+        };
+        if !self.captured.any() {
+            bail!("{}", self.nothing_decoded());
+        }
+        // Whatever the automation was waiting on, and the sender after it.
+        if let Some(at) = journal.automation_at {
+            journal.advance(at, &self.player_data);
+        }
+        let later = journal.now_ms + crate::live::LONE_CHANGE_MS;
+        journal.advance(later, &self.player_data);
+        journal.checkpoint(&self.player_data);
+        journal.out.flush()?;
+        if let Some(e) = journal.error.take() {
+            return Err(e);
+        }
+        tracing::info!(
+            snapshots = journal.snapshots,
+            batches = journal.batches,
+            changes = journal.changes,
+            states = journal.states,
+            "journal replay summary"
+        );
+        Ok(())
+    }
+
     /// Why a recording yielded no data, as specifically as it can be told.
     fn nothing_decoded(&self) -> String {
         if self.frames == 0 {
@@ -592,6 +917,7 @@ fn describe(applied: AppliedData) -> String {
         (applied.achievements, "achievements"),
         (applied.properties, "player properties"),
         (applied.anecdotes, "anecdotes"),
+        (applied.routine, "planner routine"),
     ]
     .into_iter()
     .filter_map(|(present, name)| present.then_some(name))

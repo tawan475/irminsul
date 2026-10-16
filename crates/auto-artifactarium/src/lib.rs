@@ -81,6 +81,13 @@ pub use crate::gacha::{
 use crate::r#gen::protos::{AvatarInfo, Item, PacketHead, PropValue, Unk, prop_value};
 use crate::kcp::{KcpSniffer, SegmentHead, segment_head};
 use crate::oodle::TcpDecoder;
+pub use crate::routine::{
+    ABYSS_FLOOR_IDS, ABYSS_STARS_PER_FLOOR, AbyssPeriod, DAILY_TASK_IDS, DailyCommissions,
+    EXPEDITION_HOURS, EXPEDITION_IDS, Expedition, HomeResources, MAX_ABYSS_FLOORS, MAX_DAILY_TASKS,
+    MAX_EXPEDITION_STATE, MAX_REALM_CURRENCY, MAX_WELKIN_DAYS, matches_avatar_expedition_notify,
+    matches_daily_task_notify, matches_home_resource_notify, matches_recharge_data_notify,
+    matches_tower_all_data_rsp,
+};
 pub use crate::unk_util::{
     Achievement, AchievementMatchError, matches_achievement_all_data_notify,
     matches_avatars_all_data_notify, matches_get_player_token_rsp, matches_items_all_data_notify,
@@ -103,6 +110,7 @@ mod cs_rand;
 mod gacha;
 mod kcp;
 pub mod oodle;
+mod routine;
 #[cfg(test)]
 mod test_support;
 mod unk_util;
@@ -267,6 +275,11 @@ static AUTHKEY_RSP_LOGGED: AtomicBool = AtomicBool::new(false);
 static GACHA_RSP_LOGGED: AtomicBool = AtomicBool::new(false);
 static GACHA_INFO_RSP_LOGGED: AtomicBool = AtomicBool::new(false);
 static CLIENT_VERSION_LOGGED: AtomicBool = AtomicBool::new(false);
+static DAILY_TASK_NOTIFY_LOGGED: AtomicBool = AtomicBool::new(false);
+static TOWER_RSP_LOGGED: AtomicBool = AtomicBool::new(false);
+static EXPEDITION_NOTIFY_LOGGED: AtomicBool = AtomicBool::new(false);
+static HOME_RESOURCE_NOTIFY_LOGGED: AtomicBool = AtomicBool::new(false);
+static RECHARGE_NOTIFY_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// `true` the first time it is called for a given flag.
 fn first_time(flag: &AtomicBool) -> bool {
@@ -1454,6 +1467,10 @@ pub enum CommandMatch {
     /// [`matches_item_del_packet`] for why the caller must intersect them with
     /// an inventory it actually holds.
     DeletedItems(Vec<u64>),
+    /// A few items the game says changed (`StoreItemChangeNotify`): see
+    /// [`matches_item_change_packet`]. Candidates too: the caller keeps only
+    /// the captured account's (guid top half = its UID).
+    ChangedItems(Vec<Item>),
     /// A web view key (`GetAuthkeyRsp`): see [`matches_authkey_packet`]. Not
     /// account data; its `Debug` never prints the key.
     AuthKey(GachaAuthKey),
@@ -1466,6 +1483,17 @@ pub enum CommandMatch {
     /// The client's full version string (`GetPlayerTokenReq`): see
     /// [`matches_client_version_packet`]. Not account data.
     ClientVersion(String),
+    /// Today's Daily Commissions: see [`matches_daily_task_packet`].
+    Commissions(DailyCommissions),
+    /// The Spiral Abyss period now running: see [`matches_tower_packet`].
+    Abyss(AbyssPeriod),
+    /// Every character's expedition: see [`matches_expedition_packet`].
+    Expeditions(Vec<Expedition>),
+    /// The Serenitea Pot's realm currency: see [`matches_home_resource_packet`].
+    HomeResources(HomeResources),
+    /// The Blessing of the Welkin Moon's days left: see
+    /// [`matches_recharge_packet`].
+    Welkin(u32),
 }
 
 impl CommandMatch {
@@ -1478,10 +1506,16 @@ impl CommandMatch {
             Self::Achievements(_) => "achievements",
             Self::Anecdotes(_) => "anecdotes",
             Self::DeletedItems(_) => "deleted items",
+            Self::ChangedItems(_) => "changed items",
             Self::AuthKey(_) => "auth key",
             Self::Wish(_) => "wish",
             Self::GachaInfo(_) => "banner list",
             Self::ClientVersion(_) => "client version",
+            Self::Commissions(_) => "commissions",
+            Self::Abyss(_) => "abyss",
+            Self::Expeditions(_) => "expeditions",
+            Self::HomeResources(_) => "realm currency",
+            Self::Welkin(_) => "welkin",
         }
     }
 
@@ -1518,6 +1552,24 @@ pub fn classify_command(game_command: &GameCommand) -> Option<CommandMatch> {
     }
     if let Some(anecdotes) = matches_anecdote_packet(game_command) {
         claims.push(CommandMatch::Anecdotes(anecdotes));
+    }
+    if let Some(commissions) = matches_daily_task_packet(game_command) {
+        claims.push(CommandMatch::Commissions(commissions));
+    }
+    if let Some(abyss) = matches_tower_packet(game_command) {
+        claims.push(CommandMatch::Abyss(abyss));
+    }
+    if let Some(expeditions) = matches_expedition_packet(game_command) {
+        claims.push(CommandMatch::Expeditions(expeditions));
+    }
+    if let Some(home) = matches_home_resource_packet(game_command) {
+        claims.push(CommandMatch::HomeResources(home));
+    }
+    if let Some(days) = matches_recharge_packet(game_command) {
+        claims.push(CommandMatch::Welkin(days));
+    }
+    if let Some(items) = matches_item_change_packet(game_command) {
+        claims.push(CommandMatch::ChangedItems(items));
     }
     if let Some(key) = matches_authkey_packet(game_command) {
         claims.push(CommandMatch::AuthKey(key));
@@ -1595,6 +1647,99 @@ pub fn matches_anecdote_packet(game_command: &GameCommand) -> Option<AnecdoteDat
         );
     }
     Some(data)
+}
+
+/// Recover today's Daily Commissions from a `WorldOwnerDailyTaskNotify`, or
+/// `None` if this is not one. Recognised by shape (see
+/// [`matches_daily_task_notify`]); the first match logs the command id.
+pub fn matches_daily_task_packet(game_command: &GameCommand) -> Option<DailyCommissions> {
+    let found = matches_daily_task_notify(&game_command.proto_data)?;
+    if first_time(&DAILY_TASK_NOTIFY_LOGGED) {
+        info!(
+            command_id = game_command.command_id,
+            total = found.total,
+            finished = ?found.finished,
+            "discovered WorldOwnerDailyTaskNotify"
+        );
+    } else {
+        debug!(command_id = game_command.command_id, "commission packet");
+    }
+    Some(found)
+}
+
+/// Recover the Spiral Abyss period from a `TowerAllDataRsp`, or `None` if
+/// this is not one. Recognised by shape (see [`matches_tower_all_data_rsp`]);
+/// the first match logs the command id.
+pub fn matches_tower_packet(game_command: &GameCommand) -> Option<AbyssPeriod> {
+    let found = matches_tower_all_data_rsp(&game_command.proto_data)?;
+    if first_time(&TOWER_RSP_LOGGED) {
+        info!(
+            command_id = game_command.command_id,
+            stars = found.stars,
+            max_stars = found.max_stars,
+            "discovered TowerAllDataRsp"
+        );
+    } else {
+        debug!(command_id = game_command.command_id, "abyss packet");
+    }
+    Some(found)
+}
+
+/// Recover every character's expedition from an `AvatarExpeditionDataNotify`,
+/// or `None` if this is not one. Recognised by shape (see
+/// [`matches_avatar_expedition_notify`]); the first match logs the command id.
+pub fn matches_expedition_packet(game_command: &GameCommand) -> Option<Vec<Expedition>> {
+    let found = matches_avatar_expedition_notify(&game_command.proto_data)?;
+    let out = found.iter().filter(|e| e.is_out()).count();
+    if first_time(&EXPEDITION_NOTIFY_LOGGED) {
+        info!(
+            command_id = game_command.command_id,
+            entries = found.len(),
+            out,
+            "discovered AvatarExpeditionDataNotify"
+        );
+    } else {
+        debug!(
+            command_id = game_command.command_id,
+            out, "expedition packet"
+        );
+    }
+    Some(found)
+}
+
+/// Recover the Serenitea Pot's realm currency from a `HomeResourceNotify`, or
+/// `None` if this is not one. Recognised by shape (see
+/// [`matches_home_resource_notify`]); the first match logs the command id.
+pub fn matches_home_resource_packet(game_command: &GameCommand) -> Option<HomeResources> {
+    let found = matches_home_resource_notify(&game_command.proto_data)?;
+    if first_time(&HOME_RESOURCE_NOTIFY_LOGGED) {
+        info!(
+            command_id = game_command.command_id,
+            "discovered HomeResourceNotify"
+        );
+    } else {
+        debug!(
+            command_id = game_command.command_id,
+            "realm currency packet"
+        );
+    }
+    Some(found)
+}
+
+/// Recover the Welkin Moon's days left from a `PlayerRechargeDataNotify`, or
+/// `None` if this is not one. Recognised by shape (see
+/// [`matches_recharge_data_notify`]); the first match logs the command id.
+pub fn matches_recharge_packet(game_command: &GameCommand) -> Option<u32> {
+    let found = matches_recharge_data_notify(&game_command.proto_data)?;
+    if first_time(&RECHARGE_NOTIFY_LOGGED) {
+        info!(
+            command_id = game_command.command_id,
+            "discovered PlayerRechargeDataNotify"
+        );
+    } else {
+        debug!(command_id = game_command.command_id, "recharge packet");
+    }
+    Some(found)
 }
 
 /// Recover a web view key from a `GetAuthkeyRsp`, or `None` if this is not one.
@@ -1730,6 +1875,23 @@ pub fn matches_item_packet(game_command: &GameCommand) -> Option<Vec<Item>> {
             "item packet"
         );
     }
+    Some(items)
+}
+
+/// Recover the items of a `StoreItemChangeNotify` (fewer than ten; a longer
+/// list is [`matches_item_packet`]'s), or `None` if this is not one.
+///
+/// Found by shape (see `unk_util::discover_changed_items`): one list of
+/// entries that are all real inventory items of one account, beside a few
+/// scalars. Observed command id: 26018 in 7.1 (documentation only).
+pub fn matches_item_change_packet(game_command: &GameCommand) -> Option<Vec<Item>> {
+    let (field, items) = unk_util::discover_changed_items(&game_command.proto_data)?;
+    debug!(
+        command_id = game_command.command_id,
+        field,
+        count = items.len(),
+        "item change packet"
+    );
     Some(items)
 }
 
@@ -4269,6 +4431,103 @@ mod tests {
     #[test]
     fn a_command_that_matches_nothing_is_classified_as_nothing() {
         assert!(classify_command(&command(field_varint(1, 1))).is_none());
+    }
+
+    // -- item change matcher ---------------------------------------------------
+
+    /// Where 7.1 put `StoreItemChangeNotify`'s fields (list, store type, reason).
+    const CHANGE_LIST_TAG: u32 = 12;
+    const CHANGE_STORE_TYPE_TAG: u32 = 1;
+    const CHANGE_REASON_TAG: u32 = 4;
+
+    /// A weapon `Item`: an equip arm holding a weapon.
+    fn weapon_entry(item_id: u32, guid: u64) -> Vec<u8> {
+        let mut out = field_varint(1, u64::from(item_id));
+        out.extend(field_varint(2, guid));
+        let weapon = field_varint(1, 90);
+        out.extend(field_bytes(6, &field_bytes(2, &weapon)));
+        out
+    }
+
+    fn change_packet(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut out: Vec<u8> = entries
+            .iter()
+            .flat_map(|entry| field_bytes(CHANGE_LIST_TAG, entry))
+            .collect();
+        out.extend(field_varint(CHANGE_STORE_TYPE_TAG, 1));
+        out.extend(field_varint(CHANGE_REASON_TAG, 0));
+        out
+    }
+
+    #[test]
+    fn a_store_item_change_notify_yields_its_items() {
+        let command = command(change_packet(&[
+            item_entry(104_013, guid(TEST_UID, 77)),
+            weapon_entry(11_509, guid(TEST_UID, 78)),
+        ]));
+        let items = matches_item_change_packet(&command).expect("match");
+        assert_eq!(
+            items.iter().map(|item| item.item_id).collect::<Vec<_>>(),
+            [104_013, 11_509]
+        );
+        assert!(matches!(
+            classify_command(&command),
+            Some(CommandMatch::ChangedItems(_))
+        ));
+    }
+
+    #[test]
+    fn ten_changed_items_are_the_inventory_matchers() {
+        // Ten or more is the full-send matcher's list (it upserts the same way),
+        // so the two never both claim one command.
+        let entries: Vec<Vec<u8>> = (0..10)
+            .map(|i| item_entry(104_000 + i, guid(TEST_UID, u64::from(i) + 1)))
+            .collect();
+        let command = command(change_packet(&entries));
+        assert!(matches_item_change_packet(&command).is_none());
+        assert!(matches!(
+            classify_command(&command),
+            Some(CommandMatch::Items(_))
+        ));
+    }
+
+    #[test]
+    fn a_change_list_is_held_to_every_entry_being_an_item() {
+        // One entry without an account guid (a scene object's id pair).
+        let mut stray = field_varint(1, 3);
+        stray.extend(field_varint(2, 12));
+        stray.extend(field_bytes(6, &field_bytes(2, &field_varint(1, 1))));
+        assert!(
+            matches_item_change_packet(&command(change_packet(&[
+                item_entry(104_013, guid(TEST_UID, 1)),
+                stray,
+            ])))
+            .is_none()
+        );
+        // Two accounts' guids.
+        assert!(
+            matches_item_change_packet(&command(change_packet(&[
+                item_entry(104_013, guid(TEST_UID, 1)),
+                item_entry(104_002, guid(TEST_UID + 1, 2)),
+            ])))
+            .is_none()
+        );
+        // A second list beside it.
+        let mut two_lists = change_packet(&[item_entry(104_013, guid(TEST_UID, 1))]);
+        two_lists.extend(field_bytes(9, &item_entry(104_002, guid(TEST_UID, 2))));
+        assert!(matches_item_change_packet(&command(two_lists)).is_none());
+        // A fixed-width field.
+        let mut fixed = change_packet(&[item_entry(104_013, guid(TEST_UID, 1))]);
+        fixed.extend(field_fixed32(7, 1));
+        assert!(matches_item_change_packet(&command(fixed)).is_none());
+        // An equip arm that is neither weapon nor artifact.
+        let mut empty_equip = field_varint(1, 11_509);
+        empty_equip.extend(field_varint(2, guid(TEST_UID, 3)));
+        empty_equip.extend(field_bytes(6, &field_varint(3, 1)));
+        assert!(matches_item_change_packet(&command(change_packet(&[empty_equip]))).is_none());
+        // A delete notify is not a change.
+        let delete = command(delete_packet(&[guid(TEST_UID, 1), guid(TEST_UID, 2)]));
+        assert!(matches_item_change_packet(&delete).is_none());
     }
 
     // -- item delete matcher ---------------------------------------------------

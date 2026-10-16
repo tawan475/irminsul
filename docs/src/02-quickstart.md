@@ -105,6 +105,13 @@ tracker at <https://genshin-tracker.475.dev>:
 2. With a capture completed, click the cloud upload icon to send the current
    data. Tick "Auto export to tracker" in the same section to upload every
    completed capture automatically.
+3. **Live sync** (under it, on by default) keeps the tracker current while you
+   play: the game sends your whole account when you log in and at every world
+   change, and each of those is a snapshot as before; in between, Irminsul
+   sends only what changed, every 15 seconds to 2 minutes while something
+   changes and nothing while nothing does. The tracker decides per account
+   whether it takes them; untick it to upload the whole account after every
+   change instead.
 
 Where uploads go is set on the tracker, not in Irminsul: **Auto (by UID)**
 (the default) files each capture under the account with that capture's UID and

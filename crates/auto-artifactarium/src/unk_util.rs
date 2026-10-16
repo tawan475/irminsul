@@ -866,6 +866,67 @@ fn plausible_avatar(avatar: &AvatarInfo, _bytes: &[u8]) -> bool {
         && avatar.prop_map.contains_key(&PROP_LEVEL)
 }
 
+/// Most top-level field numbers a [`discover_changed_items`] message may have:
+/// the item list, `store_type` and `reason` in 7.1, with room for one more.
+const MAX_ITEM_CHANGE_FIELDS: usize = 4;
+
+/// A few items the game says changed (`StoreItemChangeNotify`: a material's
+/// new count, a levelled artifact, a new weapon), with the number of the field
+/// they were on; `None` if `data` is not that shape.
+///
+/// The bag's full send ([`discover_items`]) needs [`MIN_ITEM_ENTRIES`]
+/// believable entries, so these small notifies never pass for it -- and the
+/// shape here is held tighter than the full send's, because a handful of
+/// entries is little evidence:
+/// - exactly one top-level field is length-delimited (the list), every other
+///   one a varint, at most [`MAX_ITEM_CHANGE_FIELDS`] numbers in all;
+/// - the list has 1 to `MIN_ITEM_ENTRIES - 1` entries, and *every* one of them
+///   decodes as a [`plausible_item`] (an account's guid, a
+///   material/equip/furniture arm, not an avatar), an equip arm holding a
+///   weapon or an artifact;
+/// - every guid carries the same top half (one account's).
+///
+/// A list of ten or more is the full-send matcher's (it upserts the same way).
+/// The caller must still check the guids are the captured account's (the top
+/// half is its UID): see irminsul's `PlayerData::change_items`.
+pub(crate) fn discover_changed_items(data: &[u8]) -> Option<(u32, Vec<Item>)> {
+    let msg = Unk::parse_from_bytes(data).ok()?;
+    let mut numbers = BTreeSet::new();
+    for (number, value) in msg.unknown_fields().iter() {
+        match value {
+            LengthDelimited(_) | Varint(_) => {}
+            Fixed32(_) | Fixed64(_) => return None,
+        }
+        numbers.insert(number);
+    }
+    if numbers.len() > MAX_ITEM_CHANGE_FIELDS {
+        return None;
+    }
+    let lists = length_delimited_fields(&msg);
+    let [(field, values)] = lists.iter().collect::<Vec<_>>()[..] else {
+        return None;
+    };
+    if values.is_empty() || values.len() >= MIN_ITEM_ENTRIES {
+        return None;
+    }
+    let mut items = Vec::with_capacity(values.len());
+    for bytes in values {
+        let item = Item::parse_from_bytes(bytes).ok()?;
+        if !has_item_id(&item) || !plausible_item(&item, bytes) {
+            return None;
+        }
+        if item.has_equip() && !item.equip().has_weapon() && !item.equip().has_reliquary() {
+            return None;
+        }
+        items.push(item);
+    }
+    let top = items[0].guid >> 32;
+    if items.iter().any(|item| item.guid >> 32 != top) {
+        return None;
+    }
+    Some((*field, items))
+}
+
 /// [`matches_items_all_data_notify`], with the number of the field the list
 /// was found on.
 pub(crate) fn discover_items(data: &[u8]) -> Option<(u32, Vec<Item>)> {

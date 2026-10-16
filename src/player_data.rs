@@ -7,8 +7,8 @@ use anyhow::Result;
 pub use auto_artifactarium::Achievement;
 pub use auto_artifactarium::r#gen::protos::{AvatarInfo, Item, PropValue};
 use auto_artifactarium::{
-    ANECDOTE_AREA_IDS, ANECDOTE_IDS, AnecdoteData, MAX_ANECDOTE_FINISH_COUNT, MAX_ANECDOTE_STATE,
-    MAX_ANECDOTES,
+    ANECDOTE_AREA_IDS, ANECDOTE_IDS, AbyssPeriod, AnecdoteData, DailyCommissions, Expedition,
+    HomeResources, MAX_ANECDOTE_FINISH_COUNT, MAX_ANECDOTE_STATE, MAX_ANECDOTES,
 };
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -449,6 +449,12 @@ pub struct ExportSettings {
     pub min_weapon_refinement: u32,
     pub min_weapon_ascension: u32,
     pub min_weapon_rarity: u32,
+
+    /// Give every artifact and weapon its game guid (`gi_guid`): live sync
+    /// names items by it. Tracker uploads only; a Genshin Optimizer file has
+    /// no use for it.
+    #[serde(default)]
+    pub item_guids: bool,
 }
 
 /// What a fresh install exports: every category, with the default minimums.
@@ -469,6 +475,7 @@ impl Default for ExportSettings {
             min_weapon_refinement: 0,
             min_weapon_ascension: 0,
             min_weapon_rarity: 3,
+            item_guids: false,
         }
     }
 }
@@ -514,6 +521,7 @@ impl ExportSettings {
             min_weapon_refinement: 0,
             min_weapon_ascension: 0,
             min_weapon_rarity: 0,
+            item_guids: true,
         }
     }
 }
@@ -572,6 +580,31 @@ fn group_thousands(n: usize) -> String {
     grouped
 }
 
+/// The most expeditions `gi_tasks` lists (the contract's cap; the game has
+/// five slots).
+const MAX_EXPORTED_EXPEDITIONS: usize = 20;
+
+/// One part of the planner's routine, as one message carried it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RoutinePart {
+    Commissions(DailyCommissions),
+    Abyss(AbyssPeriod),
+    Expeditions(Vec<Expedition>),
+    Home(HomeResources),
+    Welkin(u32),
+}
+
+/// The planner's routine as captured: each part `None` until its message
+/// arrives.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Routine {
+    commissions: Option<DailyCommissions>,
+    abyss: Option<AbyssPeriod>,
+    expeditions: Option<Vec<Expedition>>,
+    home: Option<HomeResources>,
+    welkin: Option<u32>,
+}
+
 pub struct PlayerData {
     game_data: AnimeGameData,
     achievements: HashMap<u32, Achievement>,
@@ -595,6 +628,9 @@ pub struct PlayerData {
     /// re-sends the whole book each time it is asked for it, so the newest
     /// copy replaces the old one rather than merging into it.
     anecdotes: Option<AnecdoteData>,
+    /// What the planner's tasks are ticked from, each part as the game last
+    /// sent it (each message is the whole state of its part).
+    routine: Routine,
 
     character_equip_guid_map: HashMap<u64, u32>,
 
@@ -611,6 +647,7 @@ impl PlayerData {
             items: HashMap::new(),
             properties: HashMap::new(),
             anecdotes: None,
+            routine: Routine::default(),
             character_equip_guid_map: HashMap::new(),
             game_data_sha: None,
         }
@@ -638,6 +675,7 @@ impl PlayerData {
         self.items.clear();
         self.properties.clear();
         self.anecdotes = None;
+        self.routine = Routine::default();
         self.character_equip_guid_map.clear();
     }
 
@@ -649,6 +687,7 @@ impl PlayerData {
             && self.items.is_empty()
             && self.properties.is_empty()
             && self.anecdotes.is_none()
+            && self.routine == Routine::default()
     }
 
     pub fn process_achievements(&mut self, achievements: &[Achievement]) {
@@ -662,6 +701,18 @@ impl PlayerData {
     /// any earlier copy: each one is the whole book.
     pub fn process_anecdotes(&mut self, data: &AnecdoteData) {
         self.anecdotes = Some(data.clone());
+    }
+
+    /// Keep one part of the planner's routine, replacing what the game sent
+    /// for it before.
+    pub fn process_routine(&mut self, part: RoutinePart) {
+        match part {
+            RoutinePart::Commissions(found) => self.routine.commissions = Some(found),
+            RoutinePart::Abyss(found) => self.routine.abyss = Some(found),
+            RoutinePart::Expeditions(found) => self.routine.expeditions = Some(found),
+            RoutinePart::Home(found) => self.routine.home = Some(found),
+            RoutinePart::Welkin(days) => self.routine.welkin = Some(days),
+        }
     }
 
     pub fn process_properties(&mut self, new_props: &HashMap<u32, u64>) {
@@ -733,6 +784,38 @@ impl PlayerData {
                 self.items.insert((item.item_id, item.guid), item.clone());
             }
         }
+    }
+
+    /// Apply a few changed items (`StoreItemChangeNotify`), returning how
+    /// many were the captured account's.
+    ///
+    /// The matcher reports *candidates* found by shape, so only items whose
+    /// guid's top half is the account's UID (read off the held inventory, see
+    /// [`Self::account_uid`]) are taken; with no inventory held there is no
+    /// UID and nothing is taken (the login's full send comes first anyway). A
+    /// material whose count is now 0 is dropped. Zero means "some other
+    /// packet", as for [`Self::remove_items`].
+    pub fn change_items(&mut self, items: &[Item]) -> usize {
+        let Some(uid) = self.account_uid() else {
+            return 0;
+        };
+        let mine: Vec<Item> = items
+            .iter()
+            .filter(|item| item.guid >> 32 == u64::from(uid))
+            .cloned()
+            .collect();
+        let mut gone = Vec::new();
+        let mut kept = Vec::new();
+        for item in mine.iter() {
+            if item.has_material() && item.material().count == 0 {
+                gone.push(item.guid);
+            } else {
+                kept.push(item.clone());
+            }
+        }
+        self.process_items(&kept);
+        self.remove_items(&gone);
+        mine.len()
     }
 
     /// Drop items the game says are gone, returning how many were actually held.
@@ -881,6 +964,87 @@ impl PlayerData {
             }),
             wish,
         })
+    }
+
+    /// `gi_tasks`, per the tracker contract (`GI_TASKS.md`), or `None` when
+    /// none of it was captured. A part whose values fall outside the
+    /// contract's ranges is left out (the tracker would drop it).
+    fn export_tasks(&self, now_secs: u64) -> Option<good::GiTasks> {
+        let routine = &self.routine;
+        let time_ok = |secs: u32| plausible_time(u64::from(secs), now_secs);
+        let commissions = routine.commissions.and_then(|found| {
+            let finished = found.finished?;
+            (found.total >= 1 && finished <= found.total).then_some(good::GiCommissions {
+                finished,
+                total: found.total,
+            })
+        });
+        let abyss = routine.abyss.and_then(|found| {
+            let ok = time_ok(found.start)
+                && found.end > found.start
+                && found.stars <= found.max_stars
+                && found.max_stars >= 1;
+            if !ok {
+                tracing::warn!(
+                    ?found,
+                    "abyss period outside the contract's ranges; left out"
+                );
+            }
+            ok.then_some(good::GiAbyss {
+                start: found.start,
+                end: found.end,
+                stars: found.stars,
+                max_stars: found.max_stars,
+            })
+        });
+        let expeditions = routine.expeditions.as_ref().and_then(|all| {
+            let mut out: Vec<good::GiExpedition> = all
+                .iter()
+                .filter(|e| e.is_out() && time_ok(e.start_time))
+                .map(|e| good::GiExpedition {
+                    character: self.character_key_by_guid(e.avatar_guid),
+                    id: e.expedition_id,
+                    start: e.start_time,
+                    hours: e.hours,
+                    done_at: e.done_at(),
+                })
+                .collect();
+            out.sort_by(|a, b| (a.done_at, &a.character).cmp(&(b.done_at, &b.character)));
+            if out.len() > MAX_EXPORTED_EXPEDITIONS {
+                tracing::warn!(
+                    out = out.len(),
+                    "more expeditions out than slots exist; left out"
+                );
+                return None;
+            }
+            Some(out)
+        });
+        let realm = routine.home.and_then(|found| {
+            (found.realm_currency <= found.realm_currency_limit).then_some(good::GiRealm {
+                value: found.realm_currency,
+                limit: found.realm_currency_limit,
+            })
+        });
+        let welkin = routine.welkin.map(|days| good::GiWelkin { days });
+        let tasks = good::GiTasks {
+            commissions,
+            abyss,
+            expeditions,
+            realm,
+            welkin,
+        };
+        (!tasks.is_empty()).then_some(tasks)
+    }
+
+    /// The GOOD key of the character with this avatar guid, if the roster was
+    /// captured and the game data knows them.
+    fn character_key_by_guid(&self, guid: u64) -> Option<String> {
+        let avatar = self
+            .characters
+            .values()
+            .find(|avatar| avatar.guid == guid && avatar.avatar_type == AVATAR_TYPE_FORMAL)?;
+        let name = self.game_data.get_character(avatar.avatar_id).ok()?;
+        Some(good::to_good_key(name)).filter(|key| !key.is_empty())
     }
 
     /// A captured player property, if it lies in the range a real one can.
@@ -1034,6 +1198,38 @@ impl PlayerData {
         self.checked_gi_player().0
     }
 
+    /// Items held, of every kind (what a full send is measured against).
+    pub fn item_count(&self) -> usize {
+        self.items.len()
+    }
+
+    /// The tracker export at `now_ms`, what it left out, and its keyed form,
+    /// for live sync (`live.rs`): every item with its guid.
+    pub fn live_export(&self, now_ms: u64) -> (good::Good, ExportReport, crate::delta::Keyed) {
+        let (good, report) = self.export_at(&ExportSettings::for_tracker(), now_ms);
+        let keyed = self.keyed(&good);
+        (good, report, keyed)
+    }
+
+    /// `good` keyed for live sync, each weapon's rarity (a delete's hint,
+    /// which GOOD's weapon has no field for) read from the items held.
+    pub fn keyed(&self, good: &good::Good) -> crate::delta::Keyed {
+        let rarities: HashMap<u64, u32> = self
+            .items
+            .values()
+            .filter(|item| item.has_equip() && item.equip().has_weapon())
+            .filter_map(|item| {
+                let weapon = self.game_data.get_weapon(item.item_id).ok()?;
+                Some((item.guid, weapon.rarity))
+            })
+            .collect();
+        crate::delta::Keyed::of(good, |guid| {
+            guid.parse::<u64>()
+                .ok()
+                .and_then(|guid| rarities.get(&guid).copied())
+        })
+    }
+
     /// Build the GOOD export and report what had to be left out of it.
     ///
     /// Callers with a UI should surface [`ExportReport::summary`]: a snapshot
@@ -1153,6 +1349,10 @@ impl PlayerData {
             gi_characters: None,
             // Omitted when the book was not captured, like the keys above.
             gi_anecdotes: self.export_anecdotes(now_ms / 1000),
+            // Set by the tracker upload (`live.rs`), never here.
+            gi_capture: None,
+            // Omitted when nothing of it was captured, like the keys above.
+            gi_tasks: self.export_tasks(now_ms / 1000),
         };
 
         if settings.include_characters {
@@ -1574,6 +1774,7 @@ impl PlayerData {
                     astral_mark,
                     elixer_crafted,
                     unactivated_substats,
+                    gi_guid: (settings.item_guids && item.guid != 0).then(|| item.guid.to_string()),
                 })
             })
             .collect()
@@ -1646,6 +1847,7 @@ impl PlayerData {
                     refinement,
                     location,
                     lock: equip.is_locked,
+                    gi_guid: (settings.item_guids && item.guid != 0).then(|| item.guid.to_string()),
                 })
             })
             .collect()
@@ -2496,6 +2698,48 @@ mod tests {
     }
 
     #[test]
+    fn changed_items_are_taken_only_for_the_account() {
+        let mut data = player_data();
+        // No inventory yet: no UID to check against, nothing taken.
+        assert_eq!(
+            data.change_items(&[material_item(104_013, minted_guid(800_000_001, 1), 5)]),
+            0
+        );
+        let items: Vec<_> = (1..=20)
+            .map(|n| material_item(104_000 + n, minted_guid(800_000_001, u64::from(n)), 3))
+            .collect();
+        data.process_items(&items);
+
+        // A new count for a held stack, and a new stack.
+        let taken = data.change_items(&[
+            material_item(104_001, minted_guid(800_000_001, 1), 9),
+            material_item(104_100, minted_guid(800_000_001, 99), 2),
+        ]);
+        assert_eq!(taken, 2);
+        let count = |data: &PlayerData, id: u32, guid: u64| {
+            data.items
+                .get(&(id, guid))
+                .map(|item| item.material().count)
+        };
+        assert_eq!(count(&data, 104_001, minted_guid(800_000_001, 1)), Some(9));
+        assert_eq!(count(&data, 104_100, minted_guid(800_000_001, 99)), Some(2));
+
+        // Another account's guid is some other packet: nothing changes.
+        assert_eq!(
+            data.change_items(&[material_item(104_001, minted_guid(800_000_002, 1), 1)]),
+            0
+        );
+        assert_eq!(count(&data, 104_001, minted_guid(800_000_001, 1)), Some(9));
+
+        // A stack down to 0 is gone.
+        assert_eq!(
+            data.change_items(&[material_item(104_002, minted_guid(800_000_001, 2), 0)]),
+            1
+        );
+        assert_eq!(count(&data, 104_002, minted_guid(800_000_001, 2)), None);
+    }
+
+    #[test]
     fn guids_that_split_claim_no_uid() {
         let mut data = player_data();
         data.process_items(&[
@@ -2624,13 +2868,41 @@ mod tests {
                 }),
                 wish: None,
             });
+            data.process_routine(RoutinePart::Commissions(DailyCommissions {
+                total: 4,
+                finished: Some(4),
+            }));
+            data.process_routine(RoutinePart::Abyss(AbyssPeriod {
+                start: 1_754_000_000,
+                end: 1_756_592_000,
+                stars: 30,
+                max_stars: 36,
+            }));
+            data.process_routine(RoutinePart::Expeditions(vec![Expedition {
+                avatar_guid: guid(4),
+                state: 1,
+                expedition_id: 202,
+                hours: 20,
+                start_time: 1_755_990_000,
+                shorten_ratio: 0.0,
+            }]));
+            data.process_routine(RoutinePart::Home(HomeResources {
+                realm_currency: 1_800,
+                realm_currency_limit: 2_400,
+            }));
+            data.process_routine(RoutinePart::Welkin(30));
         }
         data
     }
 
     fn golden_json(data: &PlayerData) -> String {
         let mut report = ExportReport::default();
-        let good = data.build_good(&settings(), &mut report, GOLDEN_TIMESTAMP_MS);
+        // Without the guids live sync adds (see the test after these).
+        let settings = ExportSettings {
+            item_guids: false,
+            ..settings()
+        };
+        let good = data.build_good(&settings, &mut report, GOLDEN_TIMESTAMP_MS);
         assert!(report.is_empty(), "{}", report.summary());
         serde_json::to_string(&good).unwrap()
     }
@@ -2660,7 +2932,11 @@ mod tests {
         r#""gi_characters":{"HuTao":{"friendship":10,"obtainedAt":1646092800}},"#,
         r#""gi_anecdotes":{"anecdotes":{"100001":{"state":3,"finishCount":1},"#,
         r#""101604":{"state":0,"finishCount":3}},"unlockedAreas":[1,2],"#,
-        r#""reward":{"index":0,"progress":1,"target":10}}}"#,
+        r#""reward":{"index":0,"progress":1,"target":10}},"#,
+        r#""gi_tasks":{"commissions":{"finished":4,"total":4},"#,
+        r#""abyss":{"start":1754000000,"end":1756592000,"stars":30,"maxStars":36},"#,
+        r#""expeditions":[{"character":"HuTao","id":202,"start":1755990000,"hours":20,"#,
+        r#""doneAt":1756062000}],"realm":{"value":1800,"limit":2400},"welkin":{"days":30}}}"#,
     );
 
     #[test]
@@ -2671,6 +2947,30 @@ mod tests {
         let with = golden_json(&golden_player_data(true));
         let good_part = GOLDEN_GOOD.strip_suffix('}').unwrap();
         assert_eq!(with, format!("{good_part}{GOLDEN_EXTRAS}"));
+    }
+
+    #[test]
+    fn a_tracker_export_names_each_item_by_its_guid_and_is_otherwise_the_same() {
+        let data = golden_player_data(false);
+        let mut report = ExportReport::default();
+        let mut good = data.build_good(&settings(), &mut report, GOLDEN_TIMESTAMP_MS);
+        for guid in good
+            .artifacts
+            .iter()
+            .map(|a| &a.gi_guid)
+            .chain(good.weapons.iter().map(|w| &w.gi_guid))
+        {
+            let guid = guid.as_deref().expect("every item has its guid");
+            assert!(guid.parse::<u64>().is_ok_and(|guid| guid != 0), "{guid}");
+        }
+        // A Genshin Optimizer export carries none.
+        let optimizer = data.build_good(&ExportSettings::default(), &mut report, 0);
+        assert!(optimizer.weapons.iter().all(|w| w.gi_guid.is_none()));
+        assert!(optimizer.artifacts.iter().all(|a| a.gi_guid.is_none()));
+        // Without them, byte for byte the golden export.
+        good.artifacts.iter_mut().for_each(|a| a.gi_guid = None);
+        good.weapons.iter_mut().for_each(|w| w.gi_guid = None);
+        assert_eq!(serde_json::to_string(&good).unwrap(), GOLDEN_GOOD);
     }
 
     #[test]
@@ -2687,17 +2987,102 @@ mod tests {
         assert!(good.gi_achievement_times.is_some());
         assert!(good.gi_characters.is_some());
         assert!(good.gi_anecdotes.is_some());
+        assert!(good.gi_tasks.is_some());
         let with = serde_json::to_string(&good).unwrap();
 
         good.gi_player = None;
         good.gi_achievement_times = None;
         good.gi_characters = None;
         good.gi_anecdotes = None;
+        good.gi_tasks = None;
         let without = serde_json::to_string(&good).unwrap();
 
         let good_part = without.strip_suffix('}').unwrap();
         assert!(with.starts_with(good_part), "{with}\n{without}");
         assert!(with[good_part.len()..].starts_with(r#","gi_player":"#));
+    }
+
+    // -- gi_tasks ----------------------------------------------------------------
+
+    fn expedition(guid: u64, state: u32, start_time: u32) -> Expedition {
+        Expedition {
+            avatar_guid: guid,
+            state,
+            expedition_id: 301,
+            hours: 20,
+            start_time,
+            shorten_ratio: 0.25,
+        }
+    }
+
+    #[test]
+    fn nothing_of_the_routine_captured_means_no_gi_tasks_key() {
+        let mut data = player_data();
+        data.process_properties(&login_properties());
+        let json = serde_json::to_value(data.export_at(&settings(), NOW_SECS * 1000).0).unwrap();
+        assert!(json.as_object().unwrap().get("gi_tasks").is_none());
+    }
+
+    #[test]
+    fn only_who_is_out_is_exported_and_a_count_not_told_apart_is_left_out() {
+        let mut data = player_data();
+        let start = (NOW_SECS - 3_600) as u32;
+        data.process_routine(RoutinePart::Expeditions(vec![
+            expedition(1 << 40, 1, start),
+            expedition(2 << 40, 0, start - 86_400),
+            expedition(3 << 40, 2, start - 86_400),
+        ]));
+        data.process_routine(RoutinePart::Commissions(DailyCommissions {
+            total: 4,
+            finished: None,
+        }));
+
+        let tasks = data.export_tasks(NOW_SECS).unwrap();
+        assert_eq!(tasks.commissions, None);
+        let out = tasks.expeditions.unwrap();
+        assert_eq!(out.len(), 2);
+        // Sorted by when they are done; no roster, so no character.
+        assert_eq!(out[0].start, start - 86_400);
+        assert_eq!(out[1].done_at, start + 15 * 3_600);
+        assert!(out.iter().all(|e| e.character.is_none()));
+    }
+
+    #[test]
+    fn an_empty_expedition_list_says_nobody_is_out() {
+        let mut data = player_data();
+        data.process_routine(RoutinePart::Expeditions(vec![expedition(
+            1 << 40,
+            0,
+            1_700_000_000,
+        )]));
+        let json = serde_json::to_value(data.export_tasks(NOW_SECS)).unwrap();
+        assert_eq!(json, serde_json::json!({ "expeditions": [] }));
+    }
+
+    #[test]
+    fn an_abyss_period_from_the_future_is_left_out() {
+        let mut data = player_data();
+        let start = (NOW_SECS + CLOCK_SLACK_SECS + 1) as u32;
+        data.process_routine(RoutinePart::Abyss(AbyssPeriod {
+            start,
+            end: start + 86_400 * 30,
+            stars: 9,
+            max_stars: 36,
+        }));
+        data.process_routine(RoutinePart::Welkin(12));
+        let tasks = data.export_tasks(NOW_SECS).unwrap();
+        assert_eq!(tasks.abyss, None);
+        assert_eq!(tasks.welkin, Some(good::GiWelkin { days: 12 }));
+    }
+
+    #[test]
+    fn reset_forgets_the_routine() {
+        let mut data = player_data();
+        data.process_routine(RoutinePart::Welkin(12));
+        assert!(!data.is_empty());
+        data.reset();
+        assert!(data.is_empty());
+        assert_eq!(data.export_tasks(NOW_SECS), None);
     }
 
     // -- gi_anecdotes ----------------------------------------------------------------

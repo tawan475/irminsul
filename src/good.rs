@@ -27,6 +27,13 @@ pub struct Artifact {
     pub astral_mark: bool,
     pub elixer_crafted: bool,
     pub unactivated_substats: Vec<Substat>,
+
+    /// The game's id of this piece, as a decimal string (a u64 does not fit a
+    /// JavaScript number): what live sync names it by (`delta.rs`). Tracker
+    /// uploads only (`ExportSettings::item_guids`); omitted elsewhere. Not
+    /// camelCase: irminsul's own keys keep their `gi_` names.
+    #[serde(rename = "gi_guid", skip_serializing_if = "Option::is_none", default)]
+    pub gi_guid: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -37,6 +44,9 @@ pub struct Weapon {
     pub refinement: u32,
     pub location: String,
     pub lock: bool,
+    /// The game's id of this weapon; see [`Artifact::gi_guid`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub gi_guid: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -94,6 +104,41 @@ pub struct Good {
     /// it unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gi_anecdotes: Option<GiAnecdotes>,
+    /// Why this snapshot was taken and which play session it belongs to
+    /// (live sync, plan section 5.1). Tracker uploads only.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub gi_capture: Option<GiCapture>,
+    /// The planner's routine (commissions, the Abyss, expeditions...), as the
+    /// game last sent each part. Omitted when none was captured, and each
+    /// part omitted when it was not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gi_tasks: Option<GiTasks>,
+}
+
+/// `gi_capture`: why a tracker snapshot was taken, and which game login it
+/// belongs to. A wire contract with the tracker (`live/capture.ts`); append
+/// fields and reasons only.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GiCapture {
+    /// Always 1.
+    pub v: u32,
+    /// `login`, `world`, `manual`, `collapse`, `logout`, `resync` or `change`.
+    pub reason: String,
+    /// irminsul's id of this game login: 16+ characters of `[A-Za-z0-9_-]`.
+    pub session: String,
+    /// 1 = the first world of the login, 2+ = each later full send of the
+    /// account in the same connection, by order (irminsul cannot tell the
+    /// player's own world from a co-op host's).
+    pub world: u32,
+    /// The journal this snapshot ends.
+    pub journal: GiCaptureJournal,
+}
+
+/// `gi_capture.journal`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GiCaptureJournal {
+    /// The last batch sent on the journal this snapshot ends (0 at login).
+    pub seq: u64,
 }
 
 /// How `gi_player.uid` was read off the item guids (see
@@ -200,6 +245,85 @@ pub struct GiAnecdoteWish {
     pub npc_id: Option<u32>,
     /// When the last wish was made, in unix seconds.
     pub last_wish_time: u32,
+}
+
+/// `gi_tasks`: what the planner's tasks can be ticked from. The contract with
+/// the tracker is `GI_TASKS.md` (v1, 2026-10-15); append fields only. Times
+/// are unix seconds. Each part is the game's state when it last sent it (at
+/// login, mostly), not a live value.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GiTasks {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commissions: Option<GiCommissions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abyss: Option<GiAbyss>,
+    /// The characters out on an expedition (an empty list: nobody is out).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expeditions: Option<Vec<GiExpedition>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub realm: Option<GiRealm>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub welkin: Option<GiWelkin>,
+}
+
+impl GiTasks {
+    pub fn is_empty(&self) -> bool {
+        self.commissions.is_none()
+            && self.abyss.is_none()
+            && self.expeditions.is_none()
+            && self.realm.is_none()
+            && self.welkin.is_none()
+    }
+}
+
+/// `gi_tasks.commissions`: today's Daily Commissions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GiCommissions {
+    pub finished: u32,
+    pub total: u32,
+}
+
+/// `gi_tasks.abyss`: the Spiral Abyss period running.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GiAbyss {
+    pub start: u32,
+    /// When the next period begins.
+    pub end: u32,
+    pub stars: u32,
+    pub max_stars: u32,
+}
+
+/// One entry of `gi_tasks.expeditions`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GiExpedition {
+    /// The character's GOOD key. Omitted when the roster was not captured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub character: Option<String>,
+    /// The game's expedition id.
+    pub id: u32,
+    pub start: u32,
+    pub hours: u32,
+    /// When it is done: `start + hours`, less what a talent takes off.
+    pub done_at: u32,
+}
+
+/// `gi_tasks.realm`: the Serenitea Pot's realm currency.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GiRealm {
+    pub value: u32,
+    pub limit: u32,
+}
+
+/// `gi_tasks.welkin`: the Blessing of the Welkin Moon.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GiWelkin {
+    pub days: u32,
 }
 
 /// Account values GOOD has no place for: `gi_player`.
@@ -325,6 +449,7 @@ mod tests {
             astral_mark: false,
             elixer_crafted: false,
             unactivated_substats: unactivated,
+            gi_guid: Some("3488998120056947072".to_string()),
         }
     }
 
@@ -391,6 +516,7 @@ mod tests {
                 refinement: 1,
                 location: "HuTao".to_string(),
                 lock: true,
+                gi_guid: Some("3488998120056947188".to_string()),
             }],
             materials: HashMap::from([("ChilledMeat".to_string(), 12)]),
             gi_achievements: Some(vec![80001]),
@@ -442,6 +568,37 @@ mod tests {
                     last_wish_time: 1_791_000_000,
                 }),
             }),
+            gi_capture: Some(GiCapture {
+                v: 1,
+                reason: "login".to_string(),
+                session: "01J9ZK5Q8W3E7R2T".to_string(),
+                world: 1,
+                journal: GiCaptureJournal { seq: 0 },
+            }),
+            gi_tasks: Some(GiTasks {
+                commissions: Some(GiCommissions {
+                    finished: 4,
+                    total: 4,
+                }),
+                abyss: Some(GiAbyss {
+                    start: 1_789_502_400,
+                    end: 1_792_094_399,
+                    stars: 30,
+                    max_stars: 36,
+                }),
+                expeditions: Some(vec![GiExpedition {
+                    character: Some("Xiangling".to_string()),
+                    id: 202,
+                    start: 1_791_000_000,
+                    hours: 20,
+                    done_at: 1_791_072_000,
+                }]),
+                realm: Some(GiRealm {
+                    value: 1_800,
+                    limit: 2_400,
+                }),
+                welkin: Some(GiWelkin { days: 30 }),
+            }),
         };
 
         let json = serde_json::to_value(&good).expect("Good must serialize");
@@ -469,8 +626,10 @@ mod tests {
                 "gi_achievement_times",
                 "gi_achievements",
                 "gi_anecdotes",
+                "gi_capture",
                 "gi_characters",
                 "gi_player",
+                "gi_tasks",
                 "materials",
                 "source",
                 "timestamp",
@@ -494,6 +653,7 @@ mod tests {
             keys(&json["weapons"][0]),
             [
                 "ascension",
+                "gi_guid",
                 "key",
                 "level",
                 "location",
@@ -511,6 +671,7 @@ mod tests {
             [
                 "astralMark",
                 "elixerCrafted",
+                "gi_guid",
                 "level",
                 "location",
                 "lock",
@@ -594,6 +755,45 @@ mod tests {
             json["gi_anecdotes"]["wish"],
             serde_json::json!({ "npcId": 9801, "lastWishTime": 1_791_000_000 })
         );
+
+        // Live sync (the tracker's `live/capture.ts` and `live/delta.ts`):
+        // item guids are decimal strings, a u64 does not fit a JS number.
+        assert_eq!(
+            keys(&json["gi_capture"]),
+            ["journal", "reason", "session", "v", "world"]
+        );
+        assert_eq!(keys(&json["gi_capture"]["journal"]), ["seq"]);
+        assert_eq!(
+            json["artifacts"][0]["gi_guid"],
+            serde_json::json!("3488998120056947072")
+        );
+        assert_eq!(
+            json["weapons"][0]["gi_guid"],
+            serde_json::json!("3488998120056947188")
+        );
+
+        // `GI_TASKS.md`: unix seconds; each part omitted when not captured.
+        assert_eq!(
+            json["gi_tasks"],
+            serde_json::json!({
+                "commissions": { "finished": 4, "total": 4 },
+                "abyss": {
+                    "start": 1_789_502_400,
+                    "end": 1_792_094_399,
+                    "stars": 30,
+                    "maxStars": 36,
+                },
+                "expeditions": [{
+                    "character": "Xiangling",
+                    "id": 202,
+                    "start": 1_791_000_000,
+                    "hours": 20,
+                    "doneAt": 1_791_072_000,
+                }],
+                "realm": { "value": 1_800, "limit": 2_400 },
+                "welkin": { "days": 30 },
+            })
+        );
     }
 
     #[test]
@@ -617,6 +817,8 @@ mod tests {
             gi_achievement_times: None,
             gi_characters: None,
             gi_anecdotes: None,
+            gi_capture: None,
+            gi_tasks: None,
         };
 
         let json = serde_json::to_value(&good).expect("Good must serialize");
@@ -627,6 +829,8 @@ mod tests {
         assert!(!object.contains_key("gi_achievement_times"));
         assert!(!object.contains_key("gi_characters"));
         assert!(!object.contains_key("gi_anecdotes"));
+        assert!(!object.contains_key("gi_capture"));
+        assert!(!object.contains_key("gi_tasks"));
     }
 
     #[test]
