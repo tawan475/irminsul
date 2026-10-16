@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::good::{self, fake_uninitialized_4th_line};
 
+mod avatar_change;
+
 /// Player properties that are exported as GOOD `materials` entries.
 ///
 /// GOOD has no place for arbitrary player properties, and the tracker backend
