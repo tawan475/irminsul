@@ -899,7 +899,7 @@ pub(crate) fn discover_changed_items(data: &[u8]) -> Option<(u32, Vec<Item>)> {
         }
         numbers.insert(number);
     }
-    if numbers.len() > MAX_ITEM_CHANGE_FIELDS {
+    if numbers.len() > MAX_ITEM_CHANGE_FIELDS || !has_varint_field(&msg) {
         return None;
     }
     let lists = length_delimited_fields(&msg);
@@ -930,7 +930,27 @@ pub(crate) fn discover_changed_items(data: &[u8]) -> Option<(u32, Vec<Item>)> {
 /// [`matches_items_all_data_notify`], with the number of the field the list
 /// was found on.
 pub(crate) fn discover_items(data: &[u8]) -> Option<(u32, Vec<Item>)> {
+    if !has_varint_field(&Unk::parse_from_bytes(data).ok()?) {
+        return None;
+    }
     discover_list(data, &ITEM_LIST)
+}
+
+/// Whether a message has a top-level varint: what tells the bag's own
+/// messages from a chest's drop list.
+///
+/// `PlayerStoreNotify` carries its `store_type` and `weight_limit` beside the
+/// item list, `StoreItemChangeNotify` its `store_type` (the pack is 1, so it
+/// is always on the wire). `GadgetAutoPickDropInfoNotify` (7.1 command 1636)
+/// is items alone -- the list and an extra-item list -- with each entry's
+/// count the amount *dropped*, under the account's own guids: it arrives after
+/// every reward chest, right after the change notifies with the real totals,
+/// and read as the bag it set each material it named to the drop (a weekly
+/// boss's drop of 3 gems turned the bag's gem count into 3).
+fn has_varint_field(msg: &Unk) -> bool {
+    msg.unknown_fields()
+        .iter()
+        .any(|(_, value)| matches!(value, Varint(_)))
 }
 
 /// [`matches_avatars_all_data_notify`], with the number of the field the list
@@ -1510,13 +1530,13 @@ mod tests {
     /// were, but they are no evidence of an inventory.
     #[test]
     fn virtual_items_ride_along_but_are_not_evidence() {
-        let mut data = item_list(6, 100_000, 10);
+        let mut data = store_payload(6, 10);
         for id in [201u32, 202, 102] {
             data.extend(field_bytes(6, &material_item(id, 0)));
         }
         assert_eq!(matches_items_all_data_notify(&data).unwrap().len(), 13);
 
-        let mut data = item_list(6, 100_000, 9);
+        let mut data = store_payload(6, 9);
         for id in 1000..1030u32 {
             data.extend(field_bytes(6, &material_item(id, 0)));
         }
@@ -1565,10 +1585,34 @@ mod tests {
         assert_eq!(items.len(), 40);
     }
 
+    /// `GadgetAutoPickDropInfoNotify` (7.1 command 1636): what a reward chest
+    /// dropped, under the account's guids, each count the amount dropped. It is
+    /// items alone, with no `store_type` or other number beside them, and must
+    /// pass for neither the bag nor a change notify -- read as either, it set
+    /// every material it named to the drop.
+    #[test]
+    fn a_chest_drop_list_is_not_the_bag() {
+        let drops = item_list(2, 100_000, 16);
+        assert!(matches_items_all_data_notify(&drops).is_none());
+        assert!(discover_changed_items(&drops).is_none());
+        let few = item_list(2, 100_000, 3);
+        assert!(discover_changed_items(&few).is_none());
+
+        // The bag and the change notify, with their store type, still are.
+        assert!(matches_items_all_data_notify(&store_payload(2, 16)).is_some());
+        let mut change = item_list(12, 100_000, 3);
+        change.extend(field_varint(1, 1));
+        assert_eq!(
+            discover_changed_items(&change).expect("a change").1.len(),
+            3
+        );
+    }
+
     #[test]
     fn two_comparable_item_lists_are_read_as_neither() {
         let mut data = item_list(5, 100_000, 40);
         data.extend(item_list(12, 200_000, 30));
+        data.extend(field_varint(11, 1));
         let logged = crate::test_support::warnings(|| {
             assert!(matches_items_all_data_notify(&data).is_none());
         });

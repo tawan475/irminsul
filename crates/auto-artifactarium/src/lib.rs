@@ -2624,10 +2624,14 @@ mod tests {
     }
 
     /// `count` items on field `tag`, with guids minted the way the game does.
+    /// A `PlayerStoreNotify`: `count` items on `tag` beside its `store_type`
+    /// (7.1's field 11; the pack is 1).
     fn item_packet_on(tag: u32, count: u32) -> Vec<u8> {
-        (0..count)
+        let mut out: Vec<u8> = (0..count)
             .flat_map(|i| field_bytes(tag, &item_entry(1000 + i, guid(TEST_UID, u64::from(i) + 1))))
-            .collect()
+            .collect();
+        out.extend(field_varint(11, 1));
+        out
     }
 
     fn item_packet(count: u32) -> Vec<u8> {

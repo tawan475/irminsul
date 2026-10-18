@@ -202,7 +202,7 @@ fn an_inventory_capture_decodes_into_items() {
     artifact.set_equip(equip);
     store.items.push(artifact);
 
-    let payload = store.write_to_bytes().unwrap();
+    let payload = with_store_type(store.write_to_bytes().unwrap());
     let mut capture = Capture::new();
     let command = capture.send_one(8132, &packet_head(8132, 1_756_400_000_000), &payload);
 
@@ -264,6 +264,15 @@ fn push_varint(out: &mut Vec<u8>, mut value: u64) {
 
 /// `entries` as a repeated message field numbered `field`: what a game patch
 /// that renumbers the list puts on the wire.
+/// A bag message as the game sends it: the item list beside its `store_type`
+/// (field 11 in 7.1; the pack is 1). A list of items alone is a chest's drop
+/// list, not the bag.
+fn with_store_type(mut payload: Vec<u8>) -> Vec<u8> {
+    push_varint(&mut payload, 11 << 3);
+    push_varint(&mut payload, 1);
+    payload
+}
+
 fn repeated_on<M: Message>(field: u32, entries: &[M]) -> Vec<u8> {
     let mut out = Vec::new();
     for entry in entries {
@@ -305,7 +314,7 @@ fn lists_moved_by_a_patch_still_decode() {
     let mut capture = Capture::new();
     for field in [5u32, 9, 14] {
         let head = packet_head(22160, 1_756_400_005_000);
-        let store = capture.send_one(22160, &head, &repeated_on(field, &items));
+        let store = capture.send_one(22160, &head, &with_store_type(repeated_on(field, &items)));
         match classify_command(&store) {
             Some(CommandMatch::Items(found)) => {
                 assert_eq!(found.len(), 12, "field {field}");
@@ -409,7 +418,7 @@ fn a_sequence_of_commands_over_one_connection_all_decode() {
         item.set_material(material);
         store.items.push(item);
     }
-    let store_bytes = store.write_to_bytes().unwrap();
+    let store_bytes = with_store_type(store.write_to_bytes().unwrap());
 
     let mut roster = AvatarDataNotify::new();
     let mut avatar = AvatarInfo::new();

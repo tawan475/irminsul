@@ -73,7 +73,14 @@ jobs:
         if: runner.os == 'Windows' && matrix.features == 'pcap'
         shell: pwsh
         run: |
+          # npcap.com first, the Internet Archive's copy of the same file when
+          # it fails (its certificate expired on 2026-10-18 and stopped every
+          # Windows pcap build). Either way the SHA-256 below must match.
           curl.exe -fsSL https://npcap.com/dist/npcap-sdk-1.15.zip -o sdk.zip
+          if ($LASTEXITCODE -ne 0) {
+            curl.exe -fsSL https://web.archive.org/web/2025id_/https://npcap.com/dist/npcap-sdk-1.15.zip -o sdk.zip
+            if ($LASTEXITCODE -ne 0) { throw 'npcap SDK download failed' }
+          }
           $expected = '52c7b9fb4abee3ad9fe739bb545c3efe77b731c8e127122bdf328eafdae3ed4f'
           $actual = (Get-FileHash sdk.zip -Algorithm SHA256).Hash.ToLower()
           if ($actual -ne $expected) {
