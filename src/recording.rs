@@ -17,6 +17,29 @@ use anyhow::{Context, Result, anyhow, bail};
 
 /// `LINKTYPE_ETHERNET`, the only link layer the sniffer parses.
 pub const LINKTYPE_ETHERNET: u16 = 1;
+/// `LINKTYPE_RAW`: bare IP packets with no link header, IPv4 or IPv6 told by
+/// the first byte. What Android's VPN-based capture apps (PCAPdroid) write.
+pub const LINKTYPE_RAW: u16 = 101;
+/// `LINKTYPE_IPV4` / `LINKTYPE_IPV6`: bare packets of one IP version.
+pub const LINKTYPE_IPV4: u16 = 228;
+pub const LINKTYPE_IPV6: u16 = 229;
+
+/// A recorded frame as the Ethernet frame the sniffer parses: Ethernet as is,
+/// a bare IP packet behind a blank Ethernet header (the sniffer reads no MAC
+/// address). `None` for any other link layer, or a bare packet that is not IP.
+pub fn as_ethernet(link_type: u16, data: Vec<u8>) -> Option<Vec<u8>> {
+    let ether_type: u16 = match (link_type, data.first().map(|b| b >> 4)) {
+        (LINKTYPE_ETHERNET, _) => return Some(data),
+        (LINKTYPE_RAW, Some(4)) | (LINKTYPE_IPV4, _) => 0x0800,
+        (LINKTYPE_RAW, Some(6)) | (LINKTYPE_IPV6, _) => 0x86DD,
+        _ => return None,
+    };
+    let mut frame = Vec::with_capacity(14 + data.len());
+    frame.extend_from_slice(&[0; 12]);
+    frame.extend_from_slice(&ether_type.to_be_bytes());
+    frame.extend_from_slice(&data);
+    Some(frame)
+}
 
 /// A block or record larger than this is taken for corruption rather than
 /// allocated. Real frames are at most 64 KiB.
@@ -781,5 +804,32 @@ pub(crate) mod tests {
             .to_string();
         assert!(error.contains("not a pcap or pcapng file"), "{error}");
         assert!(Recording::new(&b"ab"[..]).is_err());
+    }
+
+    #[test]
+    fn bare_ip_frames_get_a_blank_ethernet_header() {
+        let ethernet = vec![1, 2, 3];
+        assert_eq!(
+            as_ethernet(LINKTYPE_ETHERNET, ethernet.clone()),
+            Some(ethernet)
+        );
+
+        let v4 = as_ethernet(LINKTYPE_RAW, vec![0x45, 0, 0, 20]).unwrap();
+        assert_eq!(&v4[..14], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x00]);
+        assert_eq!(&v4[14..], &[0x45, 0, 0, 20]);
+        let v6 = as_ethernet(LINKTYPE_RAW, vec![0x60, 0, 0, 0]).unwrap();
+        assert_eq!(&v6[12..14], &[0x86, 0xDD]);
+        assert_eq!(
+            &as_ethernet(LINKTYPE_IPV6, vec![0x60]).unwrap()[12..14],
+            &[0x86, 0xDD]
+        );
+        assert_eq!(
+            &as_ethernet(LINKTYPE_IPV4, vec![0x45]).unwrap()[12..14],
+            &[0x08, 0x00]
+        );
+
+        assert_eq!(as_ethernet(LINKTYPE_RAW, vec![0x12, 0]), None);
+        assert_eq!(as_ethernet(LINKTYPE_RAW, Vec::new()), None);
+        assert_eq!(as_ethernet(105, vec![0x45]), None);
     }
 }
