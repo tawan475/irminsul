@@ -337,6 +337,17 @@ impl Args {
 }
 
 fn main() -> eframe::Result {
+    // The crash dump handler the app starts of itself (`crash/native/
+    // dump_handler.rs`): nothing of the app runs in it, not even clap, which
+    // does not know the argument.
+    #[cfg(windows)]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == crash::DUMP_HANDLER_ARG)
+    {
+        std::process::exit(crash::run_dump_handler());
+    }
+
     let args = Args::parse();
 
     // A replay is a command-line tool, not the app, and it goes before
