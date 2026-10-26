@@ -1,9 +1,29 @@
+## Irminsul is now Teyvat.me Capture
+
+This project moved to **[tawan475/teyvat.me-capture](https://github.com/tawan475/teyvat.me-capture)**.
+All new features, bug fixes and releases happen there; this repository gets no
+more updates.
+
+- **Already using Irminsul?** Say Yes to the update it offers: v0.2.3-T-19,
+  the last Irminsul release. After it restarts it offers Teyvat.me; say Yes
+  again. On its first start Teyvat.me takes over your settings, your tracker
+  sign-in and the start-on-startup task.
+- **New?** Download from
+  [Teyvat.me's latest release](https://github.com/tawan475/teyvat.me-capture/releases/latest):
+  Windows, Linux, macOS and Android.
+- The tracker is now at [teyvat.me](https://teyvat.me). Community:
+  [Discord](https://discord.gg/W6GUY3UtAx).
+
+The rest of this page describes Irminsul as it was at its last release.
+
+---
+
 ![Screenshot](docs/src/images/main-window.webp)
 
 # Resources
 
 - [Docs](https://tawan475.github.io/irminsul)
-- [Discord](https://discord.gg/aQqdZPHEpP)
+- [Discord](https://discord.gg/W6GUY3UtAx)
 
 # Introduction
 
