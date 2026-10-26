@@ -168,7 +168,7 @@ pub fn check_for_new_version() -> Result<Option<Release>> {
     let releases = thread::spawn(move || -> Result<Vec<Release>> {
         let releases = self_update::backends::github::ReleaseList::configure()
             .repo_owner("tawan475")
-            .repo_name("irminsul")
+            .repo_name("teyvat.me-capture")
             .build()?
             .fetch()?;
         Ok(releases)
@@ -199,19 +199,19 @@ pub fn check_for_new_version() -> Result<Option<Release>> {
 const CURRENT_ASSET_NAME: Option<&str> = {
     #[cfg(all(target_os = "windows", feature = "pcap"))]
     {
-        Some("irminsul-windows-pcap.exe")
+        Some("teyvatme-windows-pcap.exe")
     }
     #[cfg(all(target_os = "windows", not(feature = "pcap")))]
     {
-        Some("irminsul-windows.exe")
+        Some("teyvatme-windows.exe")
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        Some("irminsul-linux-x86_64.tar.gz")
+        Some("teyvatme-linux-x86_64.tar.gz")
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        Some("Irminsul-macos-arm64.app.tar.gz")
+        Some("Teyvatme-macos-arm64.app.tar.gz")
     }
     #[cfg(not(any(
         target_os = "windows",
@@ -244,15 +244,17 @@ fn asset_for_current_platform(release: &Release) -> Result<ReleaseAsset> {
 
 /// The single entry the Linux release tarball holds.
 ///
-/// `.github/workflows/release.yaml` builds it as `tar -czf <out_file> <binary>`
-/// from `target/release`, so the archive contains exactly one member, named
-/// after the matrix's `binary` field. Renaming that means renaming this.
-const TARBALL_EXECUTABLE_ENTRY: &str = "irminsul";
+/// Teyvat.me's `release.yaml` (this is the bridge: irminsul updates to it)
+/// builds it as `tar -czf <out_file> <binary>` from `target/release`, so the
+/// archive holds exactly one member, its `teyvatme` binary. The update
+/// writes it over this executable, whatever its name.
+const TARBALL_EXECUTABLE_ENTRY: &str = "teyvatme";
 
 /// The executable inside the macOS release bundle.
 ///
-/// `.github/workflows/release.yaml` assembles `Irminsul.app` by hand and tars
-/// the whole directory, so this is the path of the Mach-O *within* the archive.
+/// Teyvat.me's `release.yaml` (this is the bridge: irminsul updates to it)
+/// assembles `Teyvatme.app` by hand and tars the whole directory, so this is
+/// the path of the Mach-O *within* the archive.
 /// It is also where `current_exe()` lands at run time: the `Info.plist`
 /// launcher execs `Contents/MacOS/irminsul`, so replacing this one file is
 /// replacing the running program.
@@ -268,7 +270,7 @@ const TARBALL_EXECUTABLE_ENTRY: &str = "irminsul";
 /// written by this process is not tagged `com.apple.quarantine` the way a
 /// browser download is, so the `xattr -dr` step is a first-install concern
 /// only.
-const MACOS_BUNDLE_EXECUTABLE_ENTRY: &str = "Irminsul.app/Contents/MacOS/irminsul";
+const MACOS_BUNDLE_EXECUTABLE_ENTRY: &str = "Teyvatme.app/Contents/MacOS/teyvatme";
 
 /// How a downloaded release asset becomes the file handed to `self_replace`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -680,10 +682,10 @@ mod tests {
     /// Every asset published by .github/workflows/release.yaml. Keep the two in
     /// sync (and docs/src/02-quickstart.md with them).
     const PUBLISHED_ASSETS: &[&str] = &[
-        "irminsul-windows.exe",
-        "irminsul-windows-pcap.exe",
-        "irminsul-linux-x86_64.tar.gz",
-        "Irminsul-macos-arm64.app.tar.gz",
+        "teyvatme-windows.exe",
+        "teyvatme-windows-pcap.exe",
+        "teyvatme-linux-x86_64.tar.gz",
+        "Teyvatme-macos-arm64.app.tar.gz",
     ];
 
     #[test]
@@ -723,7 +725,7 @@ mod tests {
         // Handing the gzip bytes to self_replace is what bricked Linux
         // installs; refusing them outright is what removed in-app updates from
         // Linux entirely. Neither is the answer -- unpacking is.
-        for name in ["irminsul-linux-x86_64.tar.gz", "irminsul.tgz"] {
+        for name in ["teyvatme-linux-x86_64.tar.gz", "irminsul.tgz"] {
             assert_eq!(
                 install_plan_for(&asset(name)).unwrap(),
                 InstallPlan::UnpackTarGz(TARBALL_EXECUTABLE_ENTRY),
@@ -740,7 +742,7 @@ mod tests {
         // `install_plan_for` is load bearing: the bare-tarball arm would look
         // for a top-level `irminsul` that a bundle does not have.
         assert_eq!(
-            install_plan_for(&asset("Irminsul-macos-arm64.app.tar.gz")).unwrap(),
+            install_plan_for(&asset("Teyvatme-macos-arm64.app.tar.gz")).unwrap(),
             InstallPlan::UnpackTarGz(MACOS_BUNDLE_EXECUTABLE_ENTRY),
         );
     }
@@ -752,7 +754,7 @@ mod tests {
 
     #[test]
     fn a_bare_executable_is_installed_verbatim() {
-        for name in ["irminsul-windows.exe", "irminsul-linux-x86_64"] {
+        for name in ["teyvatme-windows.exe", "irminsul-linux-x86_64"] {
             assert_eq!(
                 install_plan_for(&asset(name)).unwrap(),
                 InstallPlan::Direct,
@@ -781,7 +783,7 @@ mod tests {
     #[test]
     fn the_linux_tarball_yields_an_installable_executable() {
         let dir = tempfile::tempdir().unwrap();
-        let archive_path = dir.path().join("irminsul-linux-x86_64.tar.gz");
+        let archive_path = dir.path().join("teyvatme-linux-x86_64.tar.gz");
 
         let mut payload = ELF_MAGIC.to_vec();
         payload.resize(MIN_ASSET_LEN as usize + 1, 0);
@@ -804,14 +806,14 @@ mod tests {
         // the extractor writes it under the staging directory rather than
         // flattening it -- `self_update` matches tar entries by whole path.
         let dir = tempfile::tempdir().unwrap();
-        let archive_path = dir.path().join("Irminsul-macos-arm64.app.tar.gz");
+        let archive_path = dir.path().join("Teyvatme-macos-arm64.app.tar.gz");
 
         let mut payload = MACHO_MAGIC_64.to_vec();
         payload.resize(MIN_ASSET_LEN as usize + 1, 0);
         write_tarball(
             &archive_path,
             &[
-                ("Irminsul.app/Contents/Info.plist", b"<plist/>"),
+                ("Teyvatme.app/Contents/Info.plist", b"<plist/>"),
                 (MACOS_BUNDLE_EXECUTABLE_ENTRY, &payload),
             ],
         );

@@ -624,9 +624,33 @@ pub struct IrminsulApp {
     /// `crash.rs`), until dismissed.
     previous_run_notice: Option<String>,
 
-    /// Started with `--minimized` ("Start minimized" on the startup task):
-    /// minimize on the first frame, then clear.
-    start_minimized: bool,
+    /// What the first frame does with the window, then [`StartWindow::AsIs`].
+    start_window: StartWindow,
+}
+
+/// How the window starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartWindow {
+    /// As the system shows it.
+    AsIs,
+    /// `--minimized` ("Start minimized" on the startup task): minimized on the
+    /// first frame, like the minimize button would.
+    Minimized,
+    /// `--after-update`, the relaunch after a self-update: restored and
+    /// brought to the front. The user just clicked "Yes" on the update, but
+    /// the new process is started by one whose window has already closed, so
+    /// Windows may keep it behind other windows or show it only as a taskbar
+    /// button.
+    Front,
+}
+
+/// Set while the window is hidden to the tray: from [`IrminsulApp::minimize`]
+/// until [`restore_window`], which runs on the tray's thread.
+static HIDDEN_TO_TRAY: AtomicBool = AtomicBool::new(false);
+
+/// The toast stack, empty.
+fn new_toasts() -> Toasts {
+    Toasts::default().with_anchor(egui_notify::Anchor::BottomLeft)
 }
 
 trait ToastError<T> {
@@ -805,6 +829,7 @@ fn window_out_of_sight() -> bool {
 
 /// Bring a window hidden to the tray back.
 fn restore_window(ctx: &Context) {
+    HIDDEN_TO_TRAY.store(false, Ordering::Relaxed);
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     ctx.request_repaint();
@@ -927,7 +952,7 @@ impl IrminsulApp {
         capture_source: capture::CaptureSource,
         restart_requested: Arc<AtomicBool>,
         previous_run_notice: Option<String>,
-        start_minimized: bool,
+        start_window: StartWindow,
     ) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         egui_material_icons::initialize(&cc.egui_ctx);
@@ -982,7 +1007,7 @@ impl IrminsulApp {
         }
         let _ = ui_message_tx.send(Message::Tracker(TrackerRequest::Load));
 
-        let toasts = Toasts::default().with_anchor(egui_notify::Anchor::BottomLeft);
+        let toasts = new_toasts();
 
         // Moves a Run entry left by an older version to a scheduled task, then
         // reads what Windows will start at sign-in.
@@ -1164,7 +1189,7 @@ impl IrminsulApp {
             startup,
             background: load_background(&cc.egui_ctx),
             previous_run_notice,
-            start_minimized,
+            start_window,
             monitor_cancel_token: cancel_token,
             monitor_handle: Some(monitor_handle),
             install_lock,
@@ -1234,14 +1259,46 @@ impl eframe::App for IrminsulApp {
         #[cfg(windows)]
         self.release_settled_memory();
 
+        // Read before the start-up minimize below, so the first frame is
+        // still drawn.
+        let out_of_sight = HIDDEN_TO_TRAY.load(Ordering::Relaxed)
+            || ctx.input(|i| i.viewport().minimized) == Some(true);
+
         // eframe shows the window after painting the first frame and applies
         // this frame's commands after that, so it is on screen for one frame.
-        // To the tray only when that was the user's choice for the minimize
-        // button; otherwise the taskbar, where it can be found.
-        if std::mem::take(&mut self.start_minimized) {
-            let to_tray = self.saved_state.minimize_to_tray == Some(true);
-            tracing::info!(to_tray, "starting minimized");
-            self.minimize(ctx, to_tray);
+        match std::mem::replace(&mut self.start_window, StartWindow::AsIs) {
+            StartWindow::AsIs => {}
+            // To the tray only when that was the user's choice for the
+            // minimize button; otherwise the taskbar, where it can be found.
+            StartWindow::Minimized => {
+                let to_tray = self.saved_state.minimize_to_tray == Some(true);
+                tracing::info!(to_tray, "starting minimized");
+                self.minimize(ctx, to_tray);
+            }
+            StartWindow::Front => {
+                tracing::info!("relaunched after an update: bringing the window to the front");
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+        }
+
+        // Nothing is drawn while the window is out of sight. Anything that
+        // animates (a toast counting down, a spinner) asks for the next frame
+        // at once, and eframe keeps running frames for a minimized window,
+        // only napping 10 ms between them: a toast kept a minimized Irminsul
+        // at a full UI frame every 10 ms until it timed out, and a spinner
+        // (a sign-in left waiting) would forever. Measured: 181 frames a
+        // second on screen with a toast up, 3 in 30 s minimized once this
+        // returns early. The background's replies still wake this function
+        // and are read above. Toasts made meanwhile are dropped, as they would
+        // have timed out unseen; `toast_rx` keeps its latest ones for when the
+        // window is back.
+        if out_of_sight {
+            if !self.toasts.is_empty() {
+                self.toasts = new_toasts();
+            }
+            let _ = self.saved_state_tx.send(self.saved_state.clone());
+            return;
         }
 
         let minimize_modal_open = self.minimize_modal_open;
@@ -1596,6 +1653,7 @@ impl IrminsulApp {
         release_memory_once_hidden();
 
         if to_tray && self.tray_menu_ready.load(Ordering::Relaxed) {
+            HIDDEN_TO_TRAY.store(true, Ordering::Relaxed);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             return;
         }
@@ -2551,13 +2609,9 @@ impl IrminsulApp {
             "Only used while signed out. Generate one on the tracker's dashboard and paste it here.",
         );
         ui.add(egui::TextEdit::singleline(&mut self.saved_state.tracker_import_key).password(true));
-        ui.label(
-            RichText::new(
-                "Stored in plain text in Irminsul's app data and never expires. Signing in is \
-                 safer.",
-            )
-            .color(Color32::GRAY)
-            .small(),
+        warning_note(
+            ui,
+            "Stored in plain text in Irminsul's app data and never expires. Signing in is safer.",
         );
         ui.horizontal(|ui| {
             if ui
@@ -2630,11 +2684,7 @@ impl IrminsulApp {
                 ui.set_width(320.0);
                 ui.label(format!("Uploads will now go to {host}. Continue?"));
                 if self.saved_state.tracker_sign_in == TrackerSignIn::SignedIn {
-                    ui.label(
-                        RichText::new("You will be signed out of the current tracker.")
-                            .color(Color32::GRAY)
-                            .small(),
-                    );
+                    warning_note(ui, "You will be signed out of the current tracker.");
                 }
                 ui.horizontal(|ui| {
                     if ui.button("Continue").clicked() {
@@ -2753,14 +2803,8 @@ impl IrminsulApp {
                     if let Some(account) = signed_in.then(|| self.upload_account()).flatten()
                         && let Some(captured) = uid_mismatch(&account, captured_uid)
                     {
-                        ui.label(
-                            RichText::new(format!(
-                                "{} Captured UID {captured} is not this account's",
-                                egui_material_icons::icons::ICON_WARNING
-                            ))
-                            .color(Color32::RED),
-                        )
-                        .on_hover_text(uid_mismatch_message(&account, captured));
+                        warning_callout(ui, &format!("Captured UID {captured} differs"))
+                            .on_hover_text(uid_mismatch_message(&account, captured));
                     }
                 }
             }
@@ -2774,7 +2818,8 @@ impl IrminsulApp {
                 egui::Checkbox::new(&mut self.saved_state.live_sync, "Live sync"),
             )
             .on_hover_text(
-                "Between snapshots, send the tracker what changed as you play, so it stays                  current without logging out. Off: every change uploads the whole account.",
+                "Between snapshots, send the tracker what changed as you play, so it stays \
+                 current without logging out. Off: every change uploads the whole account.",
             );
             // Checked but inert is otherwise completely silent: the
             // automation upload simply never fires.
@@ -2782,13 +2827,10 @@ impl IrminsulApp {
                 && self.saved_state.tracker_sign_in != TrackerSignIn::Unknown
                 && !want_tracker_upload(&self.saved_state)
             {
-                ui.label(
-                    RichText::new(
-                        "Auto export is on, but you are not signed in (and no verified key), \
-                         so nothing will be uploaded.",
-                    )
-                    .color(Color32::RED)
-                    .small(),
+                // One line: the panel already reaches down to the footer.
+                warning_callout(ui, "Not signed in: nothing uploads").on_hover_text(
+                    "Auto export is on, but you are not signed in (and have no verified key), \
+                     so nothing will be uploaded.",
                 );
             }
         });
@@ -2895,13 +2937,10 @@ impl IrminsulApp {
         ui.heading("Bug Report");
         ui.separator();
         ui.label("When filing a bug, please include the latest log file:");
-        ui.label(
-            RichText::new(
-                "Check it first: at the Verbose Trace logging level the log contains a \
-                 dump of your account's game data.",
-            )
-            .color(Color32::GRAY)
-            .small(),
+        warning_note(
+            ui,
+            "Check it first: at the Verbose Trace logging level the log contains a dump of \
+             your account's game data.",
         );
         if ui.button("Open log directory").clicked() {
             thread::spawn(|| {
@@ -3282,6 +3321,39 @@ impl IrminsulApp {
     fn section_header(ui: &mut egui::Ui, name: &str) {
         ui.label(RichText::new(name).size(18.));
     }
+}
+
+/// A warning that something the user turned on is not happening: body-size
+/// text with the warning icon, in a red box. It used to be small red text,
+/// which users could not read.
+fn warning_callout(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    egui::Frame::new()
+        .fill(Color32::from_rgba_unmultiplied(220, 40, 40, 40))
+        .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(220, 70, 70)))
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(format!(
+                    "{} {text}",
+                    egui_material_icons::icons::ICON_WARNING
+                ))
+                .color(Color32::from_rgb(255, 150, 150)),
+            )
+        })
+        .inner
+}
+
+/// A caution beside a setting or in a dialog: body-size text in the theme's
+/// warning colour, with the warning icon. These were small grey text.
+fn warning_note(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        RichText::new(format!(
+            "{} {text}",
+            egui_material_icons::icons::ICON_WARNING
+        ))
+        .color(ui.visuals().warn_fg_color),
+    );
 }
 
 #[cfg(windows)]

@@ -33,6 +33,9 @@ use chrono::{DateTime, Datelike, Local, Timelike, Utc};
 #[cfg(windows)]
 mod native;
 
+#[cfg(windows)]
+pub use native::{HANDLER_ARG as DUMP_HANDLER_ARG, run_dump_handler};
+
 /// The file every crash report is appended to, in the log directory.
 pub const CRASH_LOG: &str = "crash.log";
 

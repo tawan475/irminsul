@@ -44,7 +44,7 @@ use crate::monitor::{
     self, AppliedData, DataReplacement, DataVerdict, KeyReport, SnifferEvent, SnifferStats,
 };
 use crate::player_data::{ExportSettings, PlayerData};
-use crate::recording::{LINKTYPE_ETHERNET, RecordedFrame, Recording};
+use crate::recording::{self, RecordedFrame, Recording};
 
 /// Run a replay from the command line and return the process exit code: 0
 /// when an export was written, 1 when nothing could be decoded or a file could
@@ -484,22 +484,22 @@ impl Replay {
     /// Decode one recorded frame, as the live sniffer thread would.
     fn feed(&mut self, frame: RecordedFrame) {
         self.frames += 1;
-        if frame.link_type != LINKTYPE_ETHERNET {
+        let Some(data) = recording::as_ethernet(frame.link_type, frame.data) else {
             let count = self.skipped.entry(frame.link_type).or_default();
             if *count == 0 {
                 tracing::warn!(
                     link_type = frame.link_type,
-                    "skipping frames that are not Ethernet; live capture cannot decode them either"
+                    "skipping frames that are neither Ethernet nor bare IP"
                 );
             }
             *count += 1;
             return;
-        }
+        };
 
         monitor::decode_one_packet(
             &mut self.sniffer,
             &mut self.generation,
-            frame.data,
+            data,
             &self.events_tx,
             &mut self.stats,
         );
@@ -861,7 +861,7 @@ impl Replay {
         }
         if self.skipped.values().sum::<u64>() == self.frames {
             return format!(
-                "nothing decoded: none of the recording's {} frames is Ethernet (link types {:?})",
+                "nothing decoded: none of the recording's {} frames is Ethernet or bare IP                  (link types {:?})",
                 self.frames,
                 self.skipped.keys().collect::<Vec<_>>()
             );
@@ -1036,19 +1036,29 @@ mod tests {
         let error = empty.finish().err().unwrap().to_string();
         assert!(error.contains("no frames"), "{error}");
 
-        let mut raw_ip = replay();
-        raw_ip.feed(RecordedFrame {
+        let mut wifi = replay();
+        wifi.feed(RecordedFrame {
             timestamp_ns: Some(1),
-            link_type: 101,
+            link_type: 105, // IEEE 802.11
             data: vec![0x45; 40],
         });
-        let error = raw_ip.finish().err().unwrap().to_string();
-        assert!(error.contains("Ethernet"), "{error}");
+        let error = wifi.finish().err().unwrap().to_string();
+        assert!(error.contains("Ethernet or bare IP"), "{error}");
+
+        // A phone capture (PCAPdroid: bare IP) is read, so what it lacks is game traffic.
+        let mut phone = replay();
+        phone.feed(RecordedFrame {
+            timestamp_ns: Some(1),
+            link_type: recording::LINKTYPE_RAW,
+            data: udp_frame(50000, 53, &[0; 32])[14..].to_vec(),
+        });
+        let error = phone.finish().err().unwrap().to_string();
+        assert!(error.contains("game traffic"), "{error}");
 
         let mut other_traffic = replay();
         other_traffic.feed(RecordedFrame {
             timestamp_ns: Some(1),
-            link_type: LINKTYPE_ETHERNET,
+            link_type: recording::LINKTYPE_ETHERNET,
             data: udp_frame(50000, 53, &[0; 32]),
         });
         let error = other_traffic.finish().err().unwrap().to_string();
@@ -1064,7 +1074,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let recording = dir.path().join("session.pcapng");
         let mut bytes = section_header(false);
-        bytes.extend(interface(LINKTYPE_ETHERNET, &[(9, &[9])], false));
+        bytes.extend(interface(recording::LINKTYPE_ETHERNET, &[(9, &[9])], false));
         for (n, frame) in [
             udp_frame(50000, 53, &[0; 32]),
             segment_frame(7, &[0u8; 40]),
@@ -1095,7 +1105,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let recording = dir.path().join("login.pcapng");
         let mut bytes = section_header(false);
-        bytes.extend(interface(LINKTYPE_ETHERNET, &[], false));
+        bytes.extend(interface(recording::LINKTYPE_ETHERNET, &[], false));
         bytes.extend(enhanced_packet(0, 1, &handshake_frame(), false));
         bytes.extend(enhanced_packet(0, 2, &segment_frame(9, &[0u8; 40]), false));
         std::fs::write(&recording, bytes).unwrap();
@@ -1112,7 +1122,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let recording = dir.path().join("rec.pcapng");
         let mut bytes = section_header(false);
-        bytes.extend(interface(LINKTYPE_ETHERNET, &[], false));
+        bytes.extend(interface(recording::LINKTYPE_ETHERNET, &[], false));
         std::fs::write(&recording, &bytes).unwrap();
 
         let error = replay_to_file(&recording, &recording)

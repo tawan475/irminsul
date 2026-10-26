@@ -1,0 +1,27 @@
+﻿[package]
+name = "irminsul-android"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Native side of irminsul's Android app: the VPN forwarder and the game traffic tee."
+
+# Built only for Android (cargo-ndk, from android/app's Gradle build), so it
+# stays out of the root workspace and its host-side clippy/test runs.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1.0.99"
+ipstack = "1.0.1"
+jni = "0.21.1"
+libc = "0.2.177"
+log = "0.4.27"
+tokio = { version = "1.47.1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15.1"
+
+[profile.release]
+opt-level = 2

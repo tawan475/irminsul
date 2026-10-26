@@ -184,6 +184,11 @@ struct Args {
     )]
     minimized: bool,
 
+    /// Passed by the relaunch after a self-update; see
+    /// [`app::StartWindow::Front`].
+    #[arg(long = "after-update", hide = true, default_value_t = false)]
+    after_update: bool,
+
     #[arg(
         long = "replay-export",
         value_name = "OUT_JSON",
@@ -332,6 +337,17 @@ impl Args {
 }
 
 fn main() -> eframe::Result {
+    // The crash dump handler the app starts of itself (`crash/native/
+    // dump_handler.rs`): nothing of the app runs in it, not even clap, which
+    // does not know the argument.
+    #[cfg(windows)]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == crash::DUMP_HANDLER_ARG)
+    {
+        std::process::exit(crash::run_dump_handler());
+    }
+
     let args = Args::parse();
 
     // A replay is a command-line tool, not the app, and it goes before
@@ -401,6 +417,13 @@ fn main() -> eframe::Result {
         persist_window: false,
         ..Default::default()
     };
+    let start_window = if args.after_update {
+        app::StartWindow::Front
+    } else if args.minimized {
+        app::StartWindow::Minimized
+    } else {
+        app::StartWindow::AsIs
+    };
     let result = eframe::run_native(
         "Irminsul",
         native_options,
@@ -412,7 +435,7 @@ fn main() -> eframe::Result {
                 capture_source,
                 app_restart_requested,
                 previous_run_notice,
-                args.minimized,
+                start_window,
             )))
         }),
     );
@@ -441,14 +464,24 @@ fn main() -> eframe::Result {
         // `irminsul-windows-pcap.exe -b pcap` came back on the pktmon default
         // after an update, and `--no-admin` and `-r <file>` replay mode were
         // dropped the same way. Except `--minimized`: the window the user just
-        // updated from comes back where they can see it.
-        let args: Vec<std::ffi::OsString> = std::env::args_os()
-            .skip(1)
-            .filter(|arg| arg.as_os_str() != autostart::MINIMIZED_ARG)
-            .collect();
+        // updated from comes back where they can see it, which
+        // `--after-update` asks for.
+        let args = relaunch_args(std::env::args_os().skip(1));
         match std::env::current_exe() {
             Ok(exe) => match std::process::Command::new(&exe).args(&args).spawn() {
-                Ok(_) => tracing::info!("relaunched {exe:?} with {args:?} after update"),
+                Ok(child) => {
+                    tracing::info!("relaunched {exe:?} with {args:?} after update");
+                    // This process got the click on "Yes", so it may still
+                    // hand the foreground on; its own window is already gone.
+                    #[cfg(windows)]
+                    unsafe {
+                        let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(
+                            child.id(),
+                        );
+                    }
+                    #[cfg(not(windows))]
+                    drop(child);
+                }
                 Err(e) => tracing::error!("could not relaunch {exe:?} after update: {e}"),
             },
             Err(e) => tracing::error!("could not find the current executable to relaunch: {e}"),
@@ -519,6 +552,21 @@ fn open_log_dir() -> Result<()> {
     open::that(dir)?;
     Ok(())
 }
+
+/// The arguments for the relaunch after an update: this run's, without
+/// `--minimized` (or an earlier relaunch's `--after-update`), then
+/// `--after-update`.
+fn relaunch_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = args
+        .into_iter()
+        .filter(|arg| arg != autostart::MINIMIZED_ARG && arg != AFTER_UPDATE_ARG)
+        .collect();
+    args.push(AFTER_UPDATE_ARG.into());
+    args
+}
+
+/// See [`app::StartWindow::Front`].
+const AFTER_UPDATE_ARG: &str = "--after-update";
 
 /// How many rotated files to keep, per kind.
 const LOG_RETENTION: usize = 6;
@@ -720,6 +768,20 @@ mod tests {
     fn the_startup_tasks_minimized_argument_parses() {
         assert!(parse(&[autostart::MINIMIZED_ARG]).unwrap().minimized);
         assert!(!parse(&[]).unwrap().minimized);
+    }
+
+    #[test]
+    fn the_update_relaunch_comes_back_in_front_not_minimized() {
+        let os = |args: &[&str]| -> Vec<std::ffi::OsString> {
+            args.iter().map(std::ffi::OsString::from).collect()
+        };
+        let args = relaunch_args(os(&["-b", "pcap", autostart::MINIMIZED_ARG, "--no-admin"]));
+        assert_eq!(args, os(&["-b", "pcap", "--no-admin", AFTER_UPDATE_ARG]));
+        // A relaunch of a relaunch carries it once.
+        assert_eq!(relaunch_args(args.clone()), args);
+
+        let parsed = parse(&["--after-update"]).unwrap();
+        assert!(parsed.after_update && !parsed.minimized);
     }
 
     #[test]
